@@ -1,0 +1,22 @@
+[Unit]
+Description=Private Provider Broker
+After=network-online.target cpa-manager.service
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yosef
+Group=yosef
+WorkingDirectory=/data/provider-broker/app
+EnvironmentFile=/data/provider-broker/secrets/broker.env
+ExecStart=/data/provider-broker/venv/bin/python -m provider_broker
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/provider-broker/data
+
+[Install]
+WantedBy=multi-user.target
