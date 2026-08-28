@@ -37,5 +37,15 @@ async def sync_cpa(store, url: str, token: str) -> int:
         async with session.get(url.rstrip("/")+"/v0/management/config",headers=headers,timeout=20) as response:
             response.raise_for_status(); payload=await response.json()
     entries=expand_config(payload)
+    async with ClientSession() as session:
+        for entry in entries:
+            headers={'Authorization':'Bearer '+entry['api_key']}
+            try:
+                async with session.get(entry['base_url'].rstrip('/')+'/models',headers=headers,timeout=10) as response:
+                    raw=await response.json(content_type=None)
+                    models=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
+                    entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
+            except Exception:
+                entry['models']=['unavailable']; entry['inventory_status']='unavailable'
     store.replace_source_snapshot(entries, datetime.datetime.now(datetime.UTC).isoformat())
     return len(entries)

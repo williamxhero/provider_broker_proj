@@ -39,7 +39,7 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS policy (
           fingerprint TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
-          price_group INTEGER NOT NULL DEFAULT 100, calibrated INTEGER NOT NULL DEFAULT 0, tiers_json TEXT NOT NULL DEFAULT '["standard","smart","expert"]'
+          price_group INTEGER NOT NULL DEFAULT 100, multiplier REAL NOT NULL DEFAULT 1.0, calibrated INTEGER NOT NULL DEFAULT 0, tiers_json TEXT NOT NULL DEFAULT '["standard","smart","expert"]'
         );
         CREATE TABLE IF NOT EXISTS observation (
           id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, requested_model TEXT NOT NULL,
@@ -48,6 +48,8 @@ class Store:
         );
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
+        except sqlite3.OperationalError: pass
+        try: self.conn.execute('ALTER TABLE policy ADD COLUMN multiplier REAL NOT NULL DEFAULT 1.0')
         except sqlite3.OperationalError: pass
         self.conn.commit()
 
@@ -66,9 +68,10 @@ class Store:
         rows = []
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
-            model = entry["model"]
-            fp = self.fingerprint(base_url, api_key, model)
-            rows.append((fp, entry.get("name", model), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), json.dumps([model]), json.dumps(entry.get("source", {})), synced_at))
+            models = entry.get("models") or [entry.get("model", "unavailable")]
+            fp = self.fingerprint(base_url, api_key, "\0".join(models))
+            source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
+            rows.append((fp, entry.get("name", models[0]), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), json.dumps(models), json.dumps(source), synced_at))
         with self.conn:
             self.conn.execute("CREATE TEMP TABLE incoming AS SELECT * FROM source_provider WHERE 0")
             self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) VALUES(?,?,?,?,?,?,?,?)", rows)
@@ -78,17 +81,23 @@ class Store:
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
 
     def providers(self, tier: str) -> list[Provider]:
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint)
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint)
         WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
-        return [Provider(r["id"], r["fingerprint"], r["name"], r["base_url"], self._decrypt(r["api_key"]), r["provider_type"], json.loads(r["models_json"]), r["price_group"], bool(r["enabled"])) for r in rows if tier in json.loads(r["tiers_json"])]
+        from .catalog import classify
+        result=[]
+        for r in rows:
+            models=[m for m in json.loads(r['models_json']) if classify(m) and classify(m)[0] == tier]
+            if models and tier in json.loads(r['tiers_json']):
+                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],models,int(classify(models[0])[1]*r['multiplier']*100),bool(r['enabled'])))
+        return result
 
     def inventory(self) -> list[dict]:
-        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
-        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"models":json.loads(r["models_json"]),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"price_group":r["price_group"],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
+        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
+        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"multiplier":r['multiplier'],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:
-            self.conn.execute("UPDATE policy SET enabled=?,price_group=?,calibrated=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled", True)), int(body.get("price_group",100)),int(body.get('calibrated',False)),json.dumps(body.get("tiers",["standard","smart","expert"])),fingerprint))
+            self.conn.execute("UPDATE policy SET enabled=?,multiplier=?,calibrated=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled", True)),float(body.get('multiplier',1)),int(body.get('calibrated',False)),json.dumps(body.get("tiers",["standard","smart","expert"])),fingerprint))
 
     def observe(self, **data):
         with self.conn:

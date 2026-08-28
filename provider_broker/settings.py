@@ -13,6 +13,7 @@ class Settings:
     encryption_key: str
     cpa_url: str = "http://127.0.0.1:8317"
     cpa_token: str = ""
+    parallel_cap: int = 3
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -24,6 +25,7 @@ class Settings:
             encryption_key=os.environ["BROKER_ENCRYPTION_KEY"],
             cpa_url=os.getenv("CPA_URL", "http://127.0.0.1:8317"),
             cpa_token=os.getenv("CPA_MANAGEMENT_KEY", ""),
+            parallel_cap=int(os.getenv("BROKER_PARALLEL_CAP", "3")),
         )
 
     def key_bytes(self) -> bytes:

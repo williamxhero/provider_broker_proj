@@ -40,9 +40,9 @@ async def generate(request):
     if 'model' in body or not isinstance(body.get('prompt'),str): return web.json_response({'error':'prompt and intellect are required; model is not a capability selector'},status=400)
     tier=body.get('intellect')
     if tier not in ('standard','smart','expert'): return web.json_response({'error':'model must be standard, smart, or expert'},status=400)
-    try: result=await route(request.app['store'],tier,body)
+    try: result=await route(request.app['store'],tier,body,request.app['settings'].parallel_cap)
     except UpstreamFailure as exc: return web.json_response({'error':'all eligible providers failed','attempts':str(exc)},status=503)
-    return web.json_response({'status':'fulfilled','intellect':tier,'effort':body.get('effort'),'actual_model':result['actual_model'],'output_text':result['text'],'provider':result['provider'],'attempts':[]})
+    return web.json_response({'status':'fulfilled','intellect':tier,'fulfilled_intellect':result['fulfilled_intellect'],'effort':body.get('effort'),'deadline_ms':body.get('deadline_ms'),'output_token_limit':body.get('output_token_limit'),'actual_model':result['actual_model'],'output_text':result['text'],'provider':result['provider'],'attempts':result['attempts']})
 
 async def stream(request):
     response=await generate(request)
@@ -60,6 +60,9 @@ async def sync(request):
     return web.json_response({'synced':count})
 
 async def inventory(request): return web.json_response({'providers':request.app['store'].inventory()})
+async def catalog(request):
+    from .catalog import CATALOG
+    return web.json_response({'catalog':CATALOG})
 async def update_policy(request):
     request.app['store'].update_policy(request.match_info['fingerprint'],await request.json()); return web.json_response({'updated':True})
 async def home(request): return web.Response(text=HTML,content_type='text/html')
@@ -75,7 +78,7 @@ async def login(request):
 def create_app(settings: Settings):
     app=web.Application(middlewares=[auth('client')])
     app['settings']=settings; app['store']=Store(settings.database_path,settings.key_bytes())
-    app.add_routes([web.get('/',home),web.get('/healthz',health),web.get('/login',login),web.post('/login',login),web.post('/v1/generate',generate),web.post('/v1/generate/stream',stream),web.post('/admin/v1/sync',sync),web.get('/admin/v1/inventory',inventory),web.put('/admin/v1/policy/{fingerprint}',update_policy)])
+    app.add_routes([web.get('/',home),web.get('/healthz',health),web.get('/login',login),web.post('/login',login),web.post('/v1/generate',generate),web.post('/v1/generate/stream',stream),web.post('/admin/v1/sync',sync),web.get('/admin/v1/inventory',inventory),web.get('/admin/v1/catalog',catalog),web.put('/admin/v1/policy/{fingerprint}',update_policy)])
     return app
 
 def main():
