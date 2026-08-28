@@ -34,11 +34,11 @@ async def test_generate_requires_client_bearer(client):
 async def cpa(client):
     async def config(request):
         assert request.headers['X-Management-Key'] == 'cpa-secret'
-        return web.json_response({'providers':[{'name':'Test OpenAI','base_url':str(request.app['upstream']),'type':'openai','keys':[{'key':'provider-secret','models':['gpt-test']}]}]})
-    app=web.Application(); app.router.add_get('/v0/management/config',config)
+        return web.json_response(request.app['config'])
+    app=web.Application(); app['config']={'providers':[{'name':'Test OpenAI','base_url':str('http://placeholder'),'type':'openai','keys':[{'key':'provider-secret','models':['gpt-test']}]}]}; app.router.add_get('/v0/management/config',config)
     async def response(request): return web.json_response({'model':'gpt-fulfilled','output_text':'hello broker'})
     upstream=web.Application(); upstream.router.add_post('/v1/responses',response)
-    upstream_server=TestServer(upstream); await upstream_server.start_server(); app['upstream']=str(upstream_server.make_url('')).rstrip('/')
+    upstream_server=TestServer(upstream); await upstream_server.start_server(); app['upstream']=str(upstream_server.make_url('')).rstrip('/'); app['config']['providers'][0]['base_url']=app['upstream']
     server=TestServer(app); await server.start_server()
     client.app['settings'] = client.app['settings'].__class__(**(client.app['settings'].__dict__ | {'cpa_url':str(server.make_url('')).rstrip('/'),'cpa_token':'cpa-secret'}))
     yield server
@@ -54,9 +54,10 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     provider=(await inventory.json())['providers'][0]
     assert provider['models'] == ['gpt-test']
     assert 'provider-secret' not in str(provider)
-    result=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'model':'smart','input':'hi','effort':'medium'})
-    assert await result.json() == {'model':'smart','actual_model':'gpt-fulfilled','output_text':'hello broker','provider':'Test OpenAI'}
-    streamed=await client.post('/v1/generate/stream',headers={'Authorization':'Bearer client-secret'},json={'model':'expert','input':'hi'})
+    await client.put('/admin/v1/policy/'+provider['fingerprint'],headers=headers,json={'calibrated':True,'tiers':['standard','smart','expert']})
+    result=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hi','intellect':'smart','effort':'medium'})
+    assert (await result.json())['actual_model'] == 'gpt-fulfilled'
+    streamed=await client.post('/v1/generate/stream',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hi','intellect':'expert'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
     assert 'gpt-fulfilled' in await streamed.text()
 
@@ -66,3 +67,20 @@ async def test_web_login_uses_session_for_admin_sync(client):
     assert response.status == 302
     response=await client.get('/',headers={'Cookie':response.headers['Set-Cookie']})
     assert response.status == 200
+
+
+async def test_sync_normalizes_cpa_sections_and_generate_uses_canonical_request(client, cpa):
+    cpa.app['config'] = {
+            'codex-api-key': [{'name':'Luna key','base_url':cpa.app['upstream'],'api_key':'luna-key'}],
+            'claude-api-key': [{'name':'Sonnet key','base_url':cpa.app['upstream'],'api_key':'claude-key'}],
+            'openai-compatibility': [{'name':'compat','base_url':cpa.app['upstream'],'api_key':'compat-key'}],
+        }
+    synced=await client.post('/admin/v1/sync',headers={'Authorization':'Bearer admin-secret'})
+    assert synced.status == 200
+    inventory=(await (await client.get('/admin/v1/inventory',headers={'Authorization':'Bearer admin-secret'})).json())['providers']
+    assert {p['family'] for p in inventory} == {'codex','anthropic','openai'}
+    assert all(secret not in str(inventory) for secret in ('luna-key','claude-key','compat-key'))
+    response=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hello','intellect':'standard','effort':'high','deadline_ms':1000,'output_token_limit':20})
+    assert response.status == 503  # providers require policy calibration before routing
+    legacy=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hello','model':'standard'})
+    assert legacy.status == 400

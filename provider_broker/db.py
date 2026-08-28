@@ -39,7 +39,7 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS policy (
           fingerprint TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
-          price_group INTEGER NOT NULL DEFAULT 100, tiers_json TEXT NOT NULL DEFAULT '["standard","smart","expert"]'
+          price_group INTEGER NOT NULL DEFAULT 100, calibrated INTEGER NOT NULL DEFAULT 0, tiers_json TEXT NOT NULL DEFAULT '["standard","smart","expert"]'
         );
         CREATE TABLE IF NOT EXISTS observation (
           id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, requested_model TEXT NOT NULL,
@@ -47,6 +47,8 @@ class Store:
           latency_ms REAL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
         """)
+        try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
+        except sqlite3.OperationalError: pass
         self.conn.commit()
 
     def _encrypt(self, value: str) -> bytes:
@@ -76,17 +78,17 @@ class Store:
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
 
     def providers(self, tier: str) -> list[Provider]:
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint)
-        WHERE p.enabled=1 ORDER BY p.price_group, s.id""").fetchall()
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint)
+        WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
         return [Provider(r["id"], r["fingerprint"], r["name"], r["base_url"], self._decrypt(r["api_key"]), r["provider_type"], json.loads(r["models_json"]), r["price_group"], bool(r["enabled"])) for r in rows if tier in json.loads(r["tiers_json"])]
 
     def inventory(self) -> list[dict]:
-        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
-        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"provider_type":r["provider_type"],"models":json.loads(r["models_json"]),"enabled":bool(r["enabled"]),"price_group":r["price_group"],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
+        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
+        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"models":json.loads(r["models_json"]),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"price_group":r["price_group"],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:
-            self.conn.execute("UPDATE policy SET enabled=?,price_group=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled", True)), int(body.get("price_group",100)),json.dumps(body.get("tiers",["standard","smart","expert"])),fingerprint))
+            self.conn.execute("UPDATE policy SET enabled=?,price_group=?,calibrated=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled", True)), int(body.get("price_group",100)),int(body.get('calibrated',False)),json.dumps(body.get("tiers",["standard","smart","expert"])),fingerprint))
 
     def observe(self, **data):
         with self.conn:

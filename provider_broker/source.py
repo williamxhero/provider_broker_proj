@@ -4,6 +4,15 @@ from aiohttp import ClientSession
 
 def expand_config(payload: object) -> list[dict]:
     """Normalize CPA config variants into one immutable direct-upstream per key/model."""
+    if isinstance(payload, dict) and any(k in payload for k in ('codex-api-key','claude-api-key','openai-compatibility')):
+        result=[]
+        for section, family in (('codex-api-key','codex'),('claude-api-key','anthropic'),('openai-compatibility','openai')):
+            for key in payload.get(section,[]) or []:
+                base=key.get('base_url') or key.get('base-url') or key.get('url')
+                secret=key.get('api_key') or key.get('api-key') or key.get('key')
+                if base and secret:
+                    result.append({'name':key.get('name') or section,'base_url':base,'api_key':secret,'model':'unavailable','provider_type':family,'source':{'section':section,'name':key.get('name') or section}})
+        return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
     if isinstance(roots, dict): roots = roots.values()
     result=[]

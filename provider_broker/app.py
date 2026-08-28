@@ -36,11 +36,13 @@ def auth(token_name):
     return middleware
 
 async def generate(request):
-    body=await request.json(); tier=body.get('model','standard')
+    body=await request.json()
+    if 'model' in body or not isinstance(body.get('prompt'),str): return web.json_response({'error':'prompt and intellect are required; model is not a capability selector'},status=400)
+    tier=body.get('intellect')
     if tier not in ('standard','smart','expert'): return web.json_response({'error':'model must be standard, smart, or expert'},status=400)
     try: result=await route(request.app['store'],tier,body)
     except UpstreamFailure as exc: return web.json_response({'error':'all eligible providers failed','attempts':str(exc)},status=503)
-    return web.json_response({'model':tier,'actual_model':result['actual_model'],'output_text':result['text'],'provider':result['provider']})
+    return web.json_response({'status':'fulfilled','intellect':tier,'effort':body.get('effort'),'actual_model':result['actual_model'],'output_text':result['text'],'provider':result['provider'],'attempts':[]})
 
 async def stream(request):
     response=await generate(request)
