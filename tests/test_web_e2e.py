@@ -124,6 +124,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#quality").get_by_text("可路由 API", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("技术成功率", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("平均 TTFT", exact=True).count() == 1
+        assert page.locator("#quality > div").count() == 12
+        assert page.locator("#quality > div").filter(has_text="transport_failed").locator("strong").inner_text() == "50.0%"
+        assert page.locator("#quality > div").filter(has_text="cancelled").locator("strong").inner_text() == "0.0%"
         assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()

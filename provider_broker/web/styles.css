@@ -21,9 +21,9 @@ main { padding: 0 clamp(1rem, 5vw, 5rem) 3rem; }
 section { padding: clamp(.8rem, 1.5vw, 1.25rem) 0; border-bottom: 1px solid var(--line); animation: rise .45s ease both; }
 section:nth-child(2) { animation-delay: .06s; } section:nth-child(3) { animation-delay: .12s; }
 h2 { margin: 0; font-size: clamp(1.7rem, 3vw, 3rem); font-weight: 520; letter-spacing: -.04em; }
-.quality-grid { display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); }
+.quality-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
 .quality-grid > div { min-height: 5rem; padding: .6rem 1.4rem .65rem 0; border-right: 1px solid var(--line); border-bottom: 1px solid var(--line); display: flex; flex-direction: column; justify-content: space-between; }
-.quality-grid > div:not(:nth-child(5n + 1)) { padding-left: 1.4rem; }
+.quality-grid > div:not(:nth-child(6n + 1)) { padding-left: 1.4rem; }
 .quality-grid span { color: var(--muted); font-size: .78rem; }
 .quality-grid strong { font: 500 clamp(1.25rem, 2.4vw, 2.2rem)/1.1 ui-monospace, SFMono-Regular, Consolas, monospace; overflow-wrap: anywhere; }
 .healthy { color: var(--accent); } .warning { color: var(--warning); } .critical { color: var(--critical); }

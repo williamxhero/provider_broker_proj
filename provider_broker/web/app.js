@@ -15,6 +15,9 @@ const cell = (value) => {
   return td;
 };
 const formatPercent = (value) => value === null || value === undefined ? "n/a" : `${(value * 100).toFixed(1)}%`;
+const formatFailureRate = (count, calls) => Number.isFinite(Number(count)) && Number(calls) > 0
+  ? formatPercent(Number(count) / Number(calls))
+  : "n/a";
 const formatMs = (value) => {
   if (value === null || value === undefined) return "n/a";
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
@@ -326,11 +329,11 @@ function renderQuality(payload) {
     metric("调用数", payload.calls),
     metric("总费用", formatCost(payload.total_cost)),
     metric("模型履约率", formatPercent(payload.model_fulfillment_rate)),
-    metric("cancelled", failures.cancelled),
-    metric("timed_out", failures.timed_out),
-    metric("transport_failed", failures.transport_failed),
-    metric("protocol_failed", failures.protocol_failed),
-    metric("stream_incomplete", failures.stream_incomplete),
+    metric("cancelled", formatFailureRate(failures.cancelled, payload.calls)),
+    metric("timed_out", formatFailureRate(failures.timed_out, payload.calls)),
+    metric("transport_failed", formatFailureRate(failures.transport_failed, payload.calls)),
+    metric("protocol_failed", formatFailureRate(failures.protocol_failed, payload.calls)),
+    metric("stream_incomplete", formatFailureRate(failures.stream_incomplete, payload.calls)),
   );
 }
 
