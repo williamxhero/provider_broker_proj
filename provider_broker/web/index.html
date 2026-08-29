@@ -90,13 +90,14 @@
   <aside id="catalog-editor" class="editor" aria-labelledby="catalog-editor-title" hidden>
     <form id="catalog-form">
       <div class="editor-heading"><div><p class="index">MODEL ROUTING</p><h2 id="catalog-editor-title">模型目录</h2></div><button id="close-catalog-editor" type="button" aria-label="关闭">×</button></div>
-      <p class="source-note">费率按每百万 token 计。stage 是路由分区，而非质量承诺。</p>
+      <p class="source-note">费率按每百万 token 计。整合价固定为 4% 未缓存输入 + 16% 缓存输入 + 80% 输出；stage 是路由分区，而非质量承诺。</p>
       <label>模型 ID<input name="model" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}" required></label>
       <label>模型家族<input name="family" required></label>
       <label>stage<select name="intellect"><option value="standard">standard</option><option value="smart">smart</option><option value="expert">expert</option></select></label>
       <label>输入费率 / 1M<input name="official_input_price" type="number" min="0" step="0.0001" required></label>
       <label>缓存输入费率 / 1M<input name="official_cache_price" type="number" min="0" step="0.0001" required></label>
       <label>输出费率 / 1M<input name="official_output_price" type="number" min="0" step="0.0001" required></label>
+      <label>整合价 / 1M<input name="blended_price" type="text" readonly aria-readonly="true"></label>
       <div class="editor-actions"><button id="catalog-delete" type="button" class="danger" hidden>删除模型</button><button id="cancel-catalog-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>

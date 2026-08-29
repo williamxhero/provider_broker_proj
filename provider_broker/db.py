@@ -7,6 +7,8 @@ from pathlib import Path
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
+from .catalog import blended_price
+
 
 @dataclass(frozen=True)
 class Provider:
@@ -118,12 +120,15 @@ class Store:
 
     def replace_source_snapshot(self, entries: list[dict], synced_at: str):
         rows = []
+        site_notes = []
         catalog = self.catalog()
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             from .catalog import canonicalize
             models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             fp = self.fingerprint(base_url, api_key, "\0".join(models))
+            if isinstance(entry.get('site_name'), str) and entry['site_name'].strip():
+                site_notes.append((entry['site_name'].strip(), fp))
             source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
             request_headers = json.dumps(entry.get('request_headers') or {}, sort_keys=True)
             rows.append((fp, entry.get("name", models[0]), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at))
@@ -136,6 +141,7 @@ class Store:
             self.conn.execute("DELETE FROM route_block")
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
             self.conn.executemany("UPDATE policy SET calibrated=? WHERE fingerprint=?", [(int(any(model in catalog for model in json.loads(r[6]))), r[0]) for r in rows])
+            self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=?", site_notes)
 
     def providers(self, tier: str) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.preference,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
@@ -149,7 +155,7 @@ class Store:
                 header_blob = r['request_headers']
                 headers = json.loads(self._decrypt(header_blob)) if header_blob else {}
                 pricing = catalog[models[0]]
-                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(pricing['official_output_price']*r['multiplier']*100),int(r['preference']),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
+                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['preference']),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
         return result
 
     def try_acquire(self, provider: Provider) -> bool:

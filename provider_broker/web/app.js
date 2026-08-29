@@ -7,7 +7,10 @@ const cell = (value) => {
   return td;
 };
 const formatPercent = (value) => value === null || value === undefined ? "暂无数据" : `${(value * 100).toFixed(1)}%`;
-const formatMs = (value) => value === null || value === undefined ? "暂无数据" : `${Math.round(value)} ms`;
+const formatMs = (value) => {
+  if (value === null || value === undefined) return "暂无数据";
+  return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
+};
 const formatPrice = (value) => value === null || value === undefined ? "未校准" : String(value);
 
 async function requestJson(url, options) {
@@ -76,9 +79,20 @@ function openCatalogEditor(model, item) {
   form.elements.official_input_price.value = item?.official_input_price ?? "";
   form.elements.official_cache_price.value = item?.official_cache_price ?? "";
   form.elements.official_output_price.value = item?.official_output_price ?? "";
+  updateBlendedPrice();
   byId("catalog-delete").hidden = !model;
   byId("catalog-editor").hidden = false;
   form.elements.model.focus();
+}
+
+function updateBlendedPrice() {
+  const form = byId("catalog-form");
+  const input = Number(form.elements.official_input_price.value);
+  const cached = Number(form.elements.official_cache_price.value);
+  const output = Number(form.elements.official_output_price.value);
+  form.elements.blended_price.value = [input, cached, output].every(Number.isFinite)
+    ? (input * 0.04 + cached * 0.16 + output * 0.80).toFixed(6)
+    : "";
 }
 
 function closeCatalogEditor() {
@@ -111,10 +125,10 @@ function renderProviders(payload) {
 
 function renderCatalog(payload) {
   const table = byId("catalog");
-  const body = tableHead(table, ["模型 ID", "模型家族", "stage", "输入 / 1M", "缓存输入 / 1M", "输出 / 1M", "可用 Key", "操作"]);
+  const body = tableHead(table, ["模型 ID", "模型家族", "stage", "输入 / 1M", "缓存输入 / 1M", "输出 / 1M", "整合价 / 1M", "可用 Key", "操作"]);
   Object.entries(payload.catalog).forEach(([model, item]) => {
     const row = document.createElement("tr");
-    [model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
+    [model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), formatPrice(item.blended_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button";
@@ -217,6 +231,7 @@ byId("policy").addEventListener("submit", async (event) => {
 });
 
 byId("catalog-create").addEventListener("click", () => openCatalogEditor());
+["official_input_price", "official_cache_price", "official_output_price"].forEach((name) => byId("catalog-form").elements[name].addEventListener("input", updateBlendedPrice));
 byId("catalog-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;

@@ -53,7 +53,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
         {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
     ]
-    catalog = {"luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "available_provider_count": 1}}
+    catalog = {"luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "blended_price": 1.656, "available_provider_count": 1}}
     seen = []
 
     def payload(path):
@@ -83,11 +83,11 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             seen.append((request.method, path, request.post_data))
             if path == "/admin/v1/catalog" and request.method == "POST":
                 body = request.post_data_json
-                catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"available_provider_count": 0}
+                catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"blended_price": 2.456, "available_provider_count": 0}
                 route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
             elif path.startswith("/admin/v1/catalog/") and request.method == "PUT":
                 model = path.rsplit("/", 1)[-1]
-                catalog[model] = request.post_data_json | {"available_provider_count": catalog[model]["available_provider_count"]}
+                catalog[model] = request.post_data_json | {"blended_price": 2.456, "available_provider_count": catalog[model]["available_provider_count"]}
                 route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
             elif path.startswith("/admin/v1/catalog/") and request.method == "DELETE":
                 catalog.pop(path.rsplit("/", 1)[-1])
@@ -104,6 +104,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
+        page.get_by_text("1.8 s", exact=True).first.wait_for()
         page.locator("#catalog-create").click()
         page.locator("#catalog-form [name=model]").fill("gpt-console-route")
         page.locator("#catalog-form [name=family]").fill("Console test")
@@ -111,6 +112,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.locator("#catalog-form [name=official_input_price]").fill("1")
         page.locator("#catalog-form [name=official_cache_price]").fill("0.1")
         page.locator("#catalog-form [name=official_output_price]").fill("3")
+        assert page.locator("#catalog-form [name=blended_price]").input_value() == "2.456000"
         page.locator("#catalog-form button[type=submit]").click()
         page.locator("#catalog").get_by_text("gpt-console-route", exact=True).wait_for()
         catalog_row = page.locator("#catalog tbody tr").filter(has_text="gpt-console-route")

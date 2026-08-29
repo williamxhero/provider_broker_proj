@@ -16,6 +16,17 @@ def _request_headers(value: object) -> dict[str, str]:
     }
 
 
+def _site_name(*values: object) -> str | None:
+    for value in values:
+        if not isinstance(value, dict):
+            continue
+        for field in ('site_name', 'site-name', 'siteName', 'name', 'id', 'label', 'endpoint'):
+            candidate = value.get(field)
+            if isinstance(candidate, str) and candidate.strip():
+                return candidate.strip()
+    return None
+
+
 def _api_url(base_url: str, suffix: str) -> str:
     base = base_url.rstrip("/")
     return base + suffix if base.endswith("/v1") else base + "/v1" + suffix
@@ -31,9 +42,10 @@ def expand_config(payload: object) -> list[dict]:
                 base=key.get('base_url') or key.get('base-url') or key.get('url')
                 secret=key.get('api_key') or key.get('api-key') or key.get('key')
                 if base and secret:
+                    site_name = _site_name(key)
                     configured=key.get('models') or []
                     aliases={str(model.get('alias')):str(model.get('name')) for model in configured if isinstance(model,dict) and model.get('alias') and model.get('name')}
-                    result.append({'name':key.get('name') or section,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':family,'request_headers':defaults,'source':{'section':section,'name':key.get('name') or section}})
+                    result.append({'name':site_name or section,'site_name':site_name,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':family,'request_headers':defaults,'source':{'section':section,'site_name':site_name}})
         return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
     if isinstance(roots, dict): roots = roots.values()
@@ -49,7 +61,8 @@ def expand_config(payload: object) -> list[dict]:
             names = [model.get("id") if isinstance(model,dict) else model for model in models]
             names = [str(name) for name in names if name]
             if base and secret and names:
-                result.append({"name":provider.get("name") or names[0],"base_url":base,"api_key":secret,"models":names,"provider_type":kind,"request_headers":_request_headers(provider.get("headers")),"source":{"provider":provider.get("name")}})
+                site_name = _site_name(key, provider)
+                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":base,"api_key":secret,"models":names,"provider_type":kind,"request_headers":_request_headers(provider.get("headers")),"source":{"site_name":site_name}})
     return result
 
 

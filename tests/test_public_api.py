@@ -198,7 +198,9 @@ async def test_sync_normalizes_cpa_sections_and_generate_uses_canonical_request(
     assert synced.status == 200
     inventory=(await (await client.get('/admin/v1/inventory',headers={'Authorization':'Bearer admin-secret'})).json())['providers']
     assert {p['family'] for p in inventory} == {'codex','anthropic','openai'}
-    assert next(p for p in inventory if p['family']=='codex')['models'] == ['gpt-5.6-terra']
+    codex = next(p for p in inventory if p['family']=='codex')
+    assert codex['models'] == ['gpt-5.6-terra']
+    assert codex['note'] == 'Luna key'
     assert all(secret not in str(inventory) for secret in ('luna-key','claude-key','compat-key'))
     response=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hello','intellect':'standard','effort':'high','deadline_ms':1000,'output_token_limit':20})
     assert response.status == 200  # fixed official catalog auto-calibrates known inventory
@@ -232,9 +234,12 @@ async def test_codex_sync_uses_cpa_headers_and_v1_base_url_for_responses(client,
 async def test_catalog_is_explicit_and_unknown_models_are_not_priced(client):
     response=await client.get('/admin/v1/catalog',headers={'Authorization':'Bearer admin-secret'})
     catalog=(await response.json())['catalog']
-    assert catalog['gpt-5.6-luna'] == {'family':'OpenAI GPT-5.6','intellect':'standard','official_input_price':.2,'official_cache_price':.02,'official_output_price':1.2,'available_provider_count':0}
+    assert catalog['gpt-5.6-luna'] == {'family':'OpenAI GPT-5.6','intellect':'standard','official_input_price':.2,'official_cache_price':.02,'official_output_price':1.2,'blended_price':.9712,'available_provider_count':0}
     assert catalog['gpt-5.6-terra']['intellect'] == 'smart'
     assert catalog['gpt-5.6-sol']['intellect'] == 'expert'
+    assert catalog['claude-opus-5']['official_output_price'] == 25
+    assert catalog['claude-opus-4-8']['intellect'] == 'expert'
+    assert catalog['claude-sonnet-5']['intellect'] == 'smart'
     assert 'luna' not in catalog and 'private-model' not in catalog
 
 
@@ -247,7 +252,7 @@ async def test_catalog_can_create_a_model_with_an_explicit_stage(client):
 
     assert created.status == 201
     catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
-    assert catalog['gpt-custom-route'] == {key: value for key, value in body.items() if key != 'model'} | {'available_provider_count': 0}
+    assert catalog['gpt-custom-route'] == {key: value for key, value in body.items() if key != 'model'} | {'blended_price': 2.456, 'available_provider_count': 0}
 
 
 async def test_catalog_stage_update_and_delete_control_routing(client, cpa):
@@ -255,6 +260,7 @@ async def test_catalog_stage_update_and_delete_control_routing(client, cpa):
     catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
     changed = catalog['gpt-5.6-luna'] | {'intellect': 'smart'}
     changed.pop('available_provider_count')
+    changed.pop('blended_price')
 
     assert (await client.put('/admin/v1/catalog/gpt-5.6-luna', json=changed)).status == 200
     generated = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'stage', 'intellect': 'standard'})

@@ -7,6 +7,7 @@ from pathlib import Path
 from aiohttp import web
 
 from .db import Store
+from .catalog import blended_price
 from .settings import Settings
 from .source import sync_cpa
 from .upstream import UpstreamFailure, invoke_stream, route
@@ -129,7 +130,7 @@ async def calls(request):
 
 async def catalog(request):
     counts = request.app["store"].catalog_counts()
-    built = {name: value | {"available_provider_count": counts.get(name, 0)} for name, value in request.app["store"].catalog().items()}
+    built = {name: value | {"blended_price": blended_price(value), "available_provider_count": counts.get(name, 0)} for name, value in request.app["store"].catalog().items()}
     return web.json_response({"catalog": built})
 
 
