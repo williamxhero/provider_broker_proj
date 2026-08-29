@@ -260,7 +260,7 @@ function stageOrder(value) {
 
 function renderModelView() {
   const table = byId("model-view");
-  const columns = [{ key: "model", label: "模型名称" }, { key: "intellect", label: "模型分组" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
+  const columns = [{ key: "intellect", label: "模型分组" }, { key: "model", label: "模型名称" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
   const body = tableHead(table, columns, "modelView", renderModelView);
   const models = Object.entries(state.catalog).map(([model, item]) => ({
     model,
@@ -276,28 +276,42 @@ function renderModelView() {
     if (key === "note") return item.providers.map((provider) => provider.note).join(" ");
     return item.model;
   });
-  sorted.forEach((item) => {
-    const bands = priceBands(item.providers);
-    const rowCount = bands.reduce((count, band) => count + band.providers.length, 0);
-    let rowIndex = 0;
-    bands.forEach((band) => {
-      band.providers.forEach((provider, index) => {
-        const row = document.createElement("tr");
-        if (rowIndex === 0) {
-        const model = cell(item.model);
-        const intellect = cell(item.intellect);
-          model.rowSpan = rowCount;
-          intellect.rowSpan = rowCount;
-        row.append(model, intellect);
-        }
-        if (index === 0) {
-          const priceBand = cell(band.label);
-          priceBand.rowSpan = band.providers.length;
-          row.append(priceBand);
-        }
-        row.append(cell(provider.note), cell(formatCost(provider.price)));
-        body.append(row);
-        rowIndex += 1;
+  const groups = [...sorted.reduce((byStage, item) => {
+    const group = byStage.get(item.intellect) || { intellect: item.intellect, models: [] };
+    group.models.push(item);
+    byStage.set(item.intellect, group);
+    return byStage;
+  }, new Map()).values()];
+  groups.forEach((group) => {
+    const groupRowCount = group.models.reduce((count, item) => count + priceBands(item.providers).reduce((total, band) => total + band.providers.length, 0), 0);
+    let groupRowIndex = 0;
+    group.models.forEach((item) => {
+      const bands = priceBands(item.providers);
+      const modelRowCount = bands.reduce((count, band) => count + band.providers.length, 0);
+      let modelRowIndex = 0;
+      bands.forEach((band) => {
+        band.providers.forEach((provider, index) => {
+          const row = document.createElement("tr");
+          if (groupRowIndex === 0) {
+            const intellect = cell(group.intellect);
+            intellect.rowSpan = groupRowCount;
+            row.append(intellect);
+          }
+          if (modelRowIndex === 0) {
+            const model = cell(item.model);
+            model.rowSpan = modelRowCount;
+            row.append(model);
+          }
+          if (index === 0) {
+            const priceBand = cell(band.label);
+            priceBand.rowSpan = band.providers.length;
+            row.append(priceBand);
+          }
+          row.append(cell(provider.note), cell(formatCost(provider.price)));
+          body.append(row);
+          groupRowIndex += 1;
+          modelRowIndex += 1;
+        });
       });
     });
   });

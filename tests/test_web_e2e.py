@@ -128,8 +128,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert base_urls.first.inner_text() == "https://alpha.invalid/<svg onload=window.__injected=3>"
         model_view = page.locator("#model-view tbody tr")
         assert model_view.count() == 2
-        assert model_view.locator("td").all_inner_texts() == ["luna", "standard", "低价组", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]
+        assert model_view.locator("td").all_inner_texts() == ["standard", "luna", "低价组", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]
         assert model_view.locator("td").nth(0).get_attribute("rowspan") == "2"
+        assert model_view.locator("td").nth(1).get_attribute("rowspan") == "2"
         page.locator("#model-view").get_by_role("button", name="价格组").click()
         page.locator("#race-parallel-cap").fill("2")
         page.locator("#save-routing").click()
