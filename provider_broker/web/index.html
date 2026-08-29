@@ -13,7 +13,6 @@
       <h1>路由运行态</h1>
       <p class="lede">CPA 是唯一人工维护源；此处保存手动同步快照与 Broker 调度策略。</p>
     </div>
-    <button id="sync" class="primary" type="button">从 CPA 手动同步</button>
   </header>
 
   <main>
@@ -23,7 +22,6 @@
         <div><span>可路由 API</span><strong id="routable">n/a</strong></div>
         <div><span>24 小时技术成功率</span><strong id="success">n/a</strong></div>
         <div><span>平均首字延迟</span><strong id="ttft">n/a</strong></div>
-        <div><span>最近同步</span><strong id="syncat">n/a</strong></div>
       </div>
       <output id="syncresult" class="notice" aria-live="polite"></output>
     </section>
@@ -31,7 +29,7 @@
     <section aria-labelledby="providers-title">
       <div class="section-heading">
         <div><p class="index">01 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><p>价格决定先后；同价模型组随机抽取指定数量的 Key 竞速。此数字对全部 stage 生效。</p><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
+        <div class="section-actions"><p>价格决定先后；同价模型组随机抽取指定数量的 Key 竞速。此数字对全部 stage 生效。</p><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
       </div>
       <div class="table-wrap"><table id="providers"></table></div>
     </section>

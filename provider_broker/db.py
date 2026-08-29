@@ -206,7 +206,7 @@ class Store:
 
     def inventory(self) -> list[dict]:
         rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
-        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"api_key_mask":self._decrypt(r['api_key'])[:3]+'***'+self._decrypt(r['api_key'])[-3:],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"note":r['note'],"max_parallel":r['max_parallel'],"multiplier":r['multiplier'],"technical_success_rate":self.conn.execute("SELECT avg(success) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"avg_ttft_ms":self.conn.execute("SELECT avg(latency_ms) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
+        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"api_key_mask":self._decrypt(r['api_key'])[:3]+'***'+self._decrypt(r['api_key'])[-3:],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"note":r['note'],"max_parallel":r['max_parallel'],"multiplier":r['multiplier'],"technical_success_rate":self.conn.execute("SELECT avg(success) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"avg_ttft_ms":self.conn.execute("SELECT avg(latency_ms) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"cost_24h":self.conn.execute("SELECT sum(cost) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:
@@ -222,12 +222,12 @@ class Store:
     def quality(self, window='24h'):
         modifier={'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]
         where="created_at >= datetime('now', ?)"; params=(modifier,)
-        row=self.conn.execute(f'SELECT count(*) calls, avg(success) rate, avg(latency_ms) ttft FROM observation WHERE {where}',params).fetchone()
+        row=self.conn.execute(f'SELECT count(*) calls, avg(success) rate, avg(latency_ms) ttft, sum(cost) total_cost FROM observation WHERE {where}',params).fetchone()
         values=[r[0] for r in self.conn.execute(f'SELECT latency_ms FROM observation WHERE {where} AND latency_ms IS NOT NULL ORDER BY latency_ms',params).fetchall()]
         p95=values[max(0, int(len(values)*.95)-1)] if values else None
         fulfillment=self.conn.execute(f'SELECT avg(actual_model=requested_model) FROM observation WHERE {where}',params).fetchone()[0]
         failures={s:self.conn.execute(f'SELECT count(*) FROM observation WHERE {where} AND status=?',params+(s,)).fetchone()[0] for s in ('cancelled','timed_out','transport_failed','protocol_failed','stream_incomplete')}
-        return {'calls':row['calls'],'technical_success_rate':row['rate'],'avg_ttft_ms':row['ttft'],'p95_ttft_ms':p95,'model_fulfillment_rate':fulfillment,'failures':failures}
+        return {'calls':row['calls'],'technical_success_rate':row['rate'],'avg_ttft_ms':row['ttft'],'p95_ttft_ms':p95,'total_cost':row['total_cost'],'model_fulfillment_rate':fulfillment,'failures':failures}
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h'):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]
         if cursor: clauses.append('o.id < ?'); params.append(int(cursor))

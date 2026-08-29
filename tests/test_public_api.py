@@ -113,6 +113,22 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     assert 'gpt-5.6-luna' in await streamed.text()
 
 
+async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa):
+    await client.post('/admin/v1/sync', headers={'Authorization':'Bearer admin-secret'})
+    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    client.app['store'].observe(
+        fingerprint=provider['fingerprint'], requested_model='gpt-5.6-luna', actual_model='gpt-5.6-luna',
+        tier='standard', effort='medium', success=1, latency_ms=100, error=None, status='completed',
+        input_tokens=100, output_tokens=50, cost=.125, request_id='cost-rollup',
+    )
+
+    inventory = (await (await client.get('/admin/v1/providers')).json())['providers']
+    quality = await (await client.get('/admin/v1/quality?window=1h')).json()
+
+    assert inventory[0]['cost_24h'] == .125
+    assert quality['total_cost'] == .125
+
+
 async def test_stream_emits_delta_before_final(client, cpa):
     response=await client.post('/admin/v1/sync',headers={'Authorization':'Bearer admin-secret'})
     provider=(await (await client.get('/admin/v1/inventory',headers={'Authorization':'Bearer admin-secret'})).json())['providers'][0]

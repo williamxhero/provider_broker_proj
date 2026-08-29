@@ -1,5 +1,7 @@
 const byId = (id) => document.getElementById(id);
-const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null };
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h" };
+const preferencesKey = "provider-broker.console.preferences.v1";
+const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
 const cell = (value) => {
   const td = document.createElement("td");
@@ -12,6 +14,26 @@ const formatMs = (value) => {
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
 };
 const formatPrice = (value) => value === null || value === undefined ? "n/a" : String(value);
+const formatCost = (value) => value === null || value === undefined || !Number.isFinite(Number(value))
+  ? "n/a"
+  : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(Number(value));
+
+function savePreferences() {
+  window.localStorage.setItem(preferencesKey, JSON.stringify(preferences));
+}
+
+function restoreControls() {
+  ["callwindow", "calllimit", "callprovider", "callstatus"].forEach((id) => {
+    if (preferences[id] !== undefined) byId(id).value = preferences[id];
+  });
+  state.qualityWindow = preferences.qualityWindow || state.qualityWindow;
+  setQualityWindow(state.qualityWindow);
+}
+
+function persistControl(id) {
+  preferences[id] = byId(id).value;
+  savePreferences();
+}
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
@@ -101,7 +123,7 @@ function closeCatalogEditor() {
 
 function renderProviders(payload) {
   const table = byId("providers");
-  const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "单 Key 并发上限", "模型库存", "技术成功率", "平均首字延迟", "操作"]);
+  const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "单 Key 并发上限", "模型库存", "24h 费用", "技术成功率", "平均首字延迟", "操作"]);
   payload.providers.forEach((provider) => {
     const row = document.createElement("tr");
     const status = document.createElement("span");
@@ -109,7 +131,18 @@ function renderProviders(payload) {
     status.textContent = provider.enabled ? "启用" : "停用";
     const statusCell = document.createElement("td");
     statusCell.append(status);
-    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(provider.multiplier), cell(provider.max_parallel), cell(`${(provider.models || []).join(", ")} / ${empty(provider.inventory_status)}`), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
+    const models = document.createElement("td");
+    const tags = document.createElement("div");
+    tags.className = "model-tags";
+    (provider.models || []).forEach((model) => {
+      const tag = document.createElement("span");
+      tag.className = "model-tag";
+      tag.textContent = model;
+      tags.append(tag);
+    });
+    if (!tags.childElementCount) tags.textContent = "n/a";
+    models.append(tags);
+    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(provider.multiplier), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button";
@@ -157,6 +190,7 @@ function renderQuality(payload) {
     metric("平均 TTFT", formatMs(payload.avg_ttft_ms)),
     metric("P95 TTFT", formatMs(payload.p95_ttft_ms)),
     metric("调用数", payload.calls),
+    metric("总费用", formatCost(payload.total_cost)),
     metric("模型履约率", formatPercent(payload.model_fulfillment_rate)),
     metric("cancelled", failures.cancelled),
     metric("timed_out", failures.timed_out),
@@ -181,7 +215,7 @@ function renderCalls(payload) {
   const body = tableHead(table, ["调用时间", "API Key 备注", "Provider", "请求模型", "实际模型", "intellect", "effort", "TTFT", "技术状态", "输入 Token", "输出 Token", "成本", "request ID"]);
   payload.items.forEach((item) => {
     const row = document.createElement("tr");
-    [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), item.status, item.input_tokens, item.output_tokens, item.cost, item.request_id].forEach((value) => row.append(cell(value)));
+    [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), item.status, item.input_tokens, item.output_tokens, formatCost(item.cost), item.request_id].forEach((value) => row.append(cell(value)));
     body.append(row);
   });
   state.cursor = payload.next_cursor || "";
@@ -203,7 +237,7 @@ async function load() {
     requestJson("/admin/v1/summary?window=24h"),
     requestJson("/admin/v1/providers"),
     requestJson("/admin/v1/catalog"),
-    requestJson("/admin/v1/quality?window=24h"),
+    requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
   ]);
   renderSummary(summary);
@@ -285,9 +319,16 @@ byId("sync").addEventListener("click", async () => {
 byId("windows").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-window]");
   if (!button) return;
-  byId("windows").querySelectorAll("button").forEach((item) => item.classList.toggle("active", item === button));
-  renderQuality(await requestJson(`/admin/v1/quality?window=${encodeURIComponent(button.dataset.window)}`));
+  setQualityWindow(button.dataset.window);
+  renderQuality(await requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`));
 });
+
+function setQualityWindow(windowName) {
+  state.qualityWindow = windowName;
+  preferences.qualityWindow = windowName;
+  savePreferences();
+  byId("windows").querySelectorAll("button").forEach((item) => item.classList.toggle("active", item.dataset.window === windowName));
+}
 
 function scheduleCallsReset() {
   window.clearTimeout(state.filterTimer);
@@ -296,8 +337,12 @@ function scheduleCallsReset() {
   byId("next").disabled = true;
   state.filterTimer = window.setTimeout(() => loadCalls(""), 30);
 }
-["callwindow", "calllimit", "callprovider", "callstatus"].forEach((id) => byId(id).addEventListener("input", scheduleCallsReset));
+["callwindow", "calllimit", "callprovider", "callstatus"].forEach((id) => byId(id).addEventListener("input", () => {
+  persistControl(id);
+  scheduleCallsReset();
+}));
 byId("next").addEventListener("click", () => loadCalls(byId("next").dataset.cursor));
 byId("close-editor").addEventListener("click", closeEditor);
 byId("cancel-editor").addEventListener("click", closeEditor);
+restoreControls();
 load().catch(() => { byId("syncresult").textContent = "管理数据加载失败"; });

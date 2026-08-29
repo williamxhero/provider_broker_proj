@@ -47,7 +47,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "note": "initial note <script>window.__injected=2</script>", "enabled": True,
         "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
         "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
-        "avg_ttft_ms": 1800, "multiplier": 1.0, "max_parallel": 3,
+        "avg_ttft_ms": 1800, "cost_24h": 0.02, "multiplier": 1.0, "max_parallel": 3,
     }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
@@ -66,7 +66,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
         if path.startswith("/admin/v1/quality"):
-            return {"calls": 7 if "window=7d" in path else 2, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
+            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 0.02, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):
             if "cursor=2" in path:
                 return {"items": [calls[1]], "next_cursor": None}
@@ -111,6 +111,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
+        assert page.locator("#providers .model-tag").all_inner_texts() == ["luna"]
+        assert "available" not in page.locator("#providers").inner_text()
+        page.get_by_text("$0.02", exact=True).first.wait_for()
         page.locator("#race-parallel-cap").fill("2")
         page.locator("#save-routing").click()
         page.get_by_text("同价竞速 Key 数已设为 2").wait_for()
@@ -150,6 +153,12 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("r-2").wait_for()
         page.get_by_role("button", name="下一页").click()
         page.get_by_text("r-1").wait_for()
+        page.reload()
+        expect(page.get_by_role("button", name="7d")).to_have_class(__import__("re").compile("active"))
+        assert page.locator("#callwindow").input_value() == "1h"
+        assert page.locator("#calllimit").input_value() == "2"
+        assert page.locator("#callprovider").input_value() == "Alpha"
+        assert page.locator("#callstatus").input_value() == "completed"
         assert page.locator("#providers").inner_text().find("saved note") >= 0
         assert any(method == "PATCH" and '"enabled":false' in (body or "") for method, _, body in seen)
         assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
