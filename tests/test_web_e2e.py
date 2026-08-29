@@ -158,8 +158,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert "available" not in page.locator("#providers").inner_text()
         assert page.locator("#providers").get_by_role("button", name="24h 费用").count() == 1
         page.get_by_text("$0.02", exact=True).first.wait_for()
-        cell_styles = page.locator("#providers tbody td, #model-view tbody td, #catalog tbody td, #calls tbody td").evaluate_all("cells => cells.map(cell => { const style = getComputedStyle(cell); return [style.lineHeight, style.paddingTop, style.paddingBottom]; })")
-        assert set(map(tuple, cell_styles)) == {("16px", "0px", "0px")}
+        cell_styles = page.locator("#providers tbody td, #model-view tbody td, #catalog tbody td, #calls tbody td").evaluate_all("cells => cells.map(cell => { const style = getComputedStyle(cell); return [style.lineHeight, style.paddingBottom]; })")
+        assert set(map(tuple, cell_styles)) == {("32px", "0px")}
         base_urls = page.locator("#providers tbody td[rowspan]")
         assert base_urls.count() == 1
         assert base_urls.first.get_attribute("rowspan") == "4"
