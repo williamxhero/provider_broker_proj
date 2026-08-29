@@ -196,15 +196,16 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('可路由 API','24 小时技术成功率','平均首字延迟','最近同步','从 CPA 手动同步','API Key','模型视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','API Key','模型视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
+    assert 'CPA 是唯一人工维护源' not in page
     assert 'client-secret' not in page and 'admin-secret' not in page
     css=await client.get('/static/styles.css')
     js=await client.get('/static/app.js')
     assert css.status == 200 and css.content_type == 'text/css'
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
-    for token in ('renderQuality','renderCalls','renderModelView','sortItems','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','n/a'):
+    for token in ('renderQuality','renderCalls','renderModelView','sortItems','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','可路由 API','技术成功率','平均 TTFT','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200
     assert (await client.get('/admin/v1/providers')).status == 200

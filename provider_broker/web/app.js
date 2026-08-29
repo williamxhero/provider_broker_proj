@@ -5,7 +5,7 @@ const sortDefaults = {
   modelView: { key: "intellect", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, sorts: {} };
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, summary: {}, sorts: {} };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
@@ -107,19 +107,9 @@ function tableHead(table, columns, list, render) {
   return table.tBodies[0];
 }
 
-function healthClass(success, ttft) {
-  if (success === null || success === undefined || ttft === null || ttft === undefined) return "";
-  if (success >= 0.95 && ttft <= 2000) return "healthy";
-  if (success >= 0.85 || ttft <= 5000) return "warning";
-  return "critical";
-}
-
 function renderSummary(summary) {
-  byId("routable").textContent = empty(summary.routable_apis);
-  byId("success").textContent = formatPercent(summary.technical_success_rate);
-  byId("ttft").textContent = formatMs(summary.avg_ttft_ms);
+  state.summary = summary;
   byId("syncat").textContent = formatShanghaiTime(summary.last_successful_sync);
-  byId("success").className = healthClass(summary.technical_success_rate, summary.avg_ttft_ms);
 }
 
 function formatShanghaiTime(value) {
@@ -345,6 +335,7 @@ function metric(label, value) {
 function renderQuality(payload) {
   const failures = payload.failures || {};
   byId("quality").replaceChildren(
+    metric("可路由 API", state.summary.routable_apis),
     metric("技术成功率", formatPercent(payload.technical_success_rate)),
     metric("平均 TTFT", formatMs(payload.avg_ttft_ms)),
     metric("P95 TTFT", formatMs(payload.p95_ttft_ms)),

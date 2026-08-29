@@ -11,47 +11,13 @@
     <div>
       <p class="eyebrow">PROVIDER BROKER / CONTROL PLANE</p>
       <h1>路由运行态</h1>
-      <p class="lede">CPA 是唯一人工维护源；此处保存手动同步快照与 Broker 调度策略。</p>
     </div>
   </header>
 
   <main>
-    <section class="summary" aria-labelledby="summary-title">
-      <h2 id="summary-title">24 小时健康摘要</h2>
-      <div class="summary-grid">
-        <div><span>可路由 API</span><strong id="routable">n/a</strong></div>
-        <div><span>24 小时技术成功率</span><strong id="success">n/a</strong></div>
-        <div><span>平均首字延迟</span><strong id="ttft">n/a</strong></div>
-      </div>
-      <output id="syncresult" class="notice" aria-live="polite"></output>
-    </section>
-
-    <section aria-labelledby="providers-title">
-      <div class="section-heading">
-        <div><p class="index">01 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
-      </div>
-      <div class="table-wrap"><table id="providers"></table></div>
-    </section>
-
-    <section aria-labelledby="model-view-title">
-      <div class="section-heading">
-        <div><p class="index">02 / MODEL VIEW</p><h2 id="model-view-title">模型视角</h2></div>
-      </div>
-      <div class="table-wrap"><table id="model-view"></table></div>
-    </section>
-
-    <section aria-labelledby="catalog-title">
-      <div class="section-heading">
-        <div><p class="index">03 / CATALOG</p><h2 id="catalog-title">模型费率</h2></div>
-        <div class="section-actions"><button id="catalog-apply" class="secondary" type="button">应用目录到库存</button><button id="catalog-create" class="secondary" type="button">新增模型</button></div>
-      </div>
-      <div class="table-wrap"><table id="catalog"></table></div>
-    </section>
-
     <section aria-labelledby="quality-title">
       <div class="section-heading">
-        <div><p class="index">04 / QUALITY</p><h2 id="quality-title">调用质量</h2></div>
+        <div><p class="index">01 / QUALITY</p><h2 id="quality-title">调用质量</h2></div>
         <nav id="windows" class="segmented" aria-label="质量时间窗">
           <button type="button" data-window="1h">1h</button>
           <button type="button" data-window="24h" class="active">24h</button>
@@ -60,6 +26,30 @@
         </nav>
       </div>
       <div id="quality" class="quality-grid"></div>
+    </section>
+
+    <section aria-labelledby="providers-title">
+      <div class="section-heading">
+        <div><p class="index">02 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
+        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
+      </div>
+      <output id="syncresult" class="notice" aria-live="polite"></output>
+      <div class="table-wrap"><table id="providers"></table></div>
+    </section>
+
+    <section aria-labelledby="model-view-title">
+      <div class="section-heading">
+        <div><p class="index">03 / MODEL VIEW</p><h2 id="model-view-title">模型视角</h2></div>
+      </div>
+      <div class="table-wrap"><table id="model-view"></table></div>
+    </section>
+
+    <section aria-labelledby="catalog-title">
+      <div class="section-heading">
+        <div><p class="index">04 / CATALOG</p><h2 id="catalog-title">模型费率</h2></div>
+        <div class="section-actions"><button id="catalog-apply" class="secondary" type="button">应用目录到库存</button><button id="catalog-create" class="secondary" type="button">新增模型</button></div>
+      </div>
+      <div class="table-wrap"><table id="catalog"></table></div>
     </section>
 
     <section aria-labelledby="calls-title">
