@@ -121,6 +121,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
         assert page.locator(".masthead").count() == 0
         assert page.locator("main > section").first.locator("h2").inner_text() == "调用质量"
+        assert page.locator("main > section").first.locator(".index").inner_text() == "01 / QUALITY"
         assert page.locator(".lede").count() == 0
         assert page.locator("#quality").get_by_text("可路由 API", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("技术成功率", exact=True).count() == 1
