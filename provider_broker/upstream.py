@@ -256,13 +256,12 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
 
 def price_bands(providers):
-    """Return at most two price bands, ordered from lower to higher price."""
-    prices = sorted({provider.price_group for provider in providers})
-    if len(prices) < 2:
-        return [providers] if providers else []
-    split = max(range(len(prices) - 1), key=lambda index: prices[index + 1] - prices[index])
-    lower_prices = set(prices[:split + 1])
-    return [
-        [provider for provider in providers if provider.price_group in lower_prices],
-        [provider for provider in providers if provider.price_group not in lower_prices],
-    ]
+    """Split all Key prices at their median, ordered from lower to higher price."""
+    ordered = sorted(providers, key=lambda provider: (provider.price_group, provider.id))
+    if not ordered:
+        return []
+    midpoint = len(ordered) // 2
+    median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
+    lower = [provider for provider in ordered if provider.price_group <= median]
+    higher = [provider for provider in ordered if provider.price_group > median]
+    return [lower] + ([higher] if higher else [])

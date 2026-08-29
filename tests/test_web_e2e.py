@@ -53,6 +53,10 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
         "base_url": "https://alpha.invalid/v1", "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "multiplier": 1.5,
     }
+    cheapest_provider = provider | {
+        "fingerprint": "provider-c", "note": "cheapest note", "api_key_mask": "ghi***rst",
+        "base_url": "https://alpha.invalid/api", "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "multiplier": 0.5,
+    }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
         {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
@@ -64,7 +68,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path.startswith("/admin/v1/summary"):
             return {"routable_apis": 1, "technical_success_rate": 0.98, "avg_ttft_ms": 1800, "last_successful_sync": "2026-08-29T10:00:00Z"}
         if path == "/admin/v1/providers":
-            return {"providers": [provider, same_site_provider]}
+            return {"providers": [provider, same_site_provider, cheapest_provider]}
         if path == "/admin/v1/catalog":
             return {"catalog": catalog}
         if path == "/admin/v1/routing":
@@ -119,19 +123,20 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#race-parallel-cap").count() == 1
         assert "价格决定先后" not in page.content()
         assert "stage 决定路由分区" not in page.content()
-        assert page.locator("#providers .model-tag").all_inner_texts() == ["luna", "luna"]
+        assert page.locator("#providers .model-tag").all_inner_texts() == ["luna", "luna", "luna"]
         assert "available" not in page.locator("#providers").inner_text()
         page.get_by_text("$0.02", exact=True).first.wait_for()
         base_urls = page.locator("#providers tbody td[rowspan]")
         assert base_urls.count() == 1
-        assert base_urls.first.get_attribute("rowspan") == "2"
+        assert base_urls.first.get_attribute("rowspan") == "3"
         assert base_urls.first.inner_text() == "https://alpha.invalid"
         assert "/v1" not in page.locator("#providers").inner_text()
         model_view = page.locator("#model-view tbody tr")
-        assert model_view.count() == 2
-        assert model_view.locator("td").all_inner_texts() == ["standard", "luna", "低价组", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]
-        assert model_view.locator("td").nth(0).get_attribute("rowspan") == "2"
-        assert model_view.locator("td").nth(1).get_attribute("rowspan") == "2"
+        assert model_view.count() == 3
+        assert model_view.locator("td").all_inner_texts() == ["standard", "luna", "低价组", "cheapest note", "$0.828", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]
+        assert model_view.locator("td").nth(0).get_attribute("rowspan") == "3"
+        assert model_view.locator("td").nth(1).get_attribute("rowspan") == "3"
+        assert model_view.locator("td").nth(2).get_attribute("rowspan") == "2"
         page.locator("#model-view").get_by_role("button", name="价格组").click()
         page.locator("#race-parallel-cap").fill("2")
         page.locator("#save-routing").click()

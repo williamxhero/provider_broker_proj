@@ -324,14 +324,12 @@ function renderModelView() {
 
 function priceBands(providers) {
   if (!providers.length) return [{ label: "n/a", providers: [{ note: "n/a", price: null }] }];
-  const prices = [...new Set(providers.map((provider) => provider.price))].sort((left, right) => left - right);
-  if (prices.length === 1) return [{ label: "低价组", providers }];
-  const split = prices.slice(0, -1).reduce((best, price, index) => prices[index + 1] - price > prices[best + 1] - prices[best] ? index : best, 0);
-  const lower = new Set(prices.slice(0, split + 1));
-  return [
-    { label: "低价组", providers: providers.filter((provider) => lower.has(provider.price)) },
-    { label: "高价组", providers: providers.filter((provider) => !lower.has(provider.price)) },
-  ];
+  const ordered = [...providers].sort((left, right) => left.price - right.price || compareValues(left.note, right.note));
+  const midpoint = Math.floor(ordered.length / 2);
+  const median = ordered.length % 2 ? ordered[midpoint].price : (ordered[midpoint - 1].price + ordered[midpoint].price) / 2;
+  const lower = ordered.filter((provider) => provider.price <= median);
+  const higher = ordered.filter((provider) => provider.price > median);
+  return [{ label: "低价组", providers: lower }, ...(higher.length ? [{ label: "高价组", providers: higher }] : [])];
 }
 
 function metric(label, value) {
