@@ -1,15 +1,16 @@
 [Unit]
 Description=Private Provider Broker
-After=network-online.target cpa-manager.service
+After=network-online.target cpa-manager.service provider-broker-firewall.service
 Wants=network-online.target
+Requires=provider-broker-firewall.service
 
 [Service]
 Type=simple
 User=yosef
 Group=yosef
-WorkingDirectory=/data/provider-broker/app
+WorkingDirectory=/data/provider-broker/current
 EnvironmentFile=/data/provider-broker/secrets/broker.env
-ExecStart=/data/provider-broker/venv/bin/python -m provider_broker
+ExecStart=/data/provider-broker/current/venv/bin/python -m provider_broker
 Restart=on-failure
 RestartSec=3
 NoNewPrivileges=true

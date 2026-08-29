@@ -1,17 +1,39 @@
 import datetime
 from aiohttp import ClientSession
 
+from .catalog import canonicalize
+
+
+def _request_headers(value: object) -> dict[str, str]:
+    """Keep CPA's transport defaults without permitting credential/header overrides."""
+    blocked = {"authorization", "content-type", "content-length", "host"}
+    if not isinstance(value, dict):
+        return {}
+    return {
+        str(name): str(header_value)
+        for name, header_value in value.items()
+        if str(name).lower() not in blocked and isinstance(header_value, (str, int, float))
+    }
+
+
+def _api_url(base_url: str, suffix: str) -> str:
+    base = base_url.rstrip("/")
+    return base + suffix if base.endswith("/v1") else base + "/v1" + suffix
+
 
 def expand_config(payload: object) -> list[dict]:
     """Normalize CPA config variants into one immutable direct-upstream per key/model."""
     if isinstance(payload, dict) and any(k in payload for k in ('codex-api-key','claude-api-key','openai-compatibility')):
         result=[]
         for section, family in (('codex-api-key','codex'),('claude-api-key','anthropic'),('openai-compatibility','openai')):
+            defaults = _request_headers(payload.get('codex-header-defaults')) if family == 'codex' else {}
             for key in payload.get(section,[]) or []:
                 base=key.get('base_url') or key.get('base-url') or key.get('url')
                 secret=key.get('api_key') or key.get('api-key') or key.get('key')
                 if base and secret:
-                    result.append({'name':key.get('name') or section,'base_url':base,'api_key':secret,'model':'unavailable','provider_type':family,'source':{'section':section,'name':key.get('name') or section}})
+                    configured=key.get('models') or []
+                    aliases={str(model.get('alias')):str(model.get('name')) for model in configured if isinstance(model,dict) and model.get('alias') and model.get('name')}
+                    result.append({'name':key.get('name') or section,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':family,'request_headers':defaults,'source':{'section':section,'name':key.get('name') or section}})
         return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
     if isinstance(roots, dict): roots = roots.values()
@@ -24,15 +46,16 @@ def expand_config(payload: object) -> list[dict]:
         for key in keys:
             secret = key.get("api_key") or key.get("key") or key.get("token")
             models = key.get("models") or provider.get("models") or []
-            for model in models:
-                name = model.get("id") if isinstance(model,dict) else model
-                if base and secret and name:
-                    result.append({"name":provider.get("name") or str(name),"base_url":base,"api_key":secret,"model":str(name),"provider_type":kind,"source":{"provider":provider.get("name"),"model":str(name)}})
+            names = [model.get("id") if isinstance(model,dict) else model for model in models]
+            names = [str(name) for name in names if name]
+            if base and secret and names:
+                result.append({"name":provider.get("name") or names[0],"base_url":base,"api_key":secret,"models":names,"provider_type":kind,"request_headers":_request_headers(provider.get("headers")),"source":{"provider":provider.get("name")}})
     return result
 
 
-async def sync_cpa(store, url: str, token: str) -> int:
+async def sync_cpa(store, url: str, token: str) -> dict:
     headers={"X-Management-Key":token} if token else {}
+    inventory_failures=0
     async with ClientSession() as session:
         async with session.get(url.rstrip("/")+"/v0/management/config",headers=headers,timeout=20) as response:
             response.raise_for_status(); payload=await response.json()
@@ -41,13 +64,16 @@ async def sync_cpa(store, url: str, token: str) -> int:
     if not entries: raise ValueError('invalid source configuration')
     async with ClientSession() as session:
         for entry in entries:
-            headers={'Authorization':'Bearer '+entry['api_key']}
+            headers=entry.get('request_headers', {}) | {'Authorization':'Bearer '+entry['api_key']}
             try:
-                async with session.get(entry['base_url'].rstrip('/')+'/models',headers=headers,timeout=10) as response:
+                async with session.get(_api_url(entry['base_url'], '/models'),headers=headers,timeout=10) as response:
                     raw=await response.json(content_type=None)
-                    models=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
+                    discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
+                    aliases=entry.get('aliases',{})
+                    models=list(dict.fromkeys(canonicalize(aliases.get(model,model)) for model in discovered))
                     entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
             except Exception:
                 entry['models']=['unavailable']; entry['inventory_status']='unavailable'
+                inventory_failures+=1
     store.replace_source_snapshot(entries, datetime.datetime.now(datetime.UTC).isoformat())
-    return len(entries)
+    return {'count':len(entries),'inventory_failures':inventory_failures}

@@ -1,0 +1,12 @@
+[Unit]
+Description=Provider Broker port restriction
+Before=provider-broker.service
+
+[Service]
+Type=oneshot
+ExecStart=/data/provider-broker/current/firewall.sh apply
+ExecStop=/data/provider-broker/current/firewall.sh remove
+RemainAfterExit=yes
+
+[Install]
+WantedBy=multi-user.target

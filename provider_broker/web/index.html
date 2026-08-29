@@ -1,0 +1,90 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Provider Broker 管理控制台</title>
+  <link rel="stylesheet" href="/static/styles.css">
+</head>
+<body>
+  <header class="masthead">
+    <div>
+      <p class="eyebrow">PROVIDER BROKER / CONTROL PLANE</p>
+      <h1>路由运行态</h1>
+      <p class="lede">CPA 是唯一人工维护源；此处保存手动同步快照与 Broker 调度策略。</p>
+    </div>
+    <button id="sync" class="primary" type="button">从 CPA 手动同步</button>
+  </header>
+
+  <main>
+    <section class="summary" aria-labelledby="summary-title">
+      <h2 id="summary-title">24 小时健康摘要</h2>
+      <div class="summary-grid">
+        <div><span>可路由 API</span><strong id="routable">暂无数据</strong></div>
+        <div><span>24 小时技术成功率</span><strong id="success">暂无数据</strong></div>
+        <div><span>平均首字延迟</span><strong id="ttft">暂无数据</strong></div>
+        <div><span>最近同步</span><strong id="syncat">暂无数据</strong></div>
+      </div>
+      <output id="syncresult" class="notice" aria-live="polite"></output>
+    </section>
+
+    <section aria-labelledby="providers-title">
+      <div class="section-heading">
+        <div><p class="index">01 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
+        <p>CPA 来源字段只读；备注、倍率、启停、偏好与并发由 Broker 管理。</p>
+      </div>
+      <div class="table-wrap"><table id="providers"></table></div>
+    </section>
+
+    <section aria-labelledby="catalog-title">
+      <div class="section-heading">
+        <div><p class="index">02 / CATALOG</p><h2 id="catalog-title">模型费率</h2></div>
+        <p>仅展示显式校准的 intellect 与官方费率；未知模型不推断。</p>
+      </div>
+      <div class="table-wrap"><table id="catalog"></table></div>
+    </section>
+
+    <section aria-labelledby="quality-title">
+      <div class="section-heading">
+        <div><p class="index">03 / QUALITY</p><h2 id="quality-title">调用质量</h2></div>
+        <nav id="windows" class="segmented" aria-label="质量时间窗">
+          <button type="button" data-window="1h">1h</button>
+          <button type="button" data-window="24h" class="active">24h</button>
+          <button type="button" data-window="7d">7d</button>
+          <button type="button" data-window="30d">30d</button>
+        </nav>
+      </div>
+      <div id="quality" class="quality-grid"></div>
+    </section>
+
+    <section aria-labelledby="calls-title">
+      <div class="section-heading">
+        <div><p class="index">04 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
+        <div class="filters">
+          <label>时间窗<select id="callwindow"><option>1h</option><option selected>24h</option><option>7d</option><option>30d</option></select></label>
+          <label>每页<select id="calllimit"><option>2</option><option>10</option><option selected>25</option></select></label>
+          <label>Provider<input id="callprovider" type="search" placeholder="指纹或 Provider"></label>
+          <label>状态<input id="callstatus" type="search" placeholder="completed"></label>
+        </div>
+      </div>
+      <div class="table-wrap"><table id="calls"></table></div>
+      <button id="next" class="secondary" type="button">下一页</button>
+    </section>
+  </main>
+
+  <aside id="editor" class="editor" aria-labelledby="editor-title" hidden>
+    <form id="policy">
+      <div class="editor-heading"><div><p class="index">POLICY</p><h2 id="editor-title">编辑 API Key</h2></div><button id="close-editor" type="button" aria-label="关闭">×</button></div>
+      <p id="editor-source" class="source-note"></p>
+      <label>备注<input name="note" type="text"></label>
+      <label>倍率<input name="multiplier" type="number" min="0.01" step="0.01" required></label>
+      <label class="toggle"><input name="enabled" type="checkbox">启用</label>
+      <label>preference<input name="preference" type="number" step="1" required></label>
+      <label>并发数<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
+      <div class="editor-actions"><button id="cancel-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </aside>
+
+  <script src="/static/app.js" defer></script>
+</body>
+</html>

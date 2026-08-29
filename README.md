@@ -21,4 +21,4 @@ Routing races all eligible providers in the cheapest price group, cancels losers
 
 From Windows: `powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1`.
 
-The installer creates `/data/provider-broker`, preserves an existing secret env file, imports CPA's server-local management token only during first install, binds to `192.168.50.2:8817`, and adds UFW rules when UFW is available. Run the independent smoke on the server with `set -a; . /data/provider-broker/secrets/broker.env; set +a; /data/provider-broker/venv/bin/python /data/provider-broker/app/scripts/smoke.py`.
+The deploy script builds and uploads one wheel, installs it under `/data/provider-broker/releases/<version>`, atomically switches `/data/provider-broker/current`, and retains `/data/provider-broker/previous` for rollback. It preserves the 0600 secret env file, binds to `192.168.50.2:8817`, and applies UFW rules when UFW is active. Run the independent smoke on the server with `set -a; . /data/provider-broker/secrets/broker.env; set +a; /data/provider-broker/current/venv/bin/python /data/provider-broker/current/smoke.py`.

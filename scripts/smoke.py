@@ -1,20 +1,36 @@
 #!/usr/bin/env python3
-"""Independent live broker smoke.  Never prints credentials or source keys."""
+"""Independent live broker smoke. Never prints credentials or response bodies on failure."""
 import json
 import os
 import sys
+import urllib.error
 import urllib.request
 
-base=os.getenv("BROKER_URL","http://192.168.50.2:8817").rstrip("/")
-token=os.environ["BROKER_CLIENT_TOKEN"]
+base = os.getenv("BROKER_URL", "http://192.168.50.2:8817").rstrip("/")
+token = os.environ["BROKER_CLIENT_TOKEN"]
 
-def request(path, payload):
-    req=urllib.request.Request(base+path,data=json.dumps(payload).encode(),headers={"Authorization":"Bearer "+token,"Content-Type":"application/json"},method="POST")
-    with urllib.request.urlopen(req,timeout=90) as response:
-        return response.status,json.load(response)
 
-for model,effort in (("standard","high"),("smart","medium"),("expert","low")):
-    status,data=request("/v1/generate",{"model":model,"effort":effort,"input":"Reply with exactly: provider-broker-ok"})
-    if status != 200 or not data.get("actual_model"):
-        raise SystemExit(f"{model}/{effort}: failed")
-    print(f"{model}/{effort}: OK actual_model={data['actual_model']}")
+def request(payload):
+    req = urllib.request.Request(
+        base + "/v1/generate", data=json.dumps(payload).encode(),
+        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST",
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=120) as response:
+            return response.status, json.load(response)
+    except urllib.error.HTTPError as exc:
+        return exc.code, None
+    except Exception:
+        return "transport_error", None
+
+
+failures = 0
+for intellect, effort in (("standard", "high"), ("smart", "medium"), ("expert", "low")):
+    status, data = request({"prompt": "Reply with exactly: provider-broker-ok", "intellect": intellect, "effort": effort, "output_token_limit": 40})
+    if status != 200 or not isinstance(data, dict) or data.get("status") != "completed":
+        failures += 1
+        print(json.dumps({"intellect": intellect, "effort": effort, "http_status": status, "technical_status": "failed"}))
+        continue
+    print(json.dumps({key: data.get(key) for key in ("status", "provider", "intellect", "fulfilled_intellect", "actual_model", "ttft_ms", "usage", "request_id")}, ensure_ascii=False))
+
+sys.exit(1 if failures else 0)

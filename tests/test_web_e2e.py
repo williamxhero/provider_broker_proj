@@ -1,0 +1,118 @@
+import asyncio
+import base64
+import threading
+from pathlib import Path
+
+from aiohttp import web
+from playwright.sync_api import sync_playwright
+
+from provider_broker.app import create_app
+from provider_broker.settings import Settings
+
+
+class LiveBroker:
+    def __init__(self, database_path: Path):
+        self.database_path = database_path
+        self.ready = threading.Event()
+        self.loop = asyncio.new_event_loop()
+        self.thread = threading.Thread(target=self._run, daemon=True)
+
+    def __enter__(self):
+        self.thread.start()
+        assert self.ready.wait(10)
+        return self
+
+    def _run(self):
+        asyncio.set_event_loop(self.loop)
+        settings = Settings(self.database_path, "client-secret", "admin-secret", "session-secret", base64.b64encode(b"x" * 32).decode())
+        self.app = create_app(settings)
+        self.runner = web.AppRunner(self.app)
+        self.loop.run_until_complete(self.runner.setup())
+        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        self.loop.run_until_complete(self.site.start())
+        self.url = f"http://127.0.0.1:{self.site._server.sockets[0].getsockname()[1]}"
+        self.ready.set()
+        self.loop.run_forever()
+
+    def __exit__(self, *_):
+        asyncio.run_coroutine_threadsafe(self.runner.cleanup(), self.loop).result(10)
+        self.loop.call_soon_threadsafe(self.loop.stop)
+        self.thread.join(10)
+
+
+def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
+    """A logged-in administrator can use every management interaction from visible DOM."""
+    provider = {
+        "fingerprint": "provider-a", "name": "Alpha <img src=x onerror=window.__injected=1>",
+        "note": "initial note <script>window.__injected=2</script>", "enabled": True,
+        "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
+        "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
+        "avg_ttft_ms": 1800, "multiplier": 1.0, "preference": 2, "max_parallel": 3,
+    }
+    calls = [
+        {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
+        {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
+    ]
+    seen = []
+
+    def payload(path):
+        if path.startswith("/admin/v1/summary"):
+            return {"routable_apis": 1, "technical_success_rate": 0.98, "avg_ttft_ms": 1800, "last_successful_sync": "2026-08-29T10:00:00Z"}
+        if path == "/admin/v1/providers":
+            return {"providers": [provider]}
+        if path == "/admin/v1/catalog":
+            return {"catalog": {"luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "available_provider_count": 1}}}
+        if path.startswith("/admin/v1/quality"):
+            return {"calls": 7 if "window=7d" in path else 2, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
+        if path.startswith("/admin/v1/calls"):
+            if "cursor=2" in path:
+                return {"items": [calls[1]], "next_cursor": None}
+            return {"items": [calls[0]], "next_cursor": "2"}
+        if path == "/admin/v1/sync":
+            return {"added": 1, "updated": 0, "offlined": 0, "inventory_failures": 0, "last_successful_sync": "2026-08-29T10:00:00Z"}
+        raise AssertionError(path)
+
+    with LiveBroker(tmp_path / "broker.sqlite3") as broker, sync_playwright() as playwright:
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+
+        def route_handler(route):
+            request = route.request
+            path = request.url.removeprefix(broker.url)
+            seen.append((request.method, path, request.post_data))
+            if request.method == "PATCH":
+                provider.update(request.post_data_json)
+                route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
+            else:
+                route.fulfill(status=200, content_type="application/json", body=__import__("json").dumps(payload(path)))
+
+        page.route("**/admin/v1/**", route_handler)
+        page.goto(broker.url + "/login")
+        page.get_by_label("管理令牌").fill("admin-secret")
+        page.get_by_role("button", name="登录").click()
+        page.wait_for_url(broker.url + "/")
+        assert page.evaluate("window.__injected") is None
+        assert page.locator("#providers img, #providers svg, #providers script").count() == 0
+        assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
+        assert "provider-secret" not in page.content()
+        page.get_by_role("button", name="编辑").click()
+        assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
+        page.get_by_label("备注").fill("saved note")
+        page.get_by_label("启用").uncheck()
+        page.get_by_role("button", name="保存").click()
+        page.get_by_role("button", name="从 CPA 手动同步").click()
+        page.get_by_text("added 1 updated 0 offlined 0 inventory_failures 0").wait_for()
+        page.get_by_role("button", name="7d").click()
+        page.get_by_text("7", exact=True).last.wait_for()
+        page.locator("#callprovider").fill("Alpha")
+        page.locator("#callstatus").fill("completed")
+        page.locator("#callwindow").select_option("1h")
+        page.locator("#calllimit").select_option("2")
+        page.get_by_text("r-2").wait_for()
+        page.get_by_role("button", name="下一页").click()
+        page.get_by_text("r-1").wait_for()
+        assert page.locator("#providers").inner_text().find("saved note") >= 0
+        assert any(method == "PATCH" and '"enabled":false' in (body or "") for method, _, body in seen)
+        assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
+        assert any("limit=2" in path for _, path, _ in seen)
+        browser.close()
