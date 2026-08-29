@@ -4,7 +4,7 @@ import threading
 from pathlib import Path
 
 from aiohttp import web
-from playwright.sync_api import sync_playwright
+from playwright.sync_api import expect, sync_playwright
 
 from provider_broker.app import create_app
 from provider_broker.settings import Settings
@@ -41,7 +41,7 @@ class LiveBroker:
 
 
 def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
-    """A logged-in administrator can use every management interaction from visible DOM."""
+    """An operator can use management, catalog CRUD, and filters from visible DOM."""
     provider = {
         "fingerprint": "provider-a", "name": "Alpha <img src=x onerror=window.__injected=1>",
         "note": "initial note <script>window.__injected=2</script>", "enabled": True,
@@ -53,6 +53,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
         {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
     ]
+    catalog = {"luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "available_provider_count": 1}}
     seen = []
 
     def payload(path):
@@ -61,7 +62,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path == "/admin/v1/providers":
             return {"providers": [provider]}
         if path == "/admin/v1/catalog":
-            return {"catalog": {"luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "available_provider_count": 1}}}
+            return {"catalog": catalog}
         if path.startswith("/admin/v1/quality"):
             return {"calls": 7 if "window=7d" in path else 2, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):
@@ -80,7 +81,18 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             request = route.request
             path = request.url.removeprefix(broker.url)
             seen.append((request.method, path, request.post_data))
-            if request.method == "PATCH":
+            if path == "/admin/v1/catalog" and request.method == "POST":
+                body = request.post_data_json
+                catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"available_provider_count": 0}
+                route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
+            elif path.startswith("/admin/v1/catalog/") and request.method == "PUT":
+                model = path.rsplit("/", 1)[-1]
+                catalog[model] = request.post_data_json | {"available_provider_count": catalog[model]["available_provider_count"]}
+                route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
+            elif path.startswith("/admin/v1/catalog/") and request.method == "DELETE":
+                catalog.pop(path.rsplit("/", 1)[-1])
+                route.fulfill(status=204, body="")
+            elif request.method == "PATCH":
                 provider.update(request.post_data_json)
                 route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
             else:
@@ -92,7 +104,24 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
-        page.get_by_role("button", name="编辑").click()
+        page.locator("#catalog-create").click()
+        page.locator("#catalog-form [name=model]").fill("gpt-console-route")
+        page.locator("#catalog-form [name=family]").fill("Console test")
+        page.locator("#catalog-form [name=intellect]").select_option("standard")
+        page.locator("#catalog-form [name=official_input_price]").fill("1")
+        page.locator("#catalog-form [name=official_cache_price]").fill("0.1")
+        page.locator("#catalog-form [name=official_output_price]").fill("3")
+        page.locator("#catalog-form button[type=submit]").click()
+        page.locator("#catalog").get_by_text("gpt-console-route", exact=True).wait_for()
+        catalog_row = page.locator("#catalog tbody tr").filter(has_text="gpt-console-route")
+        catalog_row.locator("button").click()
+        page.locator("#catalog-form [name=intellect]").select_option("smart")
+        page.locator("#catalog-form button[type=submit]").click()
+        page.locator("#catalog tbody tr").filter(has_text="gpt-console-route").get_by_text("smart", exact=True).wait_for()
+        page.locator("#catalog tbody tr").filter(has_text="gpt-console-route").locator("button").click()
+        page.locator("#catalog-delete").click()
+        expect(page.locator("#catalog").get_by_text("gpt-console-route", exact=True)).to_have_count(0)
+        page.locator("#providers").get_by_role("button", name="编辑").click()
         assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
         page.get_by_label("备注").fill("saved note")
         page.get_by_label("启用").uncheck()
@@ -112,4 +141,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert any(method == "PATCH" and '"enabled":false' in (body or "") for method, _, body in seen)
         assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
         assert any("limit=2" in path for _, path, _ in seen)
+        assert any(method == "POST" and path == "/admin/v1/catalog" for method, path, _ in seen)
+        assert any(method == "PUT" and path.endswith("/gpt-console-route") for method, path, _ in seen)
+        assert any(method == "DELETE" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         browser.close()

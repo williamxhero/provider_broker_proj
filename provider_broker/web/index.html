@@ -39,7 +39,7 @@
     <section aria-labelledby="catalog-title">
       <div class="section-heading">
         <div><p class="index">02 / CATALOG</p><h2 id="catalog-title">模型费率</h2></div>
-        <p>仅展示显式校准的 intellect 与官方费率；未知模型不推断。</p>
+        <div class="section-actions"><p>stage 决定路由分区：standard 可向 smart、expert 升级；smart 只可向 expert 升级。</p><button id="catalog-create" class="secondary" type="button">新增模型</button></div>
       </div>
       <div class="table-wrap"><table id="catalog"></table></div>
     </section>
@@ -80,8 +80,24 @@
       <label>倍率<input name="multiplier" type="number" min="0.01" step="0.01" required></label>
       <label class="toggle"><input name="enabled" type="checkbox">启用</label>
       <label>preference<input name="preference" type="number" step="1" required></label>
+      <p class="field-help">同一 price group 内，数值更高的 Key 优先参加竞速；不会改变模型 stage。</p>
       <label>并发数<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
+      <p class="field-help">此 Key 同时在飞的上游请求上限；达到上限时，路由会优先尝试其他可用 Key。</p>
       <div class="editor-actions"><button id="cancel-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </aside>
+
+  <aside id="catalog-editor" class="editor" aria-labelledby="catalog-editor-title" hidden>
+    <form id="catalog-form">
+      <div class="editor-heading"><div><p class="index">MODEL ROUTING</p><h2 id="catalog-editor-title">模型目录</h2></div><button id="close-catalog-editor" type="button" aria-label="关闭">×</button></div>
+      <p class="source-note">费率按每百万 token 计。stage 是路由分区，而非质量承诺。</p>
+      <label>模型 ID<input name="model" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}" required></label>
+      <label>模型家族<input name="family" required></label>
+      <label>stage<select name="intellect"><option value="standard">standard</option><option value="smart">smart</option><option value="expert">expert</option></select></label>
+      <label>输入费率 / 1M<input name="official_input_price" type="number" min="0" step="0.0001" required></label>
+      <label>缓存输入费率 / 1M<input name="official_cache_price" type="number" min="0" step="0.0001" required></label>
+      <label>输出费率 / 1M<input name="official_output_price" type="number" min="0" step="0.0001" required></label>
+      <div class="editor-actions"><button id="catalog-delete" type="button" class="danger" hidden>删除模型</button><button id="cancel-catalog-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>
 

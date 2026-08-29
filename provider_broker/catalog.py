@@ -1,4 +1,4 @@
-"""Official, explicit model catalog. Unknown models are never inferred."""
+"""Default model-directory seed. Runtime entries are managed in SQLite; unknown models are never inferred."""
 
 CATALOG = {
     "gpt-5.6-luna": {

@@ -18,7 +18,10 @@ class Provider:
     provider_type: str
     request_headers: dict[str, str]
     models: list[str]
+    pricing: dict[str, object]
     price_group: int
+    preference: int
+    max_parallel: int
     enabled: bool
     multiplier: float
 
@@ -29,6 +32,7 @@ class Store:
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.aes = AESGCM(encryption_key)
+        self._inflight: dict[str, int] = {}
         self._migrate()
 
     def _migrate(self):
@@ -48,7 +52,10 @@ class Store:
           actual_model TEXT, tier TEXT NOT NULL, effort TEXT, success INTEGER NOT NULL,
           latency_ms REAL, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
         );
-        CREATE TABLE IF NOT EXISTS catalog_calibration (model TEXT PRIMARY KEY, family TEXT NOT NULL, intellect TEXT NOT NULL, input_price REAL NOT NULL, cache_price REAL NOT NULL, output_price REAL NOT NULL);
+        CREATE TABLE IF NOT EXISTS model_catalog (
+          model TEXT PRIMARY KEY, family TEXT NOT NULL, intellect TEXT NOT NULL,
+          input_price REAL NOT NULL, cache_price REAL NOT NULL, output_price REAL NOT NULL
+        );
         CREATE TABLE IF NOT EXISTS route_block (fingerprint TEXT NOT NULL, model TEXT NOT NULL, blocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(fingerprint,model));
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
@@ -65,15 +72,35 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
+        from .catalog import CATALOG
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?)",
+            [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
+        )
         self.conn.commit()
 
-    def save_calibration(self, model, body):
-        with self.conn: self.conn.execute('INSERT OR REPLACE INTO catalog_calibration VALUES(?,?,?,?,?,?)',(model,body['family'],body['intellect'],body['official_input_price'],body['official_cache_price'],body['official_output_price']))
-    def calibrations(self):
-        return {r['model']:{'family':r['family'],'intellect':r['intellect'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price'],'available_provider_count':0} for r in self.conn.execute('SELECT * FROM catalog_calibration')}
+    def catalog(self):
+        return {r['model']:{'family':r['family'],'intellect':r['intellect'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price']} for r in self.conn.execute('SELECT * FROM model_catalog ORDER BY model')}
+    def create_catalog(self, model, body):
+        try:
+            with self.conn:
+                self.conn.execute("INSERT INTO model_catalog VALUES(?,?,?,?,?,?)", (model, body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price']))
+        except sqlite3.IntegrityError:
+            return False
+        return True
+    def update_catalog(self, model, body):
+        with self.conn:
+            updated = self.conn.execute(
+                "UPDATE model_catalog SET family=?,intellect=?,input_price=?,cache_price=?,output_price=? WHERE model=?",
+                (body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price'], model),
+            ).rowcount
+        return bool(updated)
+    def delete_catalog(self, model):
+        with self.conn:
+            deleted = self.conn.execute("DELETE FROM model_catalog WHERE model=?", (model,)).rowcount
+        return bool(deleted)
     def catalog_counts(self):
-        from .catalog import CATALOG
-        rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in CATALOG}
+        rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.catalog()}
         for name in counts:
             counts[name]=len({r['fingerprint'] for r in rows if r['enabled'] and r['calibrated'] and json.loads(r['source_json']).get('inventory_status') == 'available' and name in json.loads(r['models_json'])})
         return counts
@@ -91,9 +118,10 @@ class Store:
 
     def replace_source_snapshot(self, entries: list[dict], synced_at: str):
         rows = []
+        catalog = self.catalog()
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
-            from .catalog import canonicalize, classify
+            from .catalog import canonicalize
             models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             fp = self.fingerprint(base_url, api_key, "\0".join(models))
             source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
@@ -107,21 +135,36 @@ class Store:
             self.conn.execute("DROP TABLE incoming")
             self.conn.execute("DELETE FROM route_block")
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
-            self.conn.executemany("UPDATE policy SET calibrated=? WHERE fingerprint=?", [(int(any(classify(model) for model in json.loads(r[6]))), r[0]) for r in rows])
+            self.conn.executemany("UPDATE policy SET calibrated=? WHERE fingerprint=?", [(int(any(model in catalog for model in json.loads(r[6]))), r[0]) for r in rows])
 
     def providers(self, tier: str) -> list[Provider]:
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint)
-        WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
-        from .catalog import classify
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.preference,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
+        WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, p.preference DESC, s.id""").fetchall()
+        catalog = self.catalog()
         result=[]
         for r in rows:
             blocked={row[0] for row in self.conn.execute('SELECT model FROM route_block WHERE fingerprint=?',(r['fingerprint'],))}
-            models=[m for m in json.loads(r['models_json']) if classify(m) and classify(m)[0] == tier and m not in blocked]
+            models=[m for m in json.loads(r['models_json']) if m in catalog and catalog[m]['intellect'] == tier and m not in blocked]
             if models and tier in json.loads(r['tiers_json']):
                 header_blob = r['request_headers']
                 headers = json.loads(self._decrypt(header_blob)) if header_blob else {}
-                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,int(classify(models[0])[1]*r['multiplier']*100),bool(r['enabled']),float(r['multiplier'])))
+                pricing = catalog[models[0]]
+                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(pricing['official_output_price']*r['multiplier']*100),int(r['preference']),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
         return result
+
+    def try_acquire(self, provider: Provider) -> bool:
+        active = self._inflight.get(provider.fingerprint, 0)
+        if active >= provider.max_parallel:
+            return False
+        self._inflight[provider.fingerprint] = active + 1
+        return True
+
+    def release(self, provider: Provider):
+        active = self._inflight.get(provider.fingerprint, 0)
+        if active <= 1:
+            self._inflight.pop(provider.fingerprint, None)
+        else:
+            self._inflight[provider.fingerprint] = active - 1
 
     def block_route(self, fingerprint: str, model: str):
         with self.conn:

@@ -1,3 +1,5 @@
+import asyncio
+
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
@@ -49,6 +51,9 @@ async def cpa(client):
         request.app['last_response_headers'] = dict(request.headers)
         payload=await request.json()
         assert 'tools' not in payload
+        if payload.get('input') == 'hold':
+            request.app['hold_started'].set()
+            await request.app['hold_release'].wait()
         if payload.get('stream'):
             stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
             await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-one"}\n\n')
@@ -233,12 +238,40 @@ async def test_catalog_is_explicit_and_unknown_models_are_not_priced(client):
     assert 'luna' not in catalog and 'private-model' not in catalog
 
 
-async def test_catalog_calibration_round_trips_and_rejects_incomplete(client):
-    headers={'Authorization':'Bearer admin-secret'}
-    bad=await client.patch('/admin/v1/catalog/private-model',headers=headers,json={'family':'x','intellect':'expert'})
+async def test_catalog_can_create_a_model_with_an_explicit_stage(client):
+    body = {
+        'model': 'gpt-custom-route', 'family': 'Internal GPT', 'intellect': 'smart',
+        'official_input_price': 1.0, 'official_cache_price': 0.1, 'official_output_price': 3.0,
+    }
+    created = await client.post('/admin/v1/catalog', json=body)
+
+    assert created.status == 201
+    catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
+    assert catalog['gpt-custom-route'] == {key: value for key, value in body.items() if key != 'model'} | {'available_provider_count': 0}
+
+
+async def test_catalog_stage_update_and_delete_control_routing(client, cpa):
+    await client.post('/admin/v1/sync')
+    catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
+    changed = catalog['gpt-5.6-luna'] | {'intellect': 'smart'}
+    changed.pop('available_provider_count')
+
+    assert (await client.put('/admin/v1/catalog/gpt-5.6-luna', json=changed)).status == 200
+    generated = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'stage', 'intellect': 'standard'})
+    assert generated.status == 200
+    assert (await generated.json())['fulfilled_intellect'] == 'smart'
+
+    assert (await client.delete('/admin/v1/catalog/gpt-5.6-luna')).status == 204
+    assert 'gpt-5.6-luna' not in (await (await client.get('/admin/v1/catalog')).json())['catalog']
+    unavailable = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'deleted', 'intellect': 'standard'})
+    assert unavailable.status == 503
+
+
+async def test_catalog_rejects_incomplete_and_unknown_updates(client):
+    bad=await client.patch('/admin/v1/catalog/private-model',json={'family':'x','intellect':'expert'})
     assert bad.status == 400
     body={'family':'private','intellect':'expert','official_input_price':1.0,'official_cache_price':.1,'official_output_price':2.0}
-    assert (await client.patch('/admin/v1/catalog/private-model',headers=headers,json=body)).status == 400
+    assert (await client.patch('/admin/v1/catalog/private-model',json=body)).status == 404
 
 
 async def test_catalog_provider_count_reflects_synced_inventory(client, cpa):
@@ -300,6 +333,45 @@ async def test_sync_reports_inventory_failures(client, cpa):
     provider=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
     assert provider['inventory_status'] == 'unavailable'
     assert (await (await client.get('/admin/v1/summary?window=24h',headers=headers)).json())['routable_apis'] == 0
+
+
+async def test_preference_selects_the_key_that_enters_a_capped_race(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Shared upstream', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'low-key', 'models': ['gpt-5.6-luna']},
+        {'key': 'high-key', 'models': ['gpt-5.6-luna']},
+    ]}]}
+    client.app['settings'] = client.app['settings'].__class__(**(client.app['settings'].__dict__ | {'parallel_cap': 1}))
+    headers = {'Authorization': 'Bearer admin-secret'}
+    assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
+    rows = (await (await client.get('/admin/v1/providers', headers=headers)).json())['providers']
+    for row in rows:
+        preference = 10 if row['api_key_mask'].startswith('hig') else 0
+        assert (await client.patch(f"/admin/v1/policy/{row['fingerprint']}", headers=headers, json={'preference': preference})).status == 200
+
+    result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'priority', 'intellect': 'standard'})
+
+    assert result.status == 200
+    assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
+
+
+async def test_max_parallel_skips_a_busy_key_until_its_request_finishes(client, cpa):
+    headers = {'Authorization': 'Bearer admin-secret'}
+    assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
+    row = (await (await client.get('/admin/v1/providers', headers=headers)).json())['providers'][0]
+    assert (await client.patch(f"/admin/v1/policy/{row['fingerprint']}", headers=headers, json={'max_parallel': 1})).status == 200
+    upstream = cpa.app['upstream_app']
+    upstream['hold_started'] = asyncio.Event()
+    upstream['hold_release'] = asyncio.Event()
+
+    first = asyncio.create_task(client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'hold', 'intellect': 'standard'}))
+    await asyncio.wait_for(upstream['hold_started'].wait(), timeout=2)
+    skipped = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'next', 'intellect': 'standard'})
+    upstream['hold_release'].set()
+    completed = await first
+
+    assert skipped.status == 503
+    assert (await skipped.json()) == {'error': 'all eligible providers failed', 'attempts': []}
+    assert completed.status == 200
 
 
 async def test_management_summary_providers_and_validated_policy(client, cpa):

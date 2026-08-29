@@ -1,5 +1,4 @@
 import asyncio
-import random
 import time
 import uuid
 
@@ -64,8 +63,8 @@ def normalize_usage(data: dict) -> dict:
     return normalized
 
 
-def estimate_cost(model: str, usage: dict, multiplier: float) -> float | None:
-    pricing = CATALOG.get(canonicalize(model))
+def estimate_cost(model: str, usage: dict, multiplier: float, pricing=None) -> float | None:
+    pricing = pricing or CATALOG.get(canonicalize(model))
     input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
     if pricing is None or not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
         return None
@@ -115,7 +114,7 @@ async def invoke(provider, body: dict) -> dict:
         "text": text, "actual_model": actual_model,
         "latency_ms": round((time.perf_counter() - started) * 1000, 2),
         "usage": usage, "request_id": str(data.get("id") or uuid.uuid4()),
-        "cost": estimate_cost(actual_model, usage, provider.multiplier),
+        "cost": estimate_cost(actual_model, usage, provider.multiplier, provider.pricing if actual_model == model else None),
     }
 
 
@@ -193,7 +192,7 @@ async def invoke_stream(provider, body: dict) -> dict:
         "text": "".join(chunks), "chunks": chunks, "actual_model": actual_model,
         "latency_ms": round(ttft, 2), "usage": usage,
         "request_id": str(metadata.get("id") or uuid.uuid4()),
-        "cost": estimate_cost(actual_model, usage, provider.multiplier),
+        "cost": estimate_cost(actual_model, usage, provider.multiplier, provider.pricing if actual_model == model else None),
     }
 
 
@@ -217,8 +216,20 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         for provider in store.providers(candidate_tier):
             groups.setdefault((candidate_tier, provider.price_group), []).append(provider)
     for (candidate_tier, _), providers in sorted(groups.items(), key=lambda item: (tiers.index(item[0][0]), item[0][1])):
-        selected = random.sample(providers, k=min(len(providers), max(1, parallel_cap)))
-        tasks = {asyncio.create_task(invoker(provider, body)): provider for provider in selected}
+        selected = []
+        for provider in providers:
+            if len(selected) >= max(1, parallel_cap):
+                break
+            if store.try_acquire(provider):
+                selected.append(provider)
+
+        async def invoke_with_capacity(provider):
+            try:
+                return await invoker(provider, body)
+            finally:
+                store.release(provider)
+
+        tasks = {asyncio.create_task(invoke_with_capacity(provider)): provider for provider in selected}
         while tasks:
             done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
             for task in done:

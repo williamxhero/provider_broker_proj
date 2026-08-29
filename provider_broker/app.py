@@ -1,6 +1,7 @@
 import hmac
 import json
 import math
+import re
 from pathlib import Path
 
 from aiohttp import web
@@ -127,19 +128,54 @@ async def calls(request):
 
 
 async def catalog(request):
-    from .catalog import CATALOG
     counts = request.app["store"].catalog_counts()
-    built = {name: value | {"available_provider_count": counts.get(name, 0)} for name, value in CATALOG.items()}
+    built = {name: value | {"available_provider_count": counts.get(name, 0)} for name, value in request.app["store"].catalog().items()}
     return web.json_response({"catalog": built})
 
 
-async def calibrate_catalog(request):
-    from .catalog import CATALOG
+def valid_catalog_body(body, *, include_model=False):
+    fields = {'family', 'intellect', 'official_input_price', 'official_cache_price', 'official_output_price'}
+    if include_model:
+        fields.add('model')
+    numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
+    return (
+        isinstance(body, dict) and set(body) == fields
+        and (not include_model or isinstance(body['model'], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body['model']))
+        and isinstance(body['family'], str) and bool(body['family'].strip())
+        and body['intellect'] in ('standard', 'smart', 'expert')
+        and all(numeric(body[name]) for name in ('official_input_price', 'official_cache_price', 'official_output_price'))
+    )
+
+
+async def create_catalog(request):
     body = await request.json()
-    official = CATALOG.get(request.match_info["model"])
-    if official is None or body != official:
-        return web.json_response({"error": "explicit family, intellect, and all official prices required"}, status=400)
-    return web.json_response({"calibrated": request.match_info["model"], "catalog": body})
+    if not valid_catalog_body(body, include_model=True):
+        return web.json_response({'error': 'invalid model catalog entry'}, status=400)
+    from .catalog import canonicalize
+    model = canonicalize(body['model'])
+    entry = body | {'model': model}
+    if not request.app['store'].create_catalog(model, entry):
+        return web.json_response({'error': 'model already exists'}, status=409)
+    return web.json_response({'model': model}, status=201)
+
+
+async def update_catalog(request):
+    body = await request.json()
+    if not valid_catalog_body(body):
+        return web.json_response({'error': 'invalid model catalog entry'}, status=400)
+    from .catalog import canonicalize
+    model = canonicalize(request.match_info['model'])
+    if not request.app['store'].update_catalog(model, body):
+        return web.json_response({'error': 'model not found'}, status=404)
+    return web.json_response({'model': model, 'updated': True})
+
+
+async def delete_catalog(request):
+    from .catalog import canonicalize
+    model = canonicalize(request.match_info['model'])
+    if not request.app['store'].delete_catalog(model):
+        return web.json_response({'error': 'model not found'}, status=404)
+    return web.Response(status=204)
 
 
 async def update_policy(request):
@@ -182,7 +218,8 @@ def create_app(settings: Settings):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog),
-        web.patch("/admin/v1/catalog/{model}", calibrate_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
+        web.post("/admin/v1/catalog", create_catalog),
+        web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),
     ])
     return app

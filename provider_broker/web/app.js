@@ -1,5 +1,5 @@
 const byId = (id) => document.getElementById(id);
-const state = { cursor: "", provider: null, callsRequest: 0, filterTimer: null };
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null };
 const empty = (value) => value === null || value === undefined || value === "" ? "暂无数据" : String(value);
 const cell = (value) => {
   const td = document.createElement("td");
@@ -12,7 +12,8 @@ const formatPrice = (value) => value === null || value === undefined ? "未校�
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
-  const body = await response.json();
+  const raw = await response.text();
+  const body = raw ? JSON.parse(raw) : {};
   if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
   return body;
 }
@@ -64,6 +65,27 @@ function closeEditor() {
   state.provider = null;
 }
 
+function openCatalogEditor(model, item) {
+  state.catalogModel = model || null;
+  const form = byId("catalog-form");
+  form.reset();
+  form.elements.model.value = model || "";
+  form.elements.model.readOnly = Boolean(model);
+  form.elements.family.value = item?.family || "";
+  form.elements.intellect.value = item?.intellect || "standard";
+  form.elements.official_input_price.value = item?.official_input_price ?? "";
+  form.elements.official_cache_price.value = item?.official_cache_price ?? "";
+  form.elements.official_output_price.value = item?.official_output_price ?? "";
+  byId("catalog-delete").hidden = !model;
+  byId("catalog-editor").hidden = false;
+  form.elements.model.focus();
+}
+
+function closeCatalogEditor() {
+  byId("catalog-editor").hidden = true;
+  state.catalogModel = null;
+}
+
 function renderProviders(payload) {
   const table = byId("providers");
   const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "preference", "并发数", "模型库存", "技术成功率", "平均首字延迟", "操作"]);
@@ -89,10 +111,18 @@ function renderProviders(payload) {
 
 function renderCatalog(payload) {
   const table = byId("catalog");
-  const body = tableHead(table, ["canonical 模型 ID", "模型家族", "intellect", "官方输入价格", "缓存输入价格", "输出价格", "可用 Provider/API key"]);
+  const body = tableHead(table, ["模型 ID", "模型家族", "stage", "输入 / 1M", "缓存输入 / 1M", "输出 / 1M", "可用 Key", "操作"]);
   Object.entries(payload.catalog).forEach(([model, item]) => {
     const row = document.createElement("tr");
     [model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
+    const action = document.createElement("td");
+    const edit = document.createElement("button");
+    edit.type = "button";
+    edit.className = "text-button";
+    edit.textContent = "编辑";
+    edit.addEventListener("click", () => openCatalogEditor(model, item));
+    action.append(edit);
+    row.append(action);
     body.append(row);
   });
 }
@@ -185,6 +215,33 @@ byId("policy").addEventListener("submit", async (event) => {
   closeEditor();
   await load();
 });
+
+byId("catalog-create").addEventListener("click", () => openCatalogEditor());
+byId("catalog-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const body = {
+    family: form.elements.family.value,
+    intellect: form.elements.intellect.value,
+    official_input_price: Number(form.elements.official_input_price.value),
+    official_cache_price: Number(form.elements.official_cache_price.value),
+    official_output_price: Number(form.elements.official_output_price.value),
+  };
+  if (state.catalogModel) {
+    await requestJson(`/admin/v1/catalog/${encodeURIComponent(state.catalogModel)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  } else {
+    await requestJson("/admin/v1/catalog", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, model: form.elements.model.value }) });
+  }
+  closeCatalogEditor();
+  await load();
+});
+byId("catalog-delete").addEventListener("click", async () => {
+  await requestJson(`/admin/v1/catalog/${encodeURIComponent(state.catalogModel)}`, { method: "DELETE" });
+  closeCatalogEditor();
+  await load();
+});
+byId("close-catalog-editor").addEventListener("click", closeCatalogEditor);
+byId("cancel-catalog-editor").addEventListener("click", closeCatalogEditor);
 
 byId("sync").addEventListener("click", async () => {
   const output = byId("syncresult");
