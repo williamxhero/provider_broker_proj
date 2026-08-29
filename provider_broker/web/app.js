@@ -332,8 +332,20 @@ function metric(label, value) {
   const number = document.createElement("strong");
   name.textContent = label;
   number.textContent = empty(value);
+  number.title = number.textContent;
   item.append(name, number);
   return item;
+}
+
+function fitMetricValues() {
+  byId("quality").querySelectorAll("strong").forEach((number) => {
+    number.style.fontSize = "";
+    let size = Number.parseFloat(getComputedStyle(number).fontSize);
+    while (number.scrollWidth > number.clientWidth && size > 8) {
+      size -= 0.5;
+      number.style.fontSize = `${size}px`;
+    }
+  });
 }
 
 function renderQuality(payload) {
@@ -352,6 +364,7 @@ function renderQuality(payload) {
     metric(displayStatus("protocol_failed"), formatFailureRate(failures.protocol_failed, payload.calls)),
     metric(displayStatus("stream_incomplete"), formatFailureRate(failures.stream_incomplete, payload.calls)),
   );
+  requestAnimationFrame(fitMetricValues);
 }
 
 function callsUrl(cursor = state.cursor) {
@@ -509,3 +522,4 @@ byId("close-editor").addEventListener("click", closeEditor);
 byId("cancel-editor").addEventListener("click", closeEditor);
 restoreControls();
 load().catch(() => { byId("syncresult").textContent = "管理数据加载失败"; });
+window.addEventListener("resize", () => requestAnimationFrame(fitMetricValues));

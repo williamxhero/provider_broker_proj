@@ -88,7 +88,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
         if path.startswith("/admin/v1/quality"):
-            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 0.02, "technical_success_rate": 0.98, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
+            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):
             if "cursor=2" in path:
                 return {"items": [calls[1]], "next_cursor": None}
@@ -141,6 +141,11 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#quality > div").filter(has_text="传输失败").locator("strong").inner_text() == "50.0%"
         assert page.locator("#quality > div").filter(has_text="已取消").locator("strong").inner_text() == "0.0%"
         assert "transport_failed" not in page.locator("#quality").inner_text()
+        total_cost = page.locator("#quality > div").filter(has_text="总费用").locator("strong")
+        total_cost.wait_for()
+        total_cost_style = total_cost.evaluate("number => ({ nowrap: getComputedStyle(number).whiteSpace, fits: number.scrollWidth <= number.clientWidth, fontSize: Number.parseFloat(getComputedStyle(number).fontSize) })")
+        assert total_cost_style["nowrap"] == "nowrap" and total_cost_style["fits"] and total_cost_style["fontSize"] < 16
+        assert all(height < 40 for height in page.locator("#quality > div").evaluate_all("items => items.map(item => item.getBoundingClientRect().height)"))
         assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
@@ -153,6 +158,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert "available" not in page.locator("#providers").inner_text()
         assert page.locator("#providers").get_by_role("button", name="24h 费用").count() == 1
         page.get_by_text("$0.02", exact=True).first.wait_for()
+        cell_styles = page.locator("#providers tbody td, #model-view tbody td, #catalog tbody td, #calls tbody td").evaluate_all("cells => cells.map(cell => { const style = getComputedStyle(cell); return [style.lineHeight, style.paddingTop, style.paddingBottom]; })")
+        assert set(map(tuple, cell_styles)) == {("16px", "0px", "0px")}
         base_urls = page.locator("#providers tbody td[rowspan]")
         assert base_urls.count() == 1
         assert base_urls.first.get_attribute("rowspan") == "4"
