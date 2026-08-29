@@ -18,6 +18,12 @@ const formatPercent = (value) => value === null || value === undefined ? "n/a" :
 const formatFailureRate = (count, calls) => Number.isFinite(Number(count)) && Number(calls) > 0
   ? formatPercent(Number(count) / Number(calls))
   : "n/a";
+const statusLabels = {
+  completed: "成功", cancelled: "已取消", timed_out: "超时", unavailable: "不可用",
+  transport_failed: "传输失败", protocol_failed: "协议失败", stream_incomplete: "流式响应不完整",
+};
+const displayStatus = (status) => statusLabels[status] || empty(status);
+const statusCode = (value) => Object.entries(statusLabels).find(([, label]) => label === value)?.[0] || value;
 const formatMs = (value) => {
   if (value === null || value === undefined) return "n/a";
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
@@ -329,11 +335,11 @@ function renderQuality(payload) {
     metric("调用数", payload.calls),
     metric("总费用", formatCost(payload.total_cost)),
     metric("模型履约率", formatPercent(payload.model_fulfillment_rate)),
-    metric("cancelled", formatFailureRate(failures.cancelled, payload.calls)),
-    metric("timed_out", formatFailureRate(failures.timed_out, payload.calls)),
-    metric("transport_failed", formatFailureRate(failures.transport_failed, payload.calls)),
-    metric("protocol_failed", formatFailureRate(failures.protocol_failed, payload.calls)),
-    metric("stream_incomplete", formatFailureRate(failures.stream_incomplete, payload.calls)),
+    metric(displayStatus("cancelled"), formatFailureRate(failures.cancelled, payload.calls)),
+    metric(displayStatus("timed_out"), formatFailureRate(failures.timed_out, payload.calls)),
+    metric(displayStatus("transport_failed"), formatFailureRate(failures.transport_failed, payload.calls)),
+    metric(displayStatus("protocol_failed"), formatFailureRate(failures.protocol_failed, payload.calls)),
+    metric(displayStatus("stream_incomplete"), formatFailureRate(failures.stream_incomplete, payload.calls)),
   );
 }
 
@@ -343,7 +349,7 @@ function callsUrl(cursor = state.cursor) {
     window: byId("callwindow").value,
     limit: byId("calllimit").value,
     provider: byId("callprovider").value,
-    status: byId("callstatus").value,
+    status: statusCode(byId("callstatus").value),
     cursor,
     sort: `${sort.key}:${sort.direction}`,
   })}`;
@@ -355,7 +361,7 @@ function renderCalls(payload) {
   const body = tableHead(table, columns, "calls", () => loadCalls(""));
   payload.items.forEach((item) => {
     const row = document.createElement("tr");
-    [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), item.status, item.input_tokens, item.output_tokens, formatCost(item.cost), item.request_id].forEach((value) => row.append(cell(value)));
+    [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), displayStatus(item.status), item.input_tokens, item.output_tokens, formatCost(item.cost), item.request_id].forEach((value) => row.append(cell(value)));
     body.append(row);
   });
   state.cursor = payload.next_cursor || "";

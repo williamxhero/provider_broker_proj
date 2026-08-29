@@ -7,17 +7,10 @@
   <link rel="stylesheet" href="/static/styles.css">
 </head>
 <body>
-  <header class="masthead">
-    <div>
-      <p class="eyebrow">PROVIDER BROKER / CONTROL PLANE</p>
-      <h1>路由运行态</h1>
-    </div>
-  </header>
-
   <main>
     <section aria-labelledby="quality-title">
       <div class="section-heading">
-        <div><p class="index">01 / QUALITY</p><h2 id="quality-title">调用质量</h2></div>
+        <div><h2 id="quality-title">调用质量</h2></div>
         <nav id="windows" class="segmented" aria-label="质量时间窗">
           <button type="button" data-window="1h">1h</button>
           <button type="button" data-window="24h" class="active">24h</button>
@@ -59,7 +52,7 @@
           <label>时间窗<select id="callwindow"><option>1h</option><option selected>24h</option><option>7d</option><option>30d</option></select></label>
           <label>每页<select id="calllimit"><option>2</option><option>10</option><option selected>25</option></select></label>
           <label>Provider<input id="callprovider" type="search" placeholder="指纹或 Provider"></label>
-          <label>状态<input id="callstatus" type="search" placeholder="completed"></label>
+          <label>状态<input id="callstatus" type="search" placeholder="成功、超时"></label>
         </div>
       </div>
       <div class="table-wrap"><table id="calls"></table></div>

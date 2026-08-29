@@ -119,14 +119,16 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.goto(broker.url)
         assert page.evaluate("window.__injected") is None
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
+        assert page.locator(".masthead").count() == 0
         assert page.locator("main > section").first.locator("h2").inner_text() == "调用质量"
         assert page.locator(".lede").count() == 0
         assert page.locator("#quality").get_by_text("可路由 API", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("技术成功率", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("平均 TTFT", exact=True).count() == 1
         assert page.locator("#quality > div").count() == 12
-        assert page.locator("#quality > div").filter(has_text="transport_failed").locator("strong").inner_text() == "50.0%"
-        assert page.locator("#quality > div").filter(has_text="cancelled").locator("strong").inner_text() == "0.0%"
+        assert page.locator("#quality > div").filter(has_text="传输失败").locator("strong").inner_text() == "50.0%"
+        assert page.locator("#quality > div").filter(has_text="已取消").locator("strong").inner_text() == "0.0%"
+        assert "transport_failed" not in page.locator("#quality").inner_text()
         assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
@@ -188,6 +190,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("r-2").wait_for()
         page.get_by_role("button", name="下一页").click()
         page.get_by_text("r-1").wait_for()
+        assert page.locator("#calls").get_by_text("传输失败", exact=True).count() == 1
         page.reload()
         expect(page.get_by_role("button", name="7d")).to_have_class(__import__("re").compile("active"))
         expect(page.locator("#model-view").get_by_role("button", name="价格组")).to_have_class(__import__("re").compile("active"))
