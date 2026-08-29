@@ -24,7 +24,7 @@
     <section aria-labelledby="providers-title">
       <div class="section-heading">
         <div><p class="index">02 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
+        <div class="section-actions"><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
       </div>
       <output id="syncresult" class="notice" aria-live="polite"></output>
       <div class="table-wrap"><table id="providers"></table></div>
@@ -32,7 +32,8 @@
 
     <section aria-labelledby="model-view-title">
       <div class="section-heading">
-        <div><p class="index">03 / MODEL VIEW</p><h2 id="model-view-title">模型视角</h2></div>
+        <div><p class="index">03 / STAGE VIEW</p><h2 id="model-view-title">Stage视角</h2></div>
+        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
       <div class="table-wrap"><table id="model-view"></table></div>
     </section>

@@ -196,7 +196,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('最近同步','从 CPA 手动同步','API Key','模型视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','API Key','Stage视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
     assert 'CPA 是唯一人工维护源' not in page
     assert 'client-secret' not in page and 'admin-secret' not in page

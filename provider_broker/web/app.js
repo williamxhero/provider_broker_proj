@@ -269,11 +269,11 @@ function renderModelView() {
   const groups = sortItems(["standard", "smart", "expert"].map((intellect) => ({
     intellect,
     providers: state.providers.flatMap((provider) => {
-      if (provider.enabled === false || provider.calibrated === false || (provider.tiers && !provider.tiers.includes(intellect))) return [];
       const model = provider.models.find((candidate) => state.catalog[candidate]?.intellect === intellect);
       if (!model) return [];
       const price = Number(state.catalog[model].blended_price) * Number(provider.multiplier);
-      return [{ note: provider.note || "n/a", model, price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint }];
+      const routable = provider.enabled !== false && provider.calibrated !== false && (!provider.tiers || provider.tiers.includes(intellect));
+      return [{ note: provider.note || "n/a", model, price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint, routable }];
     }),
   })).filter((group) => group.providers.length), "modelView", (group, key) => {
     if (key === "intellect") return stageOrder(group.intellect);
@@ -281,12 +281,22 @@ function renderModelView() {
     return group.providers.map((provider) => key === "model" ? provider.model : provider.note).join(" ");
   });
   groups.forEach((group) => {
-    const bands = priceBands(group.providers);
+    const routable = group.providers.filter((provider) => provider.routable);
+    const inactive = group.providers.filter((provider) => !provider.routable);
+    const activeBands = priceBands(routable);
+    const byPrice = (left, right) => left.priceGroup - right.priceGroup || compareValues(left.fingerprint, right.fingerprint);
+    const bands = activeBands.length ? (() => {
+      const threshold = activeBands[0].threshold;
+      const lower = [...activeBands[0].providers, ...inactive.filter((provider) => provider.priceGroup <= threshold)].sort(byPrice);
+      const higher = [...(activeBands[1]?.providers || []), ...inactive.filter((provider) => provider.priceGroup > threshold)].sort(byPrice);
+      return [{ label: "低价组", providers: lower }, ...(higher.length ? [{ label: "高价组", providers: higher }] : [])];
+    })() : [{ label: "n/a", providers: inactive.sort(byPrice) }];
     const groupRowCount = bands.reduce((count, band) => count + band.providers.length, 0);
     let groupRowIndex = 0;
     bands.forEach((band) => {
       band.providers.forEach((provider, index) => {
         const row = document.createElement("tr");
+        if (!provider.routable) row.className = "inactive-row";
         if (groupRowIndex === 0) {
           const intellect = cell(group.intellect);
           intellect.rowSpan = groupRowCount;
@@ -306,13 +316,13 @@ function renderModelView() {
 }
 
 function priceBands(providers) {
-  if (!providers.length) return [{ label: "n/a", providers: [{ note: "n/a", price: null }] }];
+  if (!providers.length) return [];
   const ordered = [...providers].sort((left, right) => left.priceGroup - right.priceGroup || compareValues(left.fingerprint, right.fingerprint));
   const midpoint = Math.floor(ordered.length / 2);
   const median = ordered.length % 2 ? ordered[midpoint].priceGroup : (ordered[midpoint - 1].priceGroup + ordered[midpoint].priceGroup) / 2;
   const lower = ordered.filter((provider) => provider.priceGroup <= median);
   const higher = ordered.filter((provider) => provider.priceGroup > median);
-  return [{ label: "低价组", providers: lower }, ...(higher.length ? [{ label: "高价组", providers: higher }] : [])];
+  return [{ label: "低价组", providers: lower, threshold: median }, ...(higher.length ? [{ label: "高价组", providers: higher, threshold: median }] : [])];
 }
 
 function metric(label, value) {

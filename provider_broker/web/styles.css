@@ -41,6 +41,7 @@ th .sort-indicator { color: var(--accent); font-size: .75rem; }
 td { max-width: 22rem; padding: .55rem 1rem .55rem 0; font-size: .82rem; border-bottom: 1px solid #182125; overflow: hidden; text-overflow: ellipsis; }
 td[rowspan] { vertical-align: top; padding-top: .55rem; }
 tbody tr { transition: background .18s ease; } tbody tr:hover { background: #0f1719; }
+.inactive-row td:not([rowspan]) { opacity: .38; }
 .status { display: inline-flex; align-items: center; gap: .4rem; } .status::before { content: ""; width: .48rem; height: .48rem; border-radius: 50%; background: var(--muted); }
 .status.on::before { background: var(--accent); box-shadow: 0 0 0 .25rem #75e0bf19; }
 .model-tags { display: flex; flex-wrap: wrap; gap: .35rem; min-width: 12rem; white-space: normal; }
