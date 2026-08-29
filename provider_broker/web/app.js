@@ -258,7 +258,7 @@ function stageOrder(value) {
 
 function renderModelView() {
   const table = byId("model-view");
-  const columns = [{ key: "intellect", label: "模型分组" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "路由价格 / 1M" }];
+  const columns = [{ key: "intellect", label: "模型分组" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "model", label: "模型名" }, { key: "price", label: "路由价格 / 1M" }];
   const body = tableHead(table, columns, "modelView", renderModelView);
   const groups = sortItems(["standard", "smart", "expert"].map((intellect) => ({
     intellect,
@@ -267,12 +267,12 @@ function renderModelView() {
       const model = provider.models.find((candidate) => state.catalog[candidate]?.intellect === intellect);
       if (!model) return [];
       const price = Number(state.catalog[model].blended_price) * Number(provider.multiplier);
-      return [{ note: provider.note || "n/a", price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint }];
+      return [{ note: provider.note || "n/a", model, price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint }];
     }),
   })).filter((group) => group.providers.length), "modelView", (group, key) => {
     if (key === "intellect") return stageOrder(group.intellect);
     if (key === "price_band" || key === "price") return Math.min(...group.providers.map((provider) => provider.price));
-    return group.providers.map((provider) => provider.note).join(" ");
+    return group.providers.map((provider) => key === "model" ? provider.model : provider.note).join(" ");
   });
   groups.forEach((group) => {
     const bands = priceBands(group.providers);
@@ -291,7 +291,7 @@ function renderModelView() {
           priceBand.rowSpan = band.providers.length;
           row.append(priceBand);
         }
-        row.append(cell(provider.note), cell(formatCost(provider.price)));
+        row.append(cell(provider.note), cell(provider.model), cell(formatCost(provider.price)));
         body.append(row);
         groupRowIndex += 1;
       });
