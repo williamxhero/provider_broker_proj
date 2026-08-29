@@ -1,6 +1,7 @@
 import asyncio
 import random
 import time
+import uuid
 from aiohttp import ClientSession
 
 
@@ -27,7 +28,7 @@ async def invoke(provider, body: dict) -> dict:
     except Exception as exc:
         raise UpstreamFailure(str(exc)) from exc
     text = data.get("output_text") or data.get("content", [{}])[0].get("text") or data.get("content", [{}])[0].get("text", "")
-    return {"text":text,"actual_model":data.get("model",model),"latency_ms":round((time.perf_counter()-started)*1000,2),"raw":data}
+    return {"text":text,"actual_model":data.get("model",model),"latency_ms":round((time.perf_counter()-started)*1000,2),"usage":data.get('usage',{}),"request_id":data.get('id',str(uuid.uuid4())),"raw":data}
 
 
 async def route(store, tier: str, body: dict, parallel_cap: int = 3) -> dict:
@@ -50,8 +51,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3) -> dict:
                         attempts.append({'provider':p.name,'status':'model_mismatch','actual_model':output['actual_model']}); continue
                     for pending in tasks: pending.cancel()
                     await asyncio.gather(*tasks,return_exceptions=True)
-                    store.observe(fingerprint=p.fingerprint,requested_model=tier,actual_model=output['actual_model'],tier=candidate_tier,effort=body.get('effort'),success=1,latency_ms=output['latency_ms'],error=None)
-                    return output | {'provider':p.name,'attempts':attempts,'fulfilled_intellect':candidate_tier}
+                    store.observe(fingerprint=p.fingerprint,requested_model=tier,actual_model=output['actual_model'],tier=candidate_tier,effort=body.get('effort'),success=1,latency_ms=output['latency_ms'],error=None,status='completed',input_tokens=output['usage'].get('input_tokens'),output_tokens=output['usage'].get('output_tokens'),cost=None,request_id=output['request_id'])
+                    return output | {'provider':p.name,'attempts':attempts,'fulfilled_intellect':candidate_tier,'fingerprint':p.fingerprint}
                 except Exception as exc:
                     attempts.append({'provider':p.name,'status':'failed'})
                     errors.append(type(exc).__name__)

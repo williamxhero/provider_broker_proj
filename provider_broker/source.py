@@ -36,7 +36,9 @@ async def sync_cpa(store, url: str, token: str) -> int:
     async with ClientSession() as session:
         async with session.get(url.rstrip("/")+"/v0/management/config",headers=headers,timeout=20) as response:
             response.raise_for_status(); payload=await response.json()
+    if not isinstance(payload, dict): raise ValueError('invalid source configuration')
     entries=expand_config(payload)
+    if not entries: raise ValueError('invalid source configuration')
     async with ClientSession() as session:
         for entry in entries:
             headers={'Authorization':'Bearer '+entry['api_key']}
