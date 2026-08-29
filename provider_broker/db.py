@@ -22,19 +22,19 @@ class Provider:
     models: list[str]
     pricing: dict[str, object]
     price_group: int
-    preference: int
     max_parallel: int
     enabled: bool
     multiplier: float
 
 
 class Store:
-    def __init__(self, path: Path, encryption_key: bytes):
+    def __init__(self, path: Path, encryption_key: bytes, default_race_parallel_cap: int = 3):
         path.parent.mkdir(parents=True, exist_ok=True)
         self.conn = sqlite3.connect(path)
         self.conn.row_factory = sqlite3.Row
         self.aes = AESGCM(encryption_key)
         self._inflight: dict[str, int] = {}
+        self.default_race_parallel_cap = default_race_parallel_cap
         self._migrate()
 
     def _migrate(self):
@@ -60,6 +60,7 @@ class Store:
           input_price REAL NOT NULL, cache_price REAL NOT NULL, output_price REAL NOT NULL
         );
         CREATE TABLE IF NOT EXISTS route_block (fingerprint TEXT NOT NULL, model TEXT NOT NULL, blocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(fingerprint,model));
+        CREATE TABLE IF NOT EXISTS broker_setting (name TEXT PRIMARY KEY, value TEXT NOT NULL);
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
@@ -81,6 +82,7 @@ class Store:
                 "INSERT INTO model_catalog VALUES(?,?,?,?,?,?)",
                 [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
             )
+        self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('race_parallel_cap',?)", (str(self.default_race_parallel_cap),))
         self.conn.commit()
 
     def catalog(self):
@@ -117,6 +119,12 @@ class Store:
                 self.conn.execute('UPDATE policy SET calibrated=? WHERE fingerprint=?', (int(bool(kept)), row['fingerprint']))
             self.conn.execute('DELETE FROM route_block WHERE model NOT IN (SELECT model FROM model_catalog)')
         return {'providers': len(rows), 'removed_models': removed, 'retained_models': retained}
+    def race_parallel_cap(self):
+        value = self.conn.execute("SELECT value FROM broker_setting WHERE name='race_parallel_cap'").fetchone()[0]
+        return int(value)
+    def update_race_parallel_cap(self, value):
+        with self.conn:
+            self.conn.execute("UPDATE broker_setting SET value=? WHERE name='race_parallel_cap'", (str(value),))
     def catalog_counts(self):
         rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.catalog()}
         for name in counts:
@@ -161,8 +169,8 @@ class Store:
             self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=?", site_notes)
 
     def providers(self, tier: str) -> list[Provider]:
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.preference,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
-        WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, p.preference DESC, s.id""").fetchall()
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
+        WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
         catalog = self.catalog()
         result=[]
         for r in rows:
@@ -172,7 +180,7 @@ class Store:
                 header_blob = r['request_headers']
                 headers = json.loads(self._decrypt(header_blob)) if header_blob else {}
                 pricing = catalog[models[0]]
-                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['preference']),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
+                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
         return result
 
     def try_acquire(self, provider: Provider) -> bool:
@@ -181,6 +189,9 @@ class Store:
             return False
         self._inflight[provider.fingerprint] = active + 1
         return True
+
+    def has_capacity(self, provider: Provider) -> bool:
+        return self._inflight.get(provider.fingerprint, 0) < provider.max_parallel
 
     def release(self, provider: Provider):
         active = self._inflight.get(provider.fingerprint, 0)
@@ -194,14 +205,14 @@ class Store:
             self.conn.execute('INSERT OR REPLACE INTO route_block(fingerprint,model) VALUES(?,?)',(fingerprint,model))
 
     def inventory(self) -> list[dict]:
-        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.preference,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
-        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"api_key_mask":self._decrypt(r['api_key'])[:3]+'***'+self._decrypt(r['api_key'])[-3:],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"note":r['note'],"preference":r['preference'],"max_parallel":r['max_parallel'],"multiplier":r['multiplier'],"technical_success_rate":self.conn.execute("SELECT avg(success) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"avg_ttft_ms":self.conn.execute("SELECT avg(latency_ms) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
+        rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
+        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"api_key_mask":self._decrypt(r['api_key'])[:3]+'***'+self._decrypt(r['api_key'])[-3:],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"note":r['note'],"max_parallel":r['max_parallel'],"multiplier":r['multiplier'],"technical_success_rate":self.conn.execute("SELECT avg(success) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"avg_ttft_ms":self.conn.execute("SELECT avg(latency_ms) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:
             current=self.conn.execute('SELECT * FROM policy WHERE fingerprint=?',(fingerprint,)).fetchone()
             if current is None: return False
-            self.conn.execute("UPDATE policy SET enabled=?,multiplier=?,calibrated=?,note=?,preference=?,max_parallel=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled",current['enabled'])),float(body.get('multiplier',current['multiplier'])),int(body.get('calibrated',current['calibrated'])),str(body.get('note',current['note'])),int(body.get('preference',current['preference'])),int(body.get('max_parallel',current['max_parallel'])),json.dumps(body.get("tiers",json.loads(current['tiers_json']))),fingerprint))
+            self.conn.execute("UPDATE policy SET enabled=?,multiplier=?,calibrated=?,note=?,max_parallel=?,tiers_json=? WHERE fingerprint=?", (int(body.get("enabled",current['enabled'])),float(body.get('multiplier',current['multiplier'])),int(body.get('calibrated',current['calibrated'])),str(body.get('note',current['note'])),int(body.get('max_parallel',current['max_parallel'])),json.dumps(body.get("tiers",json.loads(current['tiers_json']))),fingerprint))
         return True
 
     def observe(self, **data):

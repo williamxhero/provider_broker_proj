@@ -1,17 +1,17 @@
 const byId = (id) => document.getElementById(id);
 const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null };
-const empty = (value) => value === null || value === undefined || value === "" ? "暂无数据" : String(value);
+const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
 const cell = (value) => {
   const td = document.createElement("td");
   td.textContent = empty(value);
   return td;
 };
-const formatPercent = (value) => value === null || value === undefined ? "暂无数据" : `${(value * 100).toFixed(1)}%`;
+const formatPercent = (value) => value === null || value === undefined ? "n/a" : `${(value * 100).toFixed(1)}%`;
 const formatMs = (value) => {
-  if (value === null || value === undefined) return "暂无数据";
+  if (value === null || value === undefined) return "n/a";
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
 };
-const formatPrice = (value) => value === null || value === undefined ? "未校准" : String(value);
+const formatPrice = (value) => value === null || value === undefined ? "n/a" : String(value);
 
 async function requestJson(url, options) {
   const response = await fetch(url, options);
@@ -56,7 +56,6 @@ function openEditor(provider) {
   form.elements.note.value = provider.note || "";
   form.elements.multiplier.value = provider.multiplier;
   form.elements.enabled.checked = provider.enabled === true;
-  form.elements.preference.value = provider.preference;
   form.elements.max_parallel.value = provider.max_parallel;
   byId("editor-source").textContent = `${provider.name} · ${provider.family} · ${provider.base_url} · ${provider.api_key_mask}`;
   byId("editor").hidden = false;
@@ -102,7 +101,7 @@ function closeCatalogEditor() {
 
 function renderProviders(payload) {
   const table = byId("providers");
-  const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "preference", "并发数", "模型库存", "技术成功率", "平均首字延迟", "操作"]);
+  const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "单 Key 并发上限", "模型库存", "技术成功率", "平均首字延迟", "操作"]);
   payload.providers.forEach((provider) => {
     const row = document.createElement("tr");
     const status = document.createElement("span");
@@ -110,7 +109,7 @@ function renderProviders(payload) {
     status.textContent = provider.enabled ? "启用" : "停用";
     const statusCell = document.createElement("td");
     statusCell.append(status);
-    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(provider.multiplier), cell(provider.preference), cell(provider.max_parallel), cell(`${(provider.models || []).join(", ")} / ${empty(provider.inventory_status)}`), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
+    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(provider.multiplier), cell(provider.max_parallel), cell(`${(provider.models || []).join(", ")} / ${empty(provider.inventory_status)}`), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button";
@@ -200,16 +199,18 @@ async function loadCalls(cursor = state.cursor) {
 }
 
 async function load() {
-  const [summary, providers, catalog, quality] = await Promise.all([
+  const [summary, providers, catalog, quality, routing] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson("/admin/v1/providers"),
     requestJson("/admin/v1/catalog"),
     requestJson("/admin/v1/quality?window=24h"),
+    requestJson("/admin/v1/routing"),
   ]);
   renderSummary(summary);
   renderProviders(providers);
   renderCatalog(catalog);
   renderQuality(quality);
+  byId("race-parallel-cap").value = routing.race_parallel_cap;
   await loadCalls("");
 }
 
@@ -220,7 +221,6 @@ byId("policy").addEventListener("submit", async (event) => {
     note: form.elements.note.value,
     multiplier: Number(form.elements.multiplier.value),
     enabled: form.elements.enabled.checked,
-    preference: Number(form.elements.preference.value),
     max_parallel: Number(form.elements.max_parallel.value),
   };
   await requestJson(`/admin/v1/policy/${encodeURIComponent(state.provider.fingerprint)}`, {
@@ -228,6 +228,13 @@ byId("policy").addEventListener("submit", async (event) => {
   });
   closeEditor();
   await load();
+});
+
+byId("save-routing").addEventListener("click", async () => {
+  const race_parallel_cap = Number(byId("race-parallel-cap").value);
+  const result = await requestJson("/admin/v1/routing", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ race_parallel_cap }) });
+  byId("race-parallel-cap").value = result.race_parallel_cap;
+  byId("syncresult").textContent = `同价竞速 Key 数已设为 ${result.race_parallel_cap}`;
 });
 
 byId("catalog-create").addEventListener("click", () => openCatalogEditor());

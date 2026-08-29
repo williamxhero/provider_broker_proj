@@ -1,4 +1,5 @@
 import asyncio
+import random
 import time
 import uuid
 
@@ -216,12 +217,10 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         for provider in store.providers(candidate_tier):
             groups.setdefault((candidate_tier, provider.price_group), []).append(provider)
     for (candidate_tier, _), providers in sorted(groups.items(), key=lambda item: (tiers.index(item[0][0]), item[0][1])):
-        selected = []
-        for provider in providers:
-            if len(selected) >= max(1, parallel_cap):
-                break
-            if store.try_acquire(provider):
-                selected.append(provider)
+        available = [provider for provider in providers if store.has_capacity(provider)]
+        selected = random.sample(available, k=min(len(available), max(1, parallel_cap)))
+        for provider in selected:
+            store.try_acquire(provider)
 
         async def invoke_with_capacity(provider):
             try:

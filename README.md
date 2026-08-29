@@ -25,7 +25,7 @@ The catalog also shows a read-only **整合价 / 1M** for quick comparison: `4% 
 
 Use **应用目录到库存** after removing models from the directory. It prunes every API Key inventory to the current catalog and reports the retained and removed model counts. CPA manual sync applies the same filter, so models absent from the directory do not return.
 
-Routing races the selected keys in the cheapest model group and cancels losers after the first success, then falls upward only when a group fails. Within a capped race, keys enter in descending `preference` order (higher integer first). `max_parallel` is the per-API-Key maximum number of simultaneous upstream requests; a saturated key is skipped so another eligible key can be used. The global `BROKER_PARALLEL_CAP` remains the maximum number of keys raced for one request. OpenAI/Codex providers use Responses; Anthropic/Claude uses Messages. Native tools are intentionally not forwarded.
+Routing tries the cheapest model group first and cancels losers after the first success, then falls upward only when a group fails. For each stage and equal blended-price group, it randomly selects the configured global **同价竞速 Key 数**; price, not a per-Key preference, determines group order. `单 Key 并发上限` is the maximum number of in-flight upstream requests for that individual Key. A saturated Key is excluded from the random draw, protecting its upstream quota without changing the draw size. `BROKER_PARALLEL_CAP` supplies the initial value only; operators can change the persisted global value in the console. OpenAI/Codex providers use Responses; Anthropic/Claude uses Messages. Native tools are intentionally not forwarded.
 
 ## Local verification
 

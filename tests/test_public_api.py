@@ -1,5 +1,6 @@
 import asyncio
 import json
+from unittest.mock import patch
 
 import pytest
 from aiohttp import web
@@ -183,10 +184,11 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert css.status == 200 and css.content_type == 'text/css'
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
-    for token in ('renderQuality','renderCalls','/admin/v1/sync','callsUrl','暂无数据'):
+    for token in ('renderQuality','renderCalls','/admin/v1/sync','/admin/v1/routing','callsUrl','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200
     assert (await client.get('/admin/v1/providers')).status == 200
+    assert (await client.get('/admin/v1/routing')).status == 200
     assert (await client.get('/login')).status == 404
 
 
@@ -375,22 +377,20 @@ async def test_sync_reports_inventory_failures(client, cpa):
     assert (await (await client.get('/admin/v1/summary?window=24h',headers=headers)).json())['routable_apis'] == 0
 
 
-async def test_preference_selects_the_key_that_enters_a_capped_race(client, cpa):
+async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
     cpa.app['config'] = {'providers': [{'name': 'Shared upstream', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
         {'key': 'low-key', 'models': ['gpt-5.6-luna']},
         {'key': 'high-key', 'models': ['gpt-5.6-luna']},
     ]}]}
-    client.app['settings'] = client.app['settings'].__class__(**(client.app['settings'].__dict__ | {'parallel_cap': 1}))
     headers = {'Authorization': 'Bearer admin-secret'}
     assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
-    rows = (await (await client.get('/admin/v1/providers', headers=headers)).json())['providers']
-    for row in rows:
-        preference = 10 if row['api_key_mask'].startswith('hig') else 0
-        assert (await client.patch(f"/admin/v1/policy/{row['fingerprint']}", headers=headers, json={'preference': preference})).status == 200
-
-    result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'priority', 'intellect': 'standard'})
+    assert await (await client.patch('/admin/v1/routing', headers=headers, json={'race_parallel_cap': 1})).json() == {'race_parallel_cap': 1}
+    assert await (await client.get('/admin/v1/routing', headers=headers)).json() == {'race_parallel_cap': 1}
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: [next(provider for provider in providers if provider.api_key == 'high-key')]) as sample:
+        result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'random', 'intellect': 'standard'})
 
     assert result.status == 200
+    assert sample.call_args.kwargs['k'] == 1
     assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
 
 
@@ -422,12 +422,13 @@ async def test_management_summary_providers_and_validated_policy(client, cpa):
     providers=await client.get('/admin/v1/providers',headers=headers)
     row=(await providers.json())['providers'][0]
     assert row['api_key_mask'].endswith('ret') and 'provider-secret' not in str(row)
-    changed=await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'note':'fast lane','multiplier':1.2,'enabled':True,'preference':2,'max_parallel':3})
+    changed=await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'note':'fast lane','multiplier':1.2,'enabled':True,'max_parallel':3})
     assert changed.status == 200
     echoed=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
-    assert (echoed['note'],echoed['preference'],echoed['max_parallel']) == ('fast lane',2,3)
+    assert (echoed['note'],echoed['max_parallel']) == ('fast lane',3)
     invalid=await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'max_parallel':0})
     assert invalid.status == 400
+    assert (await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'preference':2})).status == 400
 
 
 async def test_policy_requires_real_boolean_and_rejects_source_fields(client, cpa):

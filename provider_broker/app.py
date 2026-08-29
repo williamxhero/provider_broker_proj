@@ -37,7 +37,7 @@ async def generate(request):
     if tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "model must be standard, smart, or expert"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["settings"].parallel_cap)
+        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap())
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     return web.json_response({
@@ -55,7 +55,7 @@ async def stream(request):
     if "model" in body or not isinstance(body.get("prompt"), str) or tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "prompt and valid intellect are required"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["settings"].parallel_cap, invoker=invoke_stream)
+        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream)
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
@@ -183,9 +183,20 @@ async def apply_catalog(request):
     return web.json_response(request.app['store'].apply_catalog_to_inventory())
 
 
+async def routing(request):
+    store = request.app['store']
+    if request.method == 'GET':
+        return web.json_response({'race_parallel_cap': store.race_parallel_cap()})
+    body = await request.json()
+    if not isinstance(body, dict) or set(body) != {'race_parallel_cap'} or type(body['race_parallel_cap']) is not int or not 1 <= body['race_parallel_cap'] <= 32:
+        return web.json_response({'error': 'invalid routing policy'}, status=400)
+    store.update_race_parallel_cap(body['race_parallel_cap'])
+    return web.json_response({'race_parallel_cap': store.race_parallel_cap()})
+
+
 async def update_policy(request):
     body = await request.json()
-    allowed = {"note", "multiplier", "enabled", "preference", "max_parallel", "calibrated", "tiers"}
+    allowed = {"note", "multiplier", "enabled", "max_parallel", "calibrated", "tiers"}
     numeric = lambda value: type(value) in (int, float) and math.isfinite(value)
     valid = (
         isinstance(body, dict) and bool(body) and set(body) <= allowed
@@ -193,7 +204,6 @@ async def update_policy(request):
         and ("enabled" not in body or type(body["enabled"]) is bool)
         and ("calibrated" not in body or type(body["calibrated"]) is bool)
         and ("multiplier" not in body or numeric(body["multiplier"]) and body["multiplier"] > 0)
-        and ("preference" not in body or type(body["preference"]) is int)
         and ("max_parallel" not in body or type(body["max_parallel"]) is int and 1 <= body["max_parallel"] <= 32)
         and ("tiers" not in body or isinstance(body["tiers"], list) and bool(body["tiers"])
              and all(tier in ("standard", "smart", "expert") for tier in body["tiers"]))
@@ -216,13 +226,13 @@ async def health(request):
 def create_app(settings: Settings):
     app = web.Application(middlewares=[auth()])
     app["settings"] = settings
-    app["store"] = Store(settings.database_path, settings.key_bytes())
+    app["store"] = Store(settings.database_path, settings.key_bytes(), settings.parallel_cap)
     app.router.add_static("/static/", WEB_ROOT)
     app.add_routes([
         web.get("/", home), web.get("/healthz", health),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),

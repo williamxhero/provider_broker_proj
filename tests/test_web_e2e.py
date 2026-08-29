@@ -47,7 +47,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "note": "initial note <script>window.__injected=2</script>", "enabled": True,
         "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
         "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
-        "avg_ttft_ms": 1800, "multiplier": 1.0, "preference": 2, "max_parallel": 3,
+        "avg_ttft_ms": 1800, "multiplier": 1.0, "max_parallel": 3,
     }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
@@ -63,6 +63,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             return {"providers": [provider]}
         if path == "/admin/v1/catalog":
             return {"catalog": catalog}
+        if path == "/admin/v1/routing":
+            return {"race_parallel_cap": 3}
         if path.startswith("/admin/v1/quality"):
             return {"calls": 7 if "window=7d" in path else 2, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):
@@ -85,6 +87,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
                 body = request.post_data_json
                 catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"blended_price": 2.456, "available_provider_count": 0}
                 route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
+            elif path == "/admin/v1/routing" and request.method == "PATCH":
+                route.fulfill(status=200, content_type="application/json", body='{"race_parallel_cap":2}')
             elif path == "/admin/v1/catalog/apply" and request.method == "POST":
                 route.fulfill(status=200, content_type="application/json", body='{"providers":1,"retained_models":1,"removed_models":2}')
             elif path.startswith("/admin/v1/catalog/") and request.method == "PUT":
@@ -107,6 +111,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
+        page.locator("#race-parallel-cap").fill("2")
+        page.locator("#save-routing").click()
+        page.get_by_text("同价竞速 Key 数已设为 2").wait_for()
         page.locator("#catalog-apply").click()
         page.get_by_text("已应用目录：1 个 Key，保留 1 个模型，移除 2 个模型").wait_for()
         page.locator("#catalog-create").click()
@@ -131,7 +138,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
         page.get_by_label("备注").fill("saved note")
         page.get_by_label("启用").uncheck()
-        page.get_by_role("button", name="保存").click()
+        page.locator("#policy").get_by_role("button", name="保存").click()
         page.get_by_role("button", name="从 CPA 手动同步").click()
         page.get_by_text("added 1 updated 0 offlined 0 inventory_failures 0").wait_for()
         page.get_by_role("button", name="7d").click()
@@ -149,6 +156,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert any("limit=2" in path for _, path, _ in seen)
         assert any(method == "POST" and path == "/admin/v1/catalog" for method, path, _ in seen)
         assert any(method == "POST" and path == "/admin/v1/catalog/apply" for method, path, _ in seen)
+        assert any(method == "PATCH" and path == "/admin/v1/routing" and '"race_parallel_cap":2' in (body or "") for method, path, body in seen)
         assert any(method == "PUT" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         assert any(method == "DELETE" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         browser.close()

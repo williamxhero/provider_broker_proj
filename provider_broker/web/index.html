@@ -20,10 +20,10 @@
     <section class="summary" aria-labelledby="summary-title">
       <h2 id="summary-title">24 小时健康摘要</h2>
       <div class="summary-grid">
-        <div><span>可路由 API</span><strong id="routable">暂无数据</strong></div>
-        <div><span>24 小时技术成功率</span><strong id="success">暂无数据</strong></div>
-        <div><span>平均首字延迟</span><strong id="ttft">暂无数据</strong></div>
-        <div><span>最近同步</span><strong id="syncat">暂无数据</strong></div>
+        <div><span>可路由 API</span><strong id="routable">n/a</strong></div>
+        <div><span>24 小时技术成功率</span><strong id="success">n/a</strong></div>
+        <div><span>平均首字延迟</span><strong id="ttft">n/a</strong></div>
+        <div><span>最近同步</span><strong id="syncat">n/a</strong></div>
       </div>
       <output id="syncresult" class="notice" aria-live="polite"></output>
     </section>
@@ -31,7 +31,7 @@
     <section aria-labelledby="providers-title">
       <div class="section-heading">
         <div><p class="index">01 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <p>CPA 来源字段只读；备注、倍率、启停、偏好与并发由 Broker 管理。</p>
+        <div class="section-actions"><p>价格决定先后；同价模型组随机抽取指定数量的 Key 竞速。此数字对全部 stage 生效。</p><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
       <div class="table-wrap"><table id="providers"></table></div>
     </section>
@@ -79,10 +79,8 @@
       <label>备注<input name="note" type="text"></label>
       <label>倍率<input name="multiplier" type="number" min="0.01" step="0.01" required></label>
       <label class="toggle"><input name="enabled" type="checkbox">启用</label>
-      <label>preference<input name="preference" type="number" step="1" required></label>
-      <p class="field-help">同一 price group 内，数值更高的 Key 优先参加竞速；不会改变模型 stage。</p>
-      <label>并发数<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
-      <p class="field-help">此 Key 同时在飞的上游请求上限；达到上限时，路由会优先尝试其他可用 Key。</p>
+      <label>单 Key 并发上限<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
+      <p class="field-help">此 Key 同时在飞的上游请求上限；达到上限时不会被抽入竞速，以保护上游配额。它不影响一次竞速会随机抽几个 Key。</p>
       <div class="editor-actions"><button id="cancel-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>
