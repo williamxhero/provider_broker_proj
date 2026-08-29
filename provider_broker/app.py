@@ -118,14 +118,26 @@ async def calls(request):
         limit = 0
     if not 1 <= limit <= 100:
         return web.json_response({"error": "invalid limit"}, status=400)
-    cursor = request.query.get("cursor")
-    if cursor and (not cursor.isdigit() or int(cursor) < 1):
-        return web.json_response({"error": "invalid cursor"}, status=400)
     window = request.query.get("window", "24h")
     if window not in ("1h", "24h", "7d", "30d"):
         return web.json_response({"error": "invalid window"}, status=400)
-    items = request.app["store"].calls(limit, cursor, request.query.get("provider"), request.query.get("status"), window)
-    return web.json_response({"items": items, "next_cursor": str(items[-1]["id"]) if len(items) == limit else None})
+    sort, _, direction = request.query.get("sort", "time:desc").partition(":")
+    if sort not in ("time", "note", "provider", "requested_model", "actual_model", "intellect", "effort", "ttft", "status", "input_tokens", "output_tokens", "cost", "request_id") or direction not in ("asc", "desc"):
+        return web.json_response({"error": "invalid sort"}, status=400)
+    cursor = request.query.get("cursor")
+    default_order = sort == "time" and direction == "desc"
+    if default_order:
+        if cursor and (not cursor.isdigit() or int(cursor) < 1):
+            return web.json_response({"error": "invalid cursor"}, status=400)
+        offset = None
+    else:
+        if cursor and not re.fullmatch(r"offset-\d+", cursor):
+            return web.json_response({"error": "invalid cursor"}, status=400)
+        offset = int(cursor.removeprefix("offset-")) if cursor else 0
+        cursor = None
+    items = request.app["store"].calls(limit, cursor, request.query.get("provider"), request.query.get("status"), window, sort, direction, offset)
+    next_cursor = str(items[-1]["id"]) if default_order and len(items) == limit else f"offset-{offset + len(items)}" if not default_order and len(items) == limit else None
+    return web.json_response({"items": items, "next_cursor": next_cursor})
 
 
 async def catalog(request):

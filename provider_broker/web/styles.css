@@ -43,7 +43,11 @@ h2 { margin: 0; font-size: clamp(1.7rem, 3vw, 3rem); font-weight: 520; letter-sp
 .table-wrap { overflow-x: auto; }
 table { width: 100%; border-collapse: collapse; white-space: nowrap; }
 th { padding: .85rem 1rem .85rem 0; color: var(--muted); font-size: .7rem; text-align: left; font-weight: 600; letter-spacing: .04em; border-bottom: 1px solid var(--line); }
+th .sort-button { display: inline-flex; align-items: center; gap: .3rem; padding: 0; border: 0; color: inherit; background: transparent; font: inherit; letter-spacing: inherit; text-align: left; }
+th .sort-button:hover, th .sort-button.active { color: var(--accent); }
+th .sort-indicator { color: var(--accent); font-size: .75rem; }
 td { max-width: 22rem; padding: 1rem 1rem 1rem 0; font-size: .82rem; border-bottom: 1px solid #182125; overflow: hidden; text-overflow: ellipsis; }
+td[rowspan] { vertical-align: top; padding-top: 1rem; }
 tbody tr { transition: background .18s ease; } tbody tr:hover { background: #0f1719; }
 .status { display: inline-flex; align-items: center; gap: .4rem; } .status::before { content: ""; width: .48rem; height: .48rem; border-radius: 50%; background: var(--muted); }
 .status.on::before { background: var(--accent); box-shadow: 0 0 0 .25rem #75e0bf19; }

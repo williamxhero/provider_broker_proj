@@ -228,10 +228,14 @@ class Store:
         fulfillment=self.conn.execute(f'SELECT avg(actual_model=requested_model) FROM observation WHERE {where}',params).fetchone()[0]
         failures={s:self.conn.execute(f'SELECT count(*) FROM observation WHERE {where} AND status=?',params+(s,)).fetchone()[0] for s in ('cancelled','timed_out','transport_failed','protocol_failed','stream_incomplete')}
         return {'calls':row['calls'],'technical_success_rate':row['rate'],'avg_ttft_ms':row['ttft'],'p95_ttft_ms':p95,'total_cost':row['total_cost'],'model_fulfillment_rate':fulfillment,'failures':failures}
-    def calls(self, limit, cursor=None, provider=None, status=None, window='24h'):
+    def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]
         if cursor: clauses.append('o.id < ?'); params.append(int(cursor))
         if provider: clauses.append('(o.fingerprint=? OR s.name=?)'); params.extend((provider,provider))
         if status: clauses.append('o.status=?'); params.append(status)
-        rows=self.conn.execute('SELECT o.*,s.name provider_name,p.note FROM observation o LEFT JOIN source_provider s ON s.fingerprint=o.fingerprint LEFT JOIN policy p ON p.fingerprint=o.fingerprint WHERE '+ ' AND '.join(clauses)+' ORDER BY o.id DESC LIMIT ?',(*params,limit)).fetchall()
+        order_columns={'time':'o.created_at','note':'p.note','provider':'COALESCE(s.name,o.fingerprint)','requested_model':'o.requested_model','actual_model':'o.actual_model','intellect':'o.tier','effort':'o.effort','ttft':'o.latency_ms','status':'o.status','input_tokens':'o.input_tokens','output_tokens':'o.output_tokens','cost':'o.cost','request_id':'o.request_id'}
+        query='SELECT o.*,s.name provider_name,p.note FROM observation o LEFT JOIN source_provider s ON s.fingerprint=o.fingerprint LEFT JOIN policy p ON p.fingerprint=o.fingerprint WHERE '+ ' AND '.join(clauses)+f' ORDER BY {order_columns[sort]} {direction.upper()}, o.id DESC LIMIT ?'
+        values=[*params,limit]
+        if offset is not None: query += ' OFFSET ?'; values.append(offset)
+        rows=self.conn.execute(query,values).fetchall()
         return [{'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],'request_id':r['request_id']} for r in rows]

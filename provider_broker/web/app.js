@@ -1,5 +1,11 @@
 const byId = (id) => document.getElementById(id);
-const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h" };
+const sortDefaults = {
+  providers: { key: "note", direction: "asc" },
+  catalog: { key: "model", direction: "asc" },
+  modelView: { key: "intellect", direction: "asc" },
+  calls: { key: "time", direction: "desc" },
+};
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, sorts: {} };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
@@ -28,6 +34,7 @@ function restoreControls() {
     if (preferences[id] !== undefined) byId(id).value = preferences[id];
   });
   state.qualityWindow = preferences.qualityWindow || state.qualityWindow;
+  state.sorts = { ...sortDefaults, ...(preferences.sorts || {}) };
   setQualityWindow(state.qualityWindow);
 }
 
@@ -44,13 +51,55 @@ async function requestJson(url, options) {
   return body;
 }
 
-function tableHead(table, labels) {
+function sortFor(list) {
+  return state.sorts[list] || sortDefaults[list];
+}
+
+function toggleSort(list, key, render) {
+  const current = sortFor(list);
+  state.sorts[list] = { key, direction: current.key === key && current.direction === "asc" ? "desc" : "asc" };
+  preferences.sorts = state.sorts;
+  savePreferences();
+  render();
+}
+
+function compareValues(left, right) {
+  const leftMissing = left === null || left === undefined || left === "";
+  const rightMissing = right === null || right === undefined || right === "";
+  if (leftMissing || rightMissing) return leftMissing === rightMissing ? 0 : leftMissing ? 1 : -1;
+  if (typeof left === "number" && typeof right === "number") return left - right;
+  return String(left).localeCompare(String(right), undefined, { numeric: true, sensitivity: "base" });
+}
+
+function sortItems(items, list, valueFor) {
+  const sort = sortFor(list);
+  return [...items].sort((left, right) => compareValues(valueFor(left, sort.key), valueFor(right, sort.key)) * (sort.direction === "asc" ? 1 : -1));
+}
+
+function tableHead(table, columns, list, render) {
   const thead = document.createElement("thead");
   const row = document.createElement("tr");
-  labels.forEach((label) => {
+  columns.forEach(({ key, label }) => {
     const th = document.createElement("th");
     th.scope = "col";
-    th.textContent = label;
+    if (!key) {
+      th.textContent = label;
+    } else {
+      const button = document.createElement("button");
+      const current = sortFor(list);
+      button.type = "button";
+      button.className = `sort-button${current.key === key ? " active" : ""}`;
+      button.textContent = label;
+      button.title = `按${label}排序`;
+      if (current.key === key) {
+        const indicator = document.createElement("span");
+        indicator.className = "sort-indicator";
+        indicator.textContent = current.direction === "asc" ? "↑" : "↓";
+        button.append(indicator);
+      }
+      button.addEventListener("click", () => toggleSort(list, key, render));
+      th.append(button);
+    }
     row.append(th);
   });
   thead.append(row);
@@ -134,9 +183,12 @@ function closeCatalogEditor() {
 }
 
 function renderProviders(payload) {
+  state.providers = payload.providers;
   const table = byId("providers");
-  const body = tableHead(table, ["状态", "备注名", "Provider 类型", "Base URL", "API Key", "费率倍率", "单 Key 并发上限", "模型库存", "24h 费用", "技术成功率", "平均首字延迟", "操作"]);
-  payload.providers.forEach((provider) => {
+  const columns = [{ key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "family", label: "Provider 类型" }, { key: "base_url", label: "Base URL" }, { key: "api_key_mask", label: "API Key" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
+  const providers = sortItems(payload.providers, "providers", (provider, key) => key === "models" ? provider.models.join(" ") : provider[key]);
+  providers.forEach((provider) => {
     const row = document.createElement("tr");
     const status = document.createElement("span");
     status.className = `status ${provider.enabled ? "on" : "off"}`;
@@ -168,20 +220,63 @@ function renderProviders(payload) {
 }
 
 function renderCatalog(payload) {
+  state.catalog = payload.catalog;
   const table = byId("catalog");
-  const body = tableHead(table, ["模型 ID", "模型家族", "stage", "输入 / 1M", "缓存输入 / 1M", "输出 / 1M", "整合价 / 1M", "可用 Key", "操作"]);
-  Object.entries(payload.catalog).forEach(([model, item]) => {
+  const columns = [{ key: "model", label: "模型 ID" }, { key: "family", label: "模型家族" }, { key: "intellect", label: "stage" }, { key: "official_input_price", label: "输入 / 1M" }, { key: "official_cache_price", label: "缓存输入 / 1M" }, { key: "official_output_price", label: "输出 / 1M" }, { key: "blended_price", label: "整合价 / 1M" }, { key: "available_provider_count", label: "可用 Key" }, { label: "操作" }];
+  const body = tableHead(table, columns, "catalog", () => renderCatalog({ catalog: state.catalog }));
+  const entries = sortItems(Object.entries(payload.catalog).map(([model, item]) => ({ model, ...item })), "catalog", (item, key) => key === "intellect" ? stageOrder(item.intellect) : item[key]);
+  entries.forEach((item) => {
     const row = document.createElement("tr");
-    [model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), formatPrice(item.blended_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
+    [item.model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), formatPrice(item.blended_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button";
     edit.className = "text-button";
     edit.textContent = "编辑";
-    edit.addEventListener("click", () => openCatalogEditor(model, item));
+    edit.addEventListener("click", () => openCatalogEditor(item.model, item));
     action.append(edit);
     row.append(action);
     body.append(row);
+  });
+}
+
+function stageOrder(value) {
+  return ({ standard: 0, smart: 1, expert: 2 })[value] ?? 99;
+}
+
+function renderModelView() {
+  const table = byId("model-view");
+  const columns = [{ key: "model", label: "模型名称" }, { key: "intellect", label: "模型分组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
+  const body = tableHead(table, columns, "modelView", renderModelView);
+  const models = Object.entries(state.catalog).map(([model, item]) => ({
+    model,
+    intellect: item.intellect,
+    providers: state.providers.filter((provider) => provider.models.includes(model)).map((provider) => ({
+      note: provider.note || "n/a",
+      price: Number(item.blended_price) * Number(provider.multiplier),
+    })),
+  }));
+  const sorted = sortItems(models, "modelView", (item, key) => {
+    if (key === "intellect") return stageOrder(item.intellect);
+    if (key === "note") return item.providers.map((provider) => provider.note).join(" ");
+    if (key === "price") return item.providers.length ? Math.min(...item.providers.map((provider) => provider.price)) : null;
+    return item.model;
+  });
+  sorted.forEach((item) => {
+    const providers = item.providers.length ? item.providers : [{ note: "n/a", price: null }];
+    providers.sort((left, right) => compareValues(left.note, right.note));
+    providers.forEach((provider, index) => {
+      const row = document.createElement("tr");
+      if (index === 0) {
+        const model = cell(item.model);
+        const intellect = cell(item.intellect);
+        model.rowSpan = providers.length;
+        intellect.rowSpan = providers.length;
+        row.append(model, intellect);
+      }
+      row.append(cell(provider.note), cell(formatCost(provider.price)));
+      body.append(row);
+    });
   });
 }
 
@@ -213,18 +308,21 @@ function renderQuality(payload) {
 }
 
 function callsUrl(cursor = state.cursor) {
+  const sort = sortFor("calls");
   return `/admin/v1/calls?${new URLSearchParams({
     window: byId("callwindow").value,
     limit: byId("calllimit").value,
     provider: byId("callprovider").value,
     status: byId("callstatus").value,
     cursor,
+    sort: `${sort.key}:${sort.direction}`,
   })}`;
 }
 
 function renderCalls(payload) {
   const table = byId("calls");
-  const body = tableHead(table, ["调用时间", "API Key 备注", "Provider", "请求模型", "实际模型", "intellect", "effort", "TTFT", "技术状态", "输入 Token", "输出 Token", "成本", "request ID"]);
+  const columns = [{ key: "time", label: "调用时间" }, { key: "note", label: "API Key 备注" }, { key: "provider", label: "Provider" }, { key: "requested_model", label: "请求模型" }, { key: "actual_model", label: "实际模型" }, { key: "intellect", label: "intellect" }, { key: "effort", label: "effort" }, { key: "ttft", label: "TTFT" }, { key: "status", label: "技术状态" }, { key: "input_tokens", label: "输入 Token" }, { key: "output_tokens", label: "输出 Token" }, { key: "cost", label: "成本" }, { key: "request_id", label: "request ID" }];
+  const body = tableHead(table, columns, "calls", () => loadCalls(""));
   payload.items.forEach((item) => {
     const row = document.createElement("tr");
     [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), item.status, item.input_tokens, item.output_tokens, formatCost(item.cost), item.request_id].forEach((value) => row.append(cell(value)));
@@ -255,6 +353,7 @@ async function load() {
   renderSummary(summary);
   renderProviders(providers);
   renderCatalog(catalog);
+  renderModelView();
   renderQuality(quality);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   await loadCalls("");
