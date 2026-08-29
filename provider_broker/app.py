@@ -1,4 +1,3 @@
-import hmac
 import json
 import math
 import re
@@ -13,20 +12,6 @@ from .source import sync_cpa
 from .upstream import UpstreamFailure, invoke_stream, route
 
 WEB_ROOT = Path(__file__).with_name("web")
-
-
-def auth():
-    @web.middleware
-    async def middleware(request, handler):
-        if not request.path.startswith("/v1/"):
-            return await handler(request)
-        required = request.app["settings"].client_token
-        value = request.headers.get("Authorization", "")
-        if not hmac.compare_digest(value, f"Bearer {required}"):
-            return web.json_response({"error": "client authentication required"}, status=401)
-        return await handler(request)
-
-    return middleware
 
 
 async def generate(request):
@@ -242,7 +227,7 @@ async def health(request):
 
 
 def create_app(settings: Settings):
-    app = web.Application(middlewares=[auth()])
+    app = web.Application()
     app["settings"] = settings
     app["store"] = Store(settings.database_path, settings.key_bytes(), settings.parallel_cap)
     app.router.add_static("/static/", WEB_ROOT)

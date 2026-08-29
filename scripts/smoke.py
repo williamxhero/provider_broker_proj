@@ -7,13 +7,12 @@ import urllib.error
 import urllib.request
 
 base = os.getenv("BROKER_URL", "http://192.168.50.2:8817").rstrip("/")
-token = os.environ["BROKER_CLIENT_TOKEN"]
 
 
 def request(payload):
     req = urllib.request.Request(
         base + "/v1/generate", data=json.dumps(payload).encode(),
-        headers={"Authorization": "Bearer " + token, "Content-Type": "application/json"}, method="POST",
+        headers={"Content-Type": "application/json"}, method="POST",
     )
     try:
         with urllib.request.urlopen(req, timeout=120) as response:

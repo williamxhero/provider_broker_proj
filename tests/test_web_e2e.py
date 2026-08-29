@@ -24,7 +24,7 @@ class LiveBroker:
 
     def _run(self):
         asyncio.set_event_loop(self.loop)
-        settings = Settings(self.database_path, "client-secret", "admin-secret", "session-secret", base64.b64encode(b"x" * 32).decode())
+        settings = Settings(self.database_path, "admin-secret", "session-secret", base64.b64encode(b"x" * 32).decode())
         self.app = create_app(settings)
         self.runner = web.AppRunner(self.app)
         self.loop.run_until_complete(self.runner.setup())

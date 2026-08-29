@@ -1,12 +1,11 @@
 ## 调用 LLM
 
-管理台在 `http://yosef-server:8817/`；LLM 调用使用同一服务的 `/v1` 接口。调用方先向管理员获取 Client Token，并将其放入 `BROKER_CLIENT_TOKEN` 环境变量。不要使用管理 Token，也不要在请求中提交 `model`；模型由 Broker 按 `intellect` 自动路由。
+管理台在 `http://yosef-server:8817/`；局域网或直连网线上的 LLM 调用使用同一服务的 `/v1` 接口，**不需要 Client Token 或 Authorization 请求头**。不要在请求中提交 `model`；模型由 Broker 按 `intellect` 自动路由。
 
 ### 非流式调用
 
 ```bash
 curl -X POST http://yosef-server:8817/v1/generate \
-  -H "Authorization: Bearer $BROKER_CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{
     "prompt": "用三点总结这份材料：……",
@@ -25,12 +24,11 @@ curl -X POST http://yosef-server:8817/v1/generate \
 
 ```bash
 curl -N -X POST http://yosef-server:8817/v1/generate/stream \
-  -H "Authorization: Bearer $BROKER_CLIENT_TOKEN" \
   -H "Content-Type: application/json" \
   -d '{"prompt":"解释这个概念", "intellect":"smart", "effort":"medium"}'
 ```
 
-认证失败返回 `401`；没有可用上游或所有竞速 Key 都失败时返回 `503`，响应中的 `attempts` 可用于排查。
+请求参数不合法返回 `400`；没有可用上游或所有竞速 Key 都失败时返回 `503`，响应中的 `attempts` 可用于排查。
 
 
 

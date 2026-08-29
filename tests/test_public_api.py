@@ -18,7 +18,6 @@ async def client(tmp_path):
     app = create_app(
         Settings(
             database_path=tmp_path / "broker.sqlite3",
-            client_token="client-secret",
             admin_token="admin-secret",
             session_secret="session-secret",
             encryption_key="MDEyMzQ1Njc4OWFiY2RlZg==",
@@ -31,10 +30,10 @@ async def client(tmp_path):
     await client.close()
 
 
-async def test_generate_requires_client_bearer(client):
+async def test_generate_does_not_require_client_bearer(client):
     response = await client.post("/v1/generate", json={"model": "standard"})
-    assert response.status == 401
-    assert await response.json() == {"error": "client authentication required"}
+    assert response.status == 400
+    assert await response.json() == {"error": "prompt and intellect are required; model is not a capability selector"}
 
 
 async def test_console_and_management_api_are_available_without_login(client):
@@ -43,7 +42,7 @@ async def test_console_and_management_api_are_available_without_login(client):
     assert 'Provider' in await response.text()
     assert (await client.get('/admin/v1/summary')).status == 200
     assert (await client.get('/login')).status == 404
-    assert (await client.post('/v1/generate', json={'prompt': 'no token', 'intellect': 'standard'})).status == 401
+    assert (await client.post('/v1/generate', json={'prompt': 'no token', 'intellect': 'standard'})).status == 503
 
 
 @pytest.fixture
@@ -100,7 +99,7 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     await client.put('/admin/v1/policy/'+provider['fingerprint'],headers=headers,json={'calibrated':True,'tiers':['standard','smart','expert']})
     updated=await client.get('/admin/v1/inventory',headers=headers)
     assert (await updated.json())['providers'][0]['calibrated'] is True
-    result=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hi','intellect':'standard','effort':'medium'})
+    result=await client.post('/v1/generate',json={'prompt':'hi','intellect':'standard','effort':'medium'})
     result_body=await result.json()
     assert result_body['actual_model'] == 'gpt-5.6-luna'
     assert result_body['request_id'] == 'req-test'
@@ -110,7 +109,7 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
     assert audit['output_tokens']==2 and audit['request_id']=='req-test' and audit['cost'] is None
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
-    streamed=await client.post('/v1/generate/stream',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hi','intellect':'standard'})
+    streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
     assert 'gpt-5.6-luna' in await streamed.text()
 

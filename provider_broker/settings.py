@@ -7,7 +7,6 @@ import os
 @dataclass(frozen=True)
 class Settings:
     database_path: Path
-    client_token: str
     admin_token: str
     session_secret: str
     encryption_key: str
@@ -19,7 +18,6 @@ class Settings:
     def from_env(cls) -> "Settings":
         return cls(
             database_path=Path(os.getenv("BROKER_DB_PATH", "/data/provider-broker/data/broker.sqlite3")),
-            client_token=os.environ["BROKER_CLIENT_TOKEN"],
             admin_token=os.environ["BROKER_ADMIN_TOKEN"],
             session_secret=os.environ["BROKER_SESSION_SECRET"],
             encryption_key=os.environ["BROKER_ENCRYPTION_KEY"],
