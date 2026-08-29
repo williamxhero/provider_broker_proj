@@ -30,9 +30,13 @@ async def test_generate_requires_client_bearer(client):
     assert await response.json() == {"error": "client authentication required"}
 
 
-async def test_console_home_redirects_to_login_without_session(client):
-    response=await client.get('/',allow_redirects=False)
-    assert response.status == 302 and response.headers['Location'] == '/login'
+async def test_console_and_management_api_are_available_without_login(client):
+    response = await client.get('/')
+    assert response.status == 200
+    assert 'Provider' in await response.text()
+    assert (await client.get('/admin/v1/summary')).status == 200
+    assert (await client.get('/login')).status == 404
+    assert (await client.post('/v1/generate', json={'prompt': 'no token', 'intellect': 'standard'})).status == 401
 
 
 @pytest.fixture
@@ -158,11 +162,8 @@ async def test_model_mismatch_is_completed_but_blocked_until_manual_sync(client,
     assert len((await (await client.get('/admin/v1/calls?limit=10',headers=headers)).json())['items']) == 2
 
 
-async def test_web_login_uses_session_for_admin_sync(client):
-    response=await client.post('/login',data={'token':'admin-secret'},allow_redirects=False)
-    assert response.status == 302
-    cookie=response.headers['Set-Cookie']
-    response=await client.get('/',headers={'Cookie':cookie})
+async def test_web_console_is_direct_and_management_api_needs_no_session(client):
+    response=await client.get('/')
     assert response.status == 200
     page=await response.text()
     assert 'href="/static/styles.css"' in page
@@ -177,10 +178,9 @@ async def test_web_login_uses_session_for_admin_sync(client):
     script=await js.text()
     for token in ('renderQuality','renderCalls','/admin/v1/sync','callsUrl','暂无数据'):
         assert token in script
-    assert (await client.get('/admin/v1/summary',headers={'Cookie':cookie})).status == 200
-    assert (await client.get('/admin/v1/providers',headers={'Cookie':cookie})).status == 200
-    client.session.cookie_jar.clear()
-    assert (await client.get('/admin/v1/summary')).status == 401
+    assert (await client.get('/admin/v1/summary')).status == 200
+    assert (await client.get('/admin/v1/providers')).status == 200
+    assert (await client.get('/login')).status == 404
 
 
 async def test_sync_normalizes_cpa_sections_and_generate_uses_canonical_request(client, cpa):

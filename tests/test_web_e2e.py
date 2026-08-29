@@ -87,10 +87,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
                 route.fulfill(status=200, content_type="application/json", body=__import__("json").dumps(payload(path)))
 
         page.route("**/admin/v1/**", route_handler)
-        page.goto(broker.url + "/login")
-        page.get_by_label("管理令牌").fill("admin-secret")
-        page.get_by_role("button", name="登录").click()
-        page.wait_for_url(broker.url + "/")
+        page.goto(broker.url)
         assert page.evaluate("window.__injected") is None
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1

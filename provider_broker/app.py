@@ -1,4 +1,3 @@
-import base64
 import hmac
 import json
 import math
@@ -14,31 +13,15 @@ from .upstream import UpstreamFailure, invoke_stream, route
 WEB_ROOT = Path(__file__).with_name("web")
 
 
-def session_value(secret: str) -> str:
-    signature = hmac.digest(secret.encode(), b"provider-broker-web-v1", "sha256")
-    return base64.urlsafe_b64encode(signature).decode()
-
-
-def session_ok(request) -> bool:
-    expected = session_value(request.app["settings"].session_secret)
-    return hmac.compare_digest(request.cookies.get("broker_session", ""), expected)
-
-
-def auth(token_name):
+def auth():
     @web.middleware
     async def middleware(request, handler):
-        if request.path in ("/healthz", "/", "/login") or request.path.startswith("/static/"):
+        if not request.path.startswith("/v1/"):
             return await handler(request)
-        if request.path.startswith("/admin/"):
-            required = request.app["settings"].admin_token
-        elif request.path.startswith("/v1/"):
-            required = request.app["settings"].client_token
-        else:
-            return await handler(request)
+        required = request.app["settings"].client_token
         value = request.headers.get("Authorization", "")
-        admin_session = request.path.startswith("/admin/") and session_ok(request)
-        if not admin_session and not hmac.compare_digest(value, f"Bearer {required}"):
-            return web.json_response({"error": f"{token_name} authentication required"}, status=401)
+        if not hmac.compare_digest(value, f"Bearer {required}"):
+            return web.json_response({"error": "client authentication required"}, status=401)
         return await handler(request)
 
     return middleware
@@ -182,8 +165,6 @@ async def update_policy(request):
 
 
 async def home(request):
-    if not session_ok(request):
-        raise web.HTTPFound("/login")
     return web.FileResponse(WEB_ROOT / "index.html")
 
 
@@ -191,24 +172,13 @@ async def health(request):
     return web.json_response({"status": "ok"})
 
 
-async def login(request):
-    if request.method == "GET":
-        return web.FileResponse(WEB_ROOT / "login.html")
-    form = await request.post()
-    if not hmac.compare_digest(str(form.get("token", "")), request.app["settings"].admin_token):
-        return web.Response(text="invalid credentials", status=401)
-    response = web.HTTPFound("/")
-    response.set_cookie("broker_session", session_value(request.app["settings"].session_secret), httponly=True, samesite="Strict", secure=False, max_age=28800)
-    return response
-
-
 def create_app(settings: Settings):
-    app = web.Application(middlewares=[auth("client")])
+    app = web.Application(middlewares=[auth()])
     app["settings"] = settings
     app["store"] = Store(settings.database_path, settings.key_bytes())
     app.router.add_static("/static/", WEB_ROOT)
     app.add_routes([
-        web.get("/", home), web.get("/healthz", health), web.get("/login", login), web.post("/login", login),
+        web.get("/", home), web.get("/healthz", health),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog),

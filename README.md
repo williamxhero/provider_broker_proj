@@ -9,7 +9,7 @@ Client bearer endpoints:
 - `POST /v1/generate` for `standard`, `smart`, or `expert`, with independent `effort`.
 - `POST /v1/generate/stream` for SSE.
 
-Admin bearer endpoints are `POST /admin/v1/sync`, `GET /admin/v1/inventory`, and `PUT /admin/v1/policy/{fingerprint}`. The embedded Web login creates an HttpOnly, Strict session cookie and has no CPA mutation paths.
+The management console opens directly at `/`, and `/admin/v1/*` is intentionally unauthenticated. It is protected by the dedicated host firewall, which only admits the direct-link client (`192.168.50.1`) and the server itself. Generation endpoints remain protected by the separate client Bearer token.
 
 Routing races all eligible providers in the cheapest price group, cancels losers after the first success, then falls upward only when a group fails. OpenAI/Codex providers use Responses; Anthropic/Claude uses Messages. Native tools are intentionally not forwarded.
 
