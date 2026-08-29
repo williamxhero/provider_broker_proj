@@ -49,6 +49,10 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
         "avg_ttft_ms": 1800, "cost_24h": 0.02, "multiplier": 1.0, "max_parallel": 3,
     }
+    same_site_provider = provider | {
+        "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
+        "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "multiplier": 1.5,
+    }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
         {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
@@ -60,7 +64,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path.startswith("/admin/v1/summary"):
             return {"routable_apis": 1, "technical_success_rate": 0.98, "avg_ttft_ms": 1800, "last_successful_sync": "2026-08-29T10:00:00Z"}
         if path == "/admin/v1/providers":
-            return {"providers": [provider]}
+            return {"providers": [provider, same_site_provider]}
         if path == "/admin/v1/catalog":
             return {"catalog": catalog}
         if path == "/admin/v1/routing":
@@ -115,13 +119,17 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#race-parallel-cap").count() == 1
         assert "价格决定先后" not in page.content()
         assert "stage 决定路由分区" not in page.content()
-        assert page.locator("#providers .model-tag").all_inner_texts() == ["luna"]
+        assert page.locator("#providers .model-tag").all_inner_texts() == ["luna", "luna"]
         assert "available" not in page.locator("#providers").inner_text()
         page.get_by_text("$0.02", exact=True).first.wait_for()
+        base_urls = page.locator("#providers tbody td[rowspan]")
+        assert base_urls.count() == 1
+        assert base_urls.first.get_attribute("rowspan") == "2"
+        assert base_urls.first.inner_text() == "https://alpha.invalid/<svg onload=window.__injected=3>"
         model_view = page.locator("#model-view tbody tr")
-        assert model_view.count() == 1
-        assert model_view.locator("td").all_inner_texts() == ["luna", "standard", "低价组", "initial note <script>window.__injected=2</script>", "$1.656"]
-        assert model_view.locator("td").nth(0).get_attribute("rowspan") == "1"
+        assert model_view.count() == 2
+        assert model_view.locator("td").all_inner_texts() == ["luna", "standard", "低价组", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]
+        assert model_view.locator("td").nth(0).get_attribute("rowspan") == "2"
         page.locator("#model-view").get_by_role("button", name="价格组").click()
         page.locator("#race-parallel-cap").fill("2")
         page.locator("#save-routing").click()
@@ -146,7 +154,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.locator("#catalog tbody tr").filter(has_text="gpt-console-route").locator("button").click()
         page.locator("#catalog-delete").click()
         expect(page.locator("#catalog").get_by_text("gpt-console-route", exact=True)).to_have_count(0)
-        page.locator("#providers").get_by_role("button", name="编辑").click()
+        page.locator("#providers").get_by_role("button", name="编辑").first.click()
         assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
         assert page.locator("#policy [name=multiplier]").get_attribute("step") == "0.001"
         page.get_by_label("备注").fill("saved note")

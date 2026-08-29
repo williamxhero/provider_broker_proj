@@ -185,37 +185,51 @@ function closeCatalogEditor() {
 function renderProviders(payload) {
   state.providers = payload.providers;
   const table = byId("providers");
-  const columns = [{ key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "family", label: "Provider 类型" }, { key: "base_url", label: "Base URL" }, { key: "api_key_mask", label: "API Key" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  const columns = [{ key: "base_url", label: "Base URL" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
-  const providers = sortItems(payload.providers, "providers", (provider, key) => key === "models" ? provider.models.join(" ") : provider[key]);
-  providers.forEach((provider) => {
-    const row = document.createElement("tr");
-    const status = document.createElement("span");
-    status.className = `status ${provider.enabled ? "on" : "off"}`;
-    status.textContent = provider.enabled ? "启用" : "停用";
-    const statusCell = document.createElement("td");
-    statusCell.append(status);
-    const models = document.createElement("td");
-    const tags = document.createElement("div");
-    tags.className = "model-tags";
-    (provider.models || []).forEach((model) => {
-      const tag = document.createElement("span");
-      tag.className = "model-tag";
-      tag.textContent = model;
-      tags.append(tag);
+  const groups = [...payload.providers.reduce((byUrl, provider) => {
+    const group = byUrl.get(provider.base_url) || { base_url: provider.base_url, providers: [] };
+    group.providers.push(provider);
+    byUrl.set(provider.base_url, group);
+    return byUrl;
+  }, new Map()).values()];
+  const valueFor = (provider, key) => key === "models" ? provider.models.join(" ") : provider[key];
+  sortItems(groups, "providers", (group, key) => key === "base_url" ? group.base_url : valueFor(sortItems(group.providers, "providers", valueFor)[0], key)).forEach((group) => {
+    const providers = sortItems(group.providers, "providers", valueFor);
+    providers.forEach((provider, index) => {
+      const row = document.createElement("tr");
+      if (index === 0) {
+        const baseUrl = cell(group.base_url);
+        baseUrl.rowSpan = providers.length;
+        row.append(baseUrl);
+      }
+      const status = document.createElement("span");
+      status.className = `status ${provider.enabled ? "on" : "off"}`;
+      status.textContent = provider.enabled ? "启用" : "停用";
+      const statusCell = document.createElement("td");
+      statusCell.append(status);
+      const models = document.createElement("td");
+      const tags = document.createElement("div");
+      tags.className = "model-tags";
+      (provider.models || []).forEach((model) => {
+        const tag = document.createElement("span");
+        tag.className = "model-tag";
+        tag.textContent = model;
+        tags.append(tag);
+      });
+      if (!tags.childElementCount) tags.textContent = "n/a";
+      models.append(tags);
+      row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.family), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
+      const action = document.createElement("td");
+      const edit = document.createElement("button");
+      edit.type = "button";
+      edit.className = "text-button";
+      edit.textContent = "编辑";
+      edit.addEventListener("click", () => openEditor(provider));
+      action.append(edit);
+      row.append(action);
+      body.append(row);
     });
-    if (!tags.childElementCount) tags.textContent = "n/a";
-    models.append(tags);
-    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
-    const action = document.createElement("td");
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "text-button";
-    edit.textContent = "编辑";
-    edit.addEventListener("click", () => openEditor(provider));
-    action.append(edit);
-    row.append(action);
-    body.append(row);
   });
 }
 
