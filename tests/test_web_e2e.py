@@ -150,6 +150,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert base_urls.first.get_attribute("rowspan") == "4"
         assert base_urls.first.inner_text() == "https://alpha.invalid"
         assert "/v1" not in page.locator("#providers").inner_text()
+        assert page.locator("#providers tbody tr").filter(has_text="disabled note").get_attribute("class") == "inactive-row"
         model_view = page.locator("#model-view tbody tr")
         assert model_view.count() == 4
         assert model_view.locator("td").all_inner_texts() == ["standard", "低价组", "cheapest note", "nova", "$0.828", "initial note <script>window.__injected=2</script>", "luna", "$1.656", "高价组", "second note", "luna", "$2.484", "disabled note", "luna", "$3.312"]
@@ -194,9 +195,12 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.locator("#callstatus").fill("completed")
         page.locator("#callwindow").select_option("1h")
         page.locator("#calllimit").select_option("2")
-        page.get_by_text("r-2").wait_for()
+        page.locator("#calls").get_by_text("成功", exact=True).wait_for()
+        call_headers = [text.split("\n")[0] for text in page.locator("#calls thead th").all_inner_texts()]
+        assert "Provider" not in call_headers
+        assert "request ID" not in call_headers
         page.get_by_role("button", name="下一页").click()
-        page.get_by_text("r-1").wait_for()
+        page.locator("#calls").get_by_text("传输失败", exact=True).wait_for()
         assert page.locator("#calls").get_by_text("传输失败", exact=True).count() == 1
         page.reload()
         expect(page.get_by_role("button", name="7d")).to_have_class(__import__("re").compile("active"))

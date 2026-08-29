@@ -198,6 +198,7 @@ function renderProviders(payload) {
     const providers = sortItems(group.providers, "providers", valueFor);
     providers.forEach((provider, index) => {
       const row = document.createElement("tr");
+      if (!provider.enabled) row.className = "inactive-row";
       if (index === 0) {
         const domain = cell(group.domain);
         domain.rowSpan = providers.length;
@@ -367,11 +368,11 @@ function callsUrl(cursor = state.cursor) {
 
 function renderCalls(payload) {
   const table = byId("calls");
-  const columns = [{ key: "time", label: "调用时间" }, { key: "note", label: "API Key 备注" }, { key: "provider", label: "Provider" }, { key: "requested_model", label: "请求模型" }, { key: "actual_model", label: "实际模型" }, { key: "intellect", label: "intellect" }, { key: "effort", label: "effort" }, { key: "ttft", label: "TTFT" }, { key: "status", label: "技术状态" }, { key: "input_tokens", label: "输入 Token" }, { key: "output_tokens", label: "输出 Token" }, { key: "cost", label: "成本" }, { key: "request_id", label: "request ID" }];
+  const columns = [{ key: "time", label: "调用时间" }, { key: "note", label: "API Key 备注" }, { key: "requested_model", label: "请求模型" }, { key: "actual_model", label: "实际模型" }, { key: "intellect", label: "intellect" }, { key: "effort", label: "effort" }, { key: "ttft", label: "TTFT" }, { key: "status", label: "技术状态" }, { key: "input_tokens", label: "输入 Token" }, { key: "output_tokens", label: "输出 Token" }, { key: "cost", label: "成本" }];
   const body = tableHead(table, columns, "calls", () => loadCalls(""));
   payload.items.forEach((item) => {
     const row = document.createElement("tr");
-    [item.time, item.note, item.provider, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), displayStatus(item.status), item.input_tokens, item.output_tokens, formatCost(item.cost), item.request_id].forEach((value) => row.append(cell(value)));
+    [item.time, item.note, item.requested_model, item.actual_model, item.intellect, item.effort, formatMs(item.ttft_ms), displayStatus(item.status), item.input_tokens, item.output_tokens, formatCost(item.cost)].forEach((value) => row.append(cell(value)));
     body.append(row);
   });
   state.cursor = payload.next_cursor || "";
