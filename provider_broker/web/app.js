@@ -14,6 +14,7 @@ const formatMs = (value) => {
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
 };
 const formatPrice = (value) => value === null || value === undefined ? "n/a" : String(value);
+const formatMultiplier = (value) => value === null || value === undefined || !Number.isFinite(Number(value)) ? "n/a" : Number(value).toFixed(3);
 const formatCost = (value) => value === null || value === undefined || !Number.isFinite(Number(value))
   ? "n/a"
   : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(Number(value));
@@ -68,8 +69,19 @@ function renderSummary(summary) {
   byId("routable").textContent = empty(summary.routable_apis);
   byId("success").textContent = formatPercent(summary.technical_success_rate);
   byId("ttft").textContent = formatMs(summary.avg_ttft_ms);
-  byId("syncat").textContent = empty(summary.last_successful_sync);
+  byId("syncat").textContent = formatShanghaiTime(summary.last_successful_sync);
   byId("success").className = healthClass(summary.technical_success_rate, summary.avg_ttft_ms);
+}
+
+function formatShanghaiTime(value) {
+  if (!value) return "n/a";
+  const date = new Date(value);
+  if (Number.isNaN(date.getTime())) return "n/a";
+  const values = Object.fromEntries(new Intl.DateTimeFormat("en-CA", {
+    timeZone: "Asia/Shanghai", year: "numeric", month: "2-digit", day: "2-digit",
+    hour: "2-digit", minute: "2-digit", hourCycle: "h23",
+  }).formatToParts(date).filter((part) => part.type !== "literal").map((part) => [part.type, part.value]));
+  return `${values.year}/${values.month}/${values.day} ${values.hour}:${values.minute}`;
 }
 
 function openEditor(provider) {
@@ -142,7 +154,7 @@ function renderProviders(payload) {
     });
     if (!tags.childElementCount) tags.textContent = "n/a";
     models.append(tags);
-    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(provider.multiplier), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
+    row.append(statusCell, cell(provider.note), cell(provider.family), cell(provider.base_url), cell(provider.api_key_mask), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button";

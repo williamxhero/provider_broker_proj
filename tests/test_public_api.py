@@ -200,7 +200,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert css.status == 200 and css.content_type == 'text/css'
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
-    for token in ('renderQuality','renderCalls','/admin/v1/sync','/admin/v1/routing','callsUrl','n/a'):
+    for token in ('renderQuality','renderCalls','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200
     assert (await client.get('/admin/v1/providers')).status == 200

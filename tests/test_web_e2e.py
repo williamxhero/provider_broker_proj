@@ -111,6 +111,10 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
+        page.get_by_text("2026/08/29 18:00", exact=True).wait_for()
+        assert page.locator("#race-parallel-cap").count() == 1
+        assert "价格决定先后" not in page.content()
+        assert "stage 决定路由分区" not in page.content()
         assert page.locator("#providers .model-tag").all_inner_texts() == ["luna"]
         assert "available" not in page.locator("#providers").inner_text()
         page.get_by_text("$0.02", exact=True).first.wait_for()
@@ -139,6 +143,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         expect(page.locator("#catalog").get_by_text("gpt-console-route", exact=True)).to_have_count(0)
         page.locator("#providers").get_by_role("button", name="编辑").click()
         assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
+        assert page.locator("#policy [name=multiplier]").get_attribute("step") == "0.001"
         page.get_by_label("备注").fill("saved note")
         page.get_by_label("启用").uncheck()
         page.locator("#policy").get_by_role("button", name="保存").click()

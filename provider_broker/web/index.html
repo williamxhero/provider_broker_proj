@@ -29,7 +29,7 @@
     <section aria-labelledby="providers-title">
       <div class="section-heading">
         <div><p class="index">01 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><p>价格决定先后；同价模型组随机抽取指定数量的 Key 竞速。此数字对全部 stage 生效。</p><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
+        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button><div class="sync-control"><button id="sync" class="primary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
       </div>
       <div class="table-wrap"><table id="providers"></table></div>
     </section>
@@ -37,7 +37,7 @@
     <section aria-labelledby="catalog-title">
       <div class="section-heading">
         <div><p class="index">02 / CATALOG</p><h2 id="catalog-title">模型费率</h2></div>
-        <div class="section-actions"><p>stage 决定路由分区：standard 可向 smart、expert 升级；smart 只可向 expert 升级。</p><button id="catalog-apply" class="secondary" type="button">应用目录到库存</button><button id="catalog-create" class="secondary" type="button">新增模型</button></div>
+        <div class="section-actions"><button id="catalog-apply" class="secondary" type="button">应用目录到库存</button><button id="catalog-create" class="secondary" type="button">新增模型</button></div>
       </div>
       <div class="table-wrap"><table id="catalog"></table></div>
     </section>
@@ -75,7 +75,7 @@
       <div class="editor-heading"><div><p class="index">POLICY</p><h2 id="editor-title">编辑 API Key</h2></div><button id="close-editor" type="button" aria-label="关闭">×</button></div>
       <p id="editor-source" class="source-note"></p>
       <label>备注<input name="note" type="text"></label>
-      <label>倍率<input name="multiplier" type="number" min="0.01" step="0.01" required></label>
+      <label>倍率<input name="multiplier" type="number" min="0.001" step="0.001" required></label>
       <label class="toggle"><input name="enabled" type="checkbox">启用</label>
       <label>单 Key 并发上限<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
       <p class="field-help">此 Key 同时在飞的上游请求上限；达到上限时不会被抽入竞速，以保护上游配额。它不影响一次竞速会随机抽几个 Key。</p>
