@@ -51,7 +51,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
     }
     same_site_provider = provider | {
         "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
-        "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "multiplier": 1.5,
+        "base_url": "https://alpha.invalid/v1", "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "multiplier": 1.5,
     }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
@@ -112,7 +112,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.goto(broker.url)
         assert page.evaluate("window.__injected") is None
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
-        assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
+        assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
         page.get_by_text("2026/08/29 18:00", exact=True).wait_for()
@@ -125,7 +125,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         base_urls = page.locator("#providers tbody td[rowspan]")
         assert base_urls.count() == 1
         assert base_urls.first.get_attribute("rowspan") == "2"
-        assert base_urls.first.inner_text() == "https://alpha.invalid/<svg onload=window.__injected=3>"
+        assert base_urls.first.inner_text() == "https://alpha.invalid"
+        assert "/v1" not in page.locator("#providers").inner_text()
         model_view = page.locator("#model-view tbody tr")
         assert model_view.count() == 2
         assert model_view.locator("td").all_inner_texts() == ["standard", "luna", "低价组", "initial note <script>window.__injected=2</script>", "$1.656", "高价组", "second note", "$2.484"]

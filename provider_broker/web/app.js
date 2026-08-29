@@ -185,23 +185,24 @@ function closeCatalogEditor() {
 function renderProviders(payload) {
   state.providers = payload.providers;
   const table = byId("providers");
-  const columns = [{ key: "base_url", label: "Base URL" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
   const groups = [...payload.providers.reduce((byUrl, provider) => {
-    const group = byUrl.get(provider.base_url) || { base_url: provider.base_url, providers: [] };
+    const domain = providerDomain(provider.base_url);
+    const group = byUrl.get(domain) || { domain, providers: [] };
     group.providers.push(provider);
-    byUrl.set(provider.base_url, group);
+    byUrl.set(domain, group);
     return byUrl;
   }, new Map()).values()];
   const valueFor = (provider, key) => key === "models" ? provider.models.join(" ") : provider[key];
-  sortItems(groups, "providers", (group, key) => key === "base_url" ? group.base_url : valueFor(sortItems(group.providers, "providers", valueFor)[0], key)).forEach((group) => {
+  sortItems(groups, "providers", (group, key) => key === "base_url" ? group.domain : valueFor(sortItems(group.providers, "providers", valueFor)[0], key)).forEach((group) => {
     const providers = sortItems(group.providers, "providers", valueFor);
     providers.forEach((provider, index) => {
       const row = document.createElement("tr");
       if (index === 0) {
-        const baseUrl = cell(group.base_url);
-        baseUrl.rowSpan = providers.length;
-        row.append(baseUrl);
+        const domain = cell(group.domain);
+        domain.rowSpan = providers.length;
+        row.append(domain);
       }
       const status = document.createElement("span");
       status.className = `status ${provider.enabled ? "on" : "off"}`;
@@ -231,6 +232,10 @@ function renderProviders(payload) {
       body.append(row);
     });
   });
+}
+
+function providerDomain(baseUrl) {
+  try { return new URL(baseUrl).origin; } catch (_) { return baseUrl; }
 }
 
 function renderCatalog(payload) {
