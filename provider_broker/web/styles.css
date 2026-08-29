@@ -16,7 +16,7 @@ button, input, select { font: inherit; }
 button { cursor: pointer; }
 .index { margin: 0 0 .3rem; color: var(--accent); font: 600 .72rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; letter-spacing: .16em; }
 main { padding: 0 clamp(1rem, 5vw, 5rem) 3rem; }
-section { padding: clamp(.8rem, 1.5vw, 1.25rem) 0; border-bottom: 1px solid var(--line); animation: rise .45s ease both; }
+section { padding: clamp(.8rem, 1.5vw, 1.25rem) 0 0; border-bottom: 1px solid var(--line); animation: rise .45s ease both; }
 section:nth-child(2) { animation-delay: .06s; } section:nth-child(3) { animation-delay: .12s; }
 h2 { margin: 0; font-size: clamp(1.7rem, 3vw, 3rem); font-weight: 520; letter-spacing: -.04em; }
 .quality-grid { display: grid; grid-template-columns: repeat(6, minmax(0, 1fr)); }
