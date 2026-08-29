@@ -179,6 +179,10 @@ async def delete_catalog(request):
     return web.Response(status=204)
 
 
+async def apply_catalog(request):
+    return web.json_response(request.app['store'].apply_catalog_to_inventory())
+
+
 async def update_policy(request):
     body = await request.json()
     allowed = {"note", "multiplier", "enabled", "preference", "max_parallel", "calibrated", "tiers"}
@@ -219,7 +223,7 @@ def create_app(settings: Settings):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog),
-        web.post("/admin/v1/catalog", create_catalog),
+        web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),
     ])

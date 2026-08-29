@@ -38,6 +38,7 @@ class Store:
         self._migrate()
 
     def _migrate(self):
+        catalog_exists = self.conn.execute("SELECT 1 FROM sqlite_master WHERE type='table' AND name='model_catalog'").fetchone() is not None
         self.conn.executescript("""
         PRAGMA journal_mode=WAL;
         CREATE TABLE IF NOT EXISTS source_provider (
@@ -74,11 +75,12 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
-        from .catalog import CATALOG
-        self.conn.executemany(
-            "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?)",
-            [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
-        )
+        if not catalog_exists:
+            from .catalog import CATALOG
+            self.conn.executemany(
+                "INSERT INTO model_catalog VALUES(?,?,?,?,?,?)",
+                [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
+            )
         self.conn.commit()
 
     def catalog(self):
@@ -101,6 +103,20 @@ class Store:
         with self.conn:
             deleted = self.conn.execute("DELETE FROM model_catalog WHERE model=?", (model,)).rowcount
         return bool(deleted)
+    def apply_catalog_to_inventory(self):
+        catalog = set(self.catalog())
+        rows = self.conn.execute('SELECT fingerprint,models_json FROM source_provider').fetchall()
+        removed = retained = 0
+        with self.conn:
+            for row in rows:
+                models = json.loads(row['models_json'])
+                kept = [model for model in models if model in catalog]
+                removed += len(models) - len(kept)
+                retained += len(kept)
+                self.conn.execute('UPDATE source_provider SET models_json=? WHERE fingerprint=?', (json.dumps(kept), row['fingerprint']))
+                self.conn.execute('UPDATE policy SET calibrated=? WHERE fingerprint=?', (int(bool(kept)), row['fingerprint']))
+            self.conn.execute('DELETE FROM route_block WHERE model NOT IN (SELECT model FROM model_catalog)')
+        return {'providers': len(rows), 'removed_models': removed, 'retained_models': retained}
     def catalog_counts(self):
         rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.catalog()}
         for name in counts:
@@ -125,13 +141,14 @@ class Store:
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             from .catalog import canonicalize
-            models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
-            fp = self.fingerprint(base_url, api_key, "\0".join(models))
+            source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
+            models = [model for model in source_models if model in catalog]
+            fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
             if isinstance(entry.get('site_name'), str) and entry['site_name'].strip():
                 site_notes.append((entry['site_name'].strip(), fp))
             source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
             request_headers = json.dumps(entry.get('request_headers') or {}, sort_keys=True)
-            rows.append((fp, entry.get("name", models[0]), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at))
+            rows.append((fp, entry.get("name") or (models[0] if models else "unavailable"), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at))
         with self.conn:
             self.conn.execute("CREATE TEMP TABLE incoming AS SELECT * FROM source_provider WHERE 0")
             self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at) VALUES(?,?,?,?,?,?,?,?,?)", rows)

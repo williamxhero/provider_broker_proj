@@ -231,6 +231,11 @@ byId("policy").addEventListener("submit", async (event) => {
 });
 
 byId("catalog-create").addEventListener("click", () => openCatalogEditor());
+byId("catalog-apply").addEventListener("click", async () => {
+  const result = await requestJson("/admin/v1/catalog/apply", { method: "POST" });
+  await load();
+  byId("syncresult").textContent = `已应用目录：${result.providers} 个 Key，保留 ${result.retained_models} 个模型，移除 ${result.removed_models} 个模型`;
+});
 ["official_input_price", "official_cache_price", "official_output_price"].forEach((name) => byId("catalog-form").elements[name].addEventListener("input", updateBlendedPrice));
 byId("catalog-form").addEventListener("submit", async (event) => {
   event.preventDefault();

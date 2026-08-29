@@ -85,6 +85,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
                 body = request.post_data_json
                 catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"blended_price": 2.456, "available_provider_count": 0}
                 route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
+            elif path == "/admin/v1/catalog/apply" and request.method == "POST":
+                route.fulfill(status=200, content_type="application/json", body='{"providers":1,"retained_models":1,"removed_models":2}')
             elif path.startswith("/admin/v1/catalog/") and request.method == "PUT":
                 model = path.rsplit("/", 1)[-1]
                 catalog[model] = request.post_data_json | {"blended_price": 2.456, "available_provider_count": catalog[model]["available_provider_count"]}
@@ -105,6 +107,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.get_by_text("https://alpha.invalid/<svg onload=window.__injected=3>", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
+        page.locator("#catalog-apply").click()
+        page.get_by_text("已应用目录：1 个 Key，保留 1 个模型，移除 2 个模型").wait_for()
         page.locator("#catalog-create").click()
         page.locator("#catalog-form [name=model]").fill("gpt-console-route")
         page.locator("#catalog-form [name=family]").fill("Console test")
@@ -144,6 +148,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
         assert any("limit=2" in path for _, path, _ in seen)
         assert any(method == "POST" and path == "/admin/v1/catalog" for method, path, _ in seen)
+        assert any(method == "POST" and path == "/admin/v1/catalog/apply" for method, path, _ in seen)
         assert any(method == "PUT" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         assert any(method == "DELETE" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         browser.close()

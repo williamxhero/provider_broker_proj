@@ -23,6 +23,8 @@ Thus `stage` is the routing partition, not a quality guarantee. A catalog change
 
 The catalog also shows a read-only **整合价 / 1M** for quick comparison: `4% × input + 16% × cached input + 80% × output`. The three underlying rates remain editable and are used for the exact per-request cost estimate. For each API Key, its multiplier is applied to those official rates. When CPA supplies a site name (`site_name`, `name`, `id`, `label`, or `endpoint`), a manual sync copies it to the Broker note.
 
+Use **应用目录到库存** after removing models from the directory. It prunes every API Key inventory to the current catalog and reports the retained and removed model counts. CPA manual sync applies the same filter, so models absent from the directory do not return.
+
 Routing races the selected keys in the cheapest model group and cancels losers after the first success, then falls upward only when a group fails. Within a capped race, keys enter in descending `preference` order (higher integer first). `max_parallel` is the per-API-Key maximum number of simultaneous upstream requests; a saturated key is skipped so another eligible key can be used. The global `BROKER_PARALLEL_CAP` remains the maximum number of keys raced for one request. OpenAI/Codex providers use Responses; Anthropic/Claude uses Messages. Native tools are intentionally not forwarded.
 
 ## Local verification

@@ -1,10 +1,12 @@
 import asyncio
+import json
 
 import pytest
 from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from provider_broker.app import create_app
+from provider_broker.db import Store
 from provider_broker.settings import Settings
 
 
@@ -72,7 +74,7 @@ async def cpa(client):
         payload=await request.json(); assert 'tools' not in payload
         return web.json_response({'id':'req-chat','model':'gpt-5.6-luna','choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
     upstream.router.add_post('/v1/chat/completions',chat)
-    async def models(request): return web.json_response({'data':[{'id':'gpt-5.6-luna'}]})
+    async def models(request): return web.json_response({'data':[{'id': model} for model in request.app.get('models', ['gpt-5.6-luna'])]})
     upstream.router.add_get('/models',models)
     upstream.router.add_get('/v1/models',models)
     upstream_server=TestServer(upstream); await upstream_server.start_server(); app['upstream']=str(upstream_server.make_url('')).rstrip('/'); app['config']['providers'][0]['base_url']=app['upstream']
@@ -280,6 +282,17 @@ async def test_catalog_rejects_incomplete_and_unknown_updates(client):
     assert (await client.patch('/admin/v1/catalog/private-model',json=body)).status == 404
 
 
+async def test_catalog_deletions_survive_a_store_restart(client):
+    assert (await client.delete('/admin/v1/catalog/gpt-5.5')).status == 204
+
+    reopened = Store(client.app['settings'].database_path, client.app['settings'].key_bytes())
+
+    try:
+        assert 'gpt-5.5' not in reopened.catalog()
+    finally:
+        reopened.conn.close()
+
+
 async def test_catalog_provider_count_reflects_synced_inventory(client, cpa):
     headers={'Authorization':'Bearer admin-secret'}
     before=(await (await client.get('/admin/v1/catalog',headers=headers)).json())['catalog']
@@ -287,6 +300,27 @@ async def test_catalog_provider_count_reflects_synced_inventory(client, cpa):
     await client.post('/admin/v1/sync',headers=headers)
     after=(await (await client.get('/admin/v1/catalog',headers=headers)).json())['catalog']
     assert after['gpt-5.6-luna']['available_provider_count'] == 1
+
+
+async def test_catalog_apply_prunes_existing_inventory_and_future_sync(client, cpa):
+    headers = {'Authorization': 'Bearer admin-secret'}
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-luna', 'private-model']
+    await client.post('/admin/v1/sync', headers=headers)
+    store = client.app['store']
+    provider = (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]
+    assert (await client.patch(f"/admin/v1/policy/{provider['fingerprint']}", headers=headers, json={'note': 'preserved', 'multiplier': .45})).status == 200
+    with store.conn:
+        store.conn.execute("UPDATE source_provider SET models_json=?", (json.dumps(['gpt-5.6-luna', 'private-model']),))
+
+    applied = await client.post('/admin/v1/catalog/apply', headers=headers)
+
+    assert await applied.json() == {'providers': 1, 'removed_models': 1, 'retained_models': 1}
+    assert (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]['models'] == ['gpt-5.6-luna']
+    cpa.app['config'] = {'codex-api-key': [{'base_url': cpa.app['upstream'], 'api_key': 'provider-secret'}]}
+    assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
+    refreshed = (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]
+    assert refreshed['models'] == ['gpt-5.6-luna']
+    assert (refreshed['note'], refreshed['multiplier']) == ('preserved', .45)
 
 
 async def test_summary_and_provider_stats_use_mixed_observations(client, cpa):
