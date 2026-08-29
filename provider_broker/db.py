@@ -204,9 +204,25 @@ class Store:
         with self.conn:
             self.conn.execute('INSERT OR REPLACE INTO route_block(fingerprint,model) VALUES(?,?)',(fingerprint,model))
 
-    def inventory(self) -> list[dict]:
+    def inventory(self, window='24h') -> list[dict]:
+        modifier = {'1h': '-1 hour', '24h': '-24 hours', '7d': '-7 days', '30d': '-30 days'}[window]
         rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
-        return [{"fingerprint":r["fingerprint"],"name":r["name"],"base_url":r["base_url"],"family":r["provider_type"],"api_key_mask":self._decrypt(r['api_key'])[:3]+'***'+self._decrypt(r['api_key'])[-3:],"models":json.loads(r["models_json"]),"inventory_status":json.loads(r['source_json']).get('inventory_status'),"enabled":bool(r["enabled"]),"calibrated":bool(r["calibrated"]),"note":r['note'],"max_parallel":r['max_parallel'],"multiplier":r['multiplier'],"technical_success_rate":self.conn.execute("SELECT avg(success) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"avg_ttft_ms":self.conn.execute("SELECT avg(latency_ms) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"cost_24h":self.conn.execute("SELECT sum(cost) FROM observation WHERE fingerprint=? AND created_at>=datetime('now','-24 hours')",(r['fingerprint'],)).fetchone()[0],"tiers":json.loads(r["tiers_json"]),"synced_at":r["synced_at"]} for r in rows]
+        inventory = []
+        for row in rows:
+            stats = self.conn.execute(
+                "SELECT avg(success) rate, avg(latency_ms) ttft, sum(cost) cost FROM observation WHERE fingerprint=? AND created_at>=datetime('now',?)",
+                (row['fingerprint'], modifier),
+            ).fetchone()
+            api_key = self._decrypt(row['api_key'])
+            inventory.append({
+                'fingerprint': row['fingerprint'], 'name': row['name'], 'base_url': row['base_url'], 'family': row['provider_type'],
+                'api_key_mask': api_key[:3] + '***' + api_key[-3:], 'models': json.loads(row['models_json']),
+                'inventory_status': json.loads(row['source_json']).get('inventory_status'), 'enabled': bool(row['enabled']),
+                'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
+                'multiplier': row['multiplier'], 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],
+                'cost_24h': stats['cost'], 'tiers': json.loads(row['tiers_json']), 'synced_at': row['synced_at'],
+            })
+        return inventory
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:

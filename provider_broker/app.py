@@ -85,11 +85,17 @@ async def sync(request):
 
 
 async def inventory(request):
-    return web.json_response({"providers": request.app["store"].inventory()})
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    return web.json_response({"providers": request.app["store"].inventory(window)})
 
 
 async def providers(request):
-    return web.json_response({"providers": request.app["store"].inventory()})
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    return web.json_response({"providers": request.app["store"].inventory(window)})
 
 
 async def summary(request):

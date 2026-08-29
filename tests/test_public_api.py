@@ -123,11 +123,22 @@ async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa)
         tier='standard', effort='medium', success=1, latency_ms=100, error=None, status='completed',
         input_tokens=100, output_tokens=50, cost=.125, request_id='cost-rollup',
     )
+    with client.app['store'].conn:
+        client.app['store'].conn.execute(
+            "INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,input_tokens,output_tokens,cost,request_id,created_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,datetime('now','-2 hours'))",
+            (provider['fingerprint'], 'gpt-5.6-luna', 'gpt-5.6-luna', 'standard', 'medium', 0, 300, 'timed_out', 'timed_out', 100, 50, .5, 'old-cost-rollup'),
+        )
 
-    inventory = (await (await client.get('/admin/v1/providers')).json())['providers']
+    inventory = (await (await client.get('/admin/v1/providers?window=1h')).json())['providers']
+    seven_day_inventory = (await (await client.get('/admin/v1/providers?window=7d')).json())['providers']
     quality = await (await client.get('/admin/v1/quality?window=1h')).json()
 
     assert inventory[0]['cost_24h'] == .125
+    assert inventory[0]['technical_success_rate'] == 1
+    assert inventory[0]['avg_ttft_ms'] == 100
+    assert seven_day_inventory[0]['cost_24h'] == .625
+    assert seven_day_inventory[0]['technical_success_rate'] == .5
+    assert seven_day_inventory[0]['avg_ttft_ms'] == 200
     assert quality['total_cost'] == .125
     assert (await client.get('/admin/v1/calls?sort=cost:asc')).status == 200
     assert (await client.get('/admin/v1/calls?sort=unknown:asc')).status == 400

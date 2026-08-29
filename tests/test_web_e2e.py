@@ -74,7 +74,14 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
     def payload(path):
         if path.startswith("/admin/v1/summary"):
             return {"routable_apis": 1, "technical_success_rate": 0.98, "avg_ttft_ms": 1800, "last_successful_sync": "2026-08-29T10:00:00Z"}
-        if path == "/admin/v1/providers":
+        if path.startswith("/admin/v1/providers"):
+            if "window=7d" in path:
+                return {"providers": [
+                    provider | {"technical_success_rate": 0.7, "avg_ttft_ms": 700, "cost_24h": 0.07},
+                    same_site_provider | {"technical_success_rate": 0.6, "avg_ttft_ms": 600, "cost_24h": 0.06},
+                    cheapest_provider | {"technical_success_rate": 0.5, "avg_ttft_ms": 500, "cost_24h": 0.05},
+                    disabled_provider,
+                ]}
             return {"providers": [provider, same_site_provider, cheapest_provider, disabled_provider]}
         if path == "/admin/v1/catalog":
             return {"catalog": catalog}
@@ -144,6 +151,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert "stage 决定路由分区" not in page.content()
         assert page.locator("#providers .model-tag").all_inner_texts() == ["nova", "luna", "luna", "luna"]
         assert "available" not in page.locator("#providers").inner_text()
+        assert page.locator("#providers").get_by_role("button", name="24h 费用").count() == 1
         page.get_by_text("$0.02", exact=True).first.wait_for()
         base_urls = page.locator("#providers tbody td[rowspan]")
         assert base_urls.count() == 1
@@ -191,6 +199,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("added 1 updated 0 offlined 0 inventory_failures 0").wait_for()
         page.get_by_role("button", name="7d").click()
         page.get_by_text("7", exact=True).last.wait_for()
+        page.locator("#providers").get_by_role("button", name="7d 费用").wait_for()
+        page.get_by_text("$0.07", exact=True).wait_for()
         page.locator("#callprovider").fill("Alpha")
         page.locator("#callstatus").fill("completed")
         page.locator("#callwindow").select_option("1h")
@@ -203,7 +213,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.locator("#calls").get_by_text("传输失败", exact=True).wait_for()
         assert page.locator("#calls").get_by_text("传输失败", exact=True).count() == 1
         page.reload()
-        expect(page.get_by_role("button", name="7d")).to_have_class(__import__("re").compile("active"))
+        expect(page.locator("#windows").get_by_role("button", name="7d", exact=True)).to_have_class(__import__("re").compile("active"))
         expect(page.locator("#model-view").get_by_role("button", name="价格组")).to_have_class(__import__("re").compile("active"))
         assert page.locator("#callwindow").input_value() == "1h"
         assert page.locator("#calllimit").input_value() == "2"
@@ -213,6 +223,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert any(method == "PATCH" and '"enabled":false' in (body or "") for method, _, body in seen)
         assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
         assert any("limit=2" in path for _, path, _ in seen)
+        assert any("/admin/v1/providers?window=7d" in path for _, path, _ in seen)
         assert any(method == "POST" and path == "/admin/v1/catalog" for method, path, _ in seen)
         assert any(method == "POST" and path == "/admin/v1/catalog/apply" for method, path, _ in seen)
         assert any(method == "PATCH" and path == "/admin/v1/routing" and '"race_parallel_cap":2' in (body or "") for method, path, body in seen)

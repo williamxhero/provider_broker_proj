@@ -184,7 +184,7 @@ function closeCatalogEditor() {
 function renderProviders(payload) {
   state.providers = payload.providers;
   const table = byId("providers");
-  const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: "24h 费用" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: `${state.qualityWindow} 费用` }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
   const groups = [...payload.providers.reduce((byUrl, provider) => {
     const domain = providerDomain(provider.base_url);
@@ -392,7 +392,7 @@ async function loadCalls(cursor = state.cursor) {
 async function load() {
   const [summary, providers, catalog, quality, routing] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
-    requestJson("/admin/v1/providers"),
+    requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/catalog"),
     requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
@@ -478,7 +478,12 @@ byId("windows").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-window]");
   if (!button) return;
   setQualityWindow(button.dataset.window);
-  renderQuality(await requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`));
+  const [quality, providers] = await Promise.all([
+    requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
+    requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
+  ]);
+  renderQuality(quality);
+  renderProviders(providers);
 });
 
 function setQualityWindow(windowName) {
