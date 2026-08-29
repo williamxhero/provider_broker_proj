@@ -1,38 +1,47 @@
-# Provider Broker
+## 调用 LLM
 
-Private aiohttp + SQLite provider router for `192.168.50.1 -> 192.168.50.2:8817`.
+管理台在 `http://yosef-server:8817/`；LLM 调用使用同一服务的 `/v1` 接口。调用方先向管理员获取 Client Token，并将其放入 `BROKER_CLIENT_TOKEN` 环境变量。不要使用管理 Token，也不要在请求中提交 `model`；模型由 Broker 按 `intellect` 自动路由。
 
-CPA is a read-only source. `POST /admin/v1/sync` is the only refresh mechanism; it reads CPA's management configuration, expands each key/model to a direct upstream record, encrypts keys with AES-GCM in SQLite, and atomically replaces the source snapshot. Returned inventory masks source credentials by omission. Broker-owned policy and observations are retained by an HMAC source fingerprint; changing a key creates a new provider.
+### 非流式调用
 
-Client bearer endpoints:
+```bash
+curl -X POST http://yosef-server:8817/v1/generate \
+  -H "Authorization: Bearer $BROKER_CLIENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{
+    "prompt": "用三点总结这份材料：……",
+    "intellect": "standard",
+    "effort": "medium",
+    "deadline_ms": 60000,
+    "output_token_limit": 1024
+  }'
+```
 
-- `POST /v1/generate` for `standard`, `smart`, or `expert`, with independent `effort`.
-- `POST /v1/generate/stream` for SSE.
+必填字段为 `prompt` 和 `intellect`。`intellect` 只能是 `standard`、`smart` 或 `expert`；`effort`、`deadline_ms`、`output_token_limit` 为可选字段。成功响应含有 `output_text`、实际使用的 `actual_model`、获胜 Provider、`attempts`、用量和 `cost_estimate`。
 
-The management console opens directly at `/`, and `/admin/v1/*` is intentionally unauthenticated. It is protected by the dedicated host firewall, which only admits the direct-link client (`192.168.50.1`) and the server itself. Generation endpoints remain protected by the separate client Bearer token.
+### 流式调用
 
-## Model directory and routing
+将路径换为 `/v1/generate/stream`，服务会返回 Server-Sent Events：每个文本片段是 `event: delta`，结束信息是 `event: final`。
 
-The **模型费率** section is a Broker-owned, persistent model directory. It is seeded with the shipped defaults on first start, then can be created, edited, and deleted from the console (or `POST`, `PUT`/`PATCH`, and `DELETE /admin/v1/catalog`). Each entry contains the model ID, family, rates per 1M tokens, and its `stage`:
+```bash
+curl -N -X POST http://yosef-server:8817/v1/generate/stream \
+  -H "Authorization: Bearer $BROKER_CLIENT_TOKEN" \
+  -H "Content-Type: application/json" \
+  -d '{"prompt":"解释这个概念", "intellect":"smart", "effort":"medium"}'
+```
 
-- `standard`: first choice for a standard request; if unavailable, the router may use `smart`, then `expert`.
-- `smart`: first choice for a smart request; if unavailable, the router may use `expert`.
-- `expert`: used only for expert requests.
+认证失败返回 `401`；没有可用上游或所有竞速 Key 都失败时返回 `503`，响应中的 `attempts` 可用于排查。
 
-Thus `stage` is the routing partition, not a quality guarantee. A catalog change takes effect immediately; deleting a model removes it from routing even if CPA still reports it.
 
-The catalog also shows a read-only **整合价 / 1M** for quick comparison: `4% × input + 16% × cached input + 80% × output`. The three underlying rates remain editable and are used for the exact per-request cost estimate. For each API Key, its multiplier is applied to those official rates. When CPA supplies a site name (`site_name`, `name`, `id`, `label`, or `endpoint`), a manual sync copies it to the Broker note.
 
-Use **应用目录到库存** after removing models from the directory. It prunes every API Key inventory to the current catalog and reports the retained and removed model counts. CPA manual sync applies the same filter, so models absent from the directory do not return.
+## 内容选择流程
 
-Routing divides all calculated Key prices at their median into at most two bands, tries the lower band first, and cancels losers after the first success; the higher band is tried only when the lower band fails. Within each band it randomly selects the configured global **同价竞速 Key 数**. `单 Key 并发上限` is the maximum number of in-flight upstream requests for that individual Key. A saturated Key is excluded from the random draw, protecting its upstream quota without changing the draw size. `BROKER_PARALLEL_CAP` supplies the initial value only; operators can change the persisted global value in the console. The API Key table shows each Key's last-24-hour log cost, while **调用质量** totals logged cost for its selected time window. Console filter choices are kept in the browser and restored on the next visit. OpenAI/Codex providers use Responses; Anthropic/Claude uses Messages. Native tools are intentionally not forwarded.
+比如用 standard + medium 调用：
 
-## Local verification
-
-`python -m pytest -q`
-
-## Deploy
-
-From Windows: `powershell -ExecutionPolicy Bypass -File scripts/deploy.ps1`.
-
-The deploy script builds and uploads one wheel, installs it under `/data/provider-broker/releases/<version>`, atomically switches `/data/provider-broker/current`, and retains `/data/provider-broker/previous` for rollback. It preserves the 0600 secret env file, binds to `192.168.50.2:8817`, and applies UFW rules when UFW is active. Run the independent smoke on the server with `set -a; . /data/provider-broker/secrets/broker.env; set +a; /data/provider-broker/current/venv/bin/python /data/provider-broker/current/smoke.py`.
+1. 先找 `standard` 下可路由的 Key：已启用、已校准、该 Key 有此分组模型、未被模型履约校验拉黑、且未达到单 Key 并发上限。
+2. 所有这些 Key 不按模型隔离；按“该模型整合价 × Key 倍率”算路由价格，用中位数切成低价组、高价组。
+3. 先从低价组随机抽取全局设定的 N 个 Key 并发竞速。谁先返回、且实际模型与该 Key 要求模型一致，谁获胜；其余请求取消。
+4. 本批全部失败或模型不符，才进入高价组；当前批中未被抽到的低价 Key 不会继续补抽。
+5. `standard` 两个价格组都失败后，依次降级尝试 `smart`、`expert`，每个 stage 同样遵循低价组再高价组。
+6. 全部失败则返回 503。
+7. `effort=medium` 不参与 Key 选择、价格分组或竞速；它仅透传给 OpenAI 兼容上游的 `reasoning.effort`。Anthropic 兼容调用目前不使用它。
