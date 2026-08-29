@@ -120,9 +120,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("$0.02", exact=True).first.wait_for()
         model_view = page.locator("#model-view tbody tr")
         assert model_view.count() == 1
-        assert model_view.locator("td").all_inner_texts() == ["luna", "standard", "initial note <script>window.__injected=2</script>", "$1.656"]
+        assert model_view.locator("td").all_inner_texts() == ["luna", "standard", "低价组", "initial note <script>window.__injected=2</script>", "$1.656"]
         assert model_view.locator("td").nth(0).get_attribute("rowspan") == "1"
-        page.locator("#model-view").get_by_role("button", name="模型分组").click()
+        page.locator("#model-view").get_by_role("button", name="价格组").click()
         page.locator("#race-parallel-cap").fill("2")
         page.locator("#save-routing").click()
         page.get_by_text("同价竞速 Key 数已设为 2").wait_for()
@@ -165,7 +165,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("r-1").wait_for()
         page.reload()
         expect(page.get_by_role("button", name="7d")).to_have_class(__import__("re").compile("active"))
-        expect(page.locator("#model-view").get_by_role("button", name="模型分组")).to_have_class(__import__("re").compile("active"))
+        expect(page.locator("#model-view").get_by_role("button", name="价格组")).to_have_class(__import__("re").compile("active"))
         assert page.locator("#callwindow").input_value() == "1h"
         assert page.locator("#calllimit").input_value() == "2"
         assert page.locator("#callprovider").input_value() == "Alpha"

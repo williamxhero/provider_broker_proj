@@ -246,7 +246,7 @@ function stageOrder(value) {
 
 function renderModelView() {
   const table = byId("model-view");
-  const columns = [{ key: "model", label: "模型名称" }, { key: "intellect", label: "模型分组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
+  const columns = [{ key: "model", label: "模型名称" }, { key: "intellect", label: "模型分组" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
   const body = tableHead(table, columns, "modelView", renderModelView);
   const models = Object.entries(state.catalog).map(([model, item]) => ({
     model,
@@ -258,26 +258,47 @@ function renderModelView() {
   }));
   const sorted = sortItems(models, "modelView", (item, key) => {
     if (key === "intellect") return stageOrder(item.intellect);
+    if (key === "price_band" || key === "price") return item.providers.length ? Math.min(...item.providers.map((provider) => provider.price)) : null;
     if (key === "note") return item.providers.map((provider) => provider.note).join(" ");
-    if (key === "price") return item.providers.length ? Math.min(...item.providers.map((provider) => provider.price)) : null;
     return item.model;
   });
   sorted.forEach((item) => {
-    const providers = item.providers.length ? item.providers : [{ note: "n/a", price: null }];
-    providers.sort((left, right) => compareValues(left.note, right.note));
-    providers.forEach((provider, index) => {
-      const row = document.createElement("tr");
-      if (index === 0) {
+    const bands = priceBands(item.providers);
+    const rowCount = bands.reduce((count, band) => count + band.providers.length, 0);
+    let rowIndex = 0;
+    bands.forEach((band) => {
+      band.providers.forEach((provider, index) => {
+        const row = document.createElement("tr");
+        if (rowIndex === 0) {
         const model = cell(item.model);
         const intellect = cell(item.intellect);
-        model.rowSpan = providers.length;
-        intellect.rowSpan = providers.length;
+          model.rowSpan = rowCount;
+          intellect.rowSpan = rowCount;
         row.append(model, intellect);
-      }
-      row.append(cell(provider.note), cell(formatCost(provider.price)));
-      body.append(row);
+        }
+        if (index === 0) {
+          const priceBand = cell(band.label);
+          priceBand.rowSpan = band.providers.length;
+          row.append(priceBand);
+        }
+        row.append(cell(provider.note), cell(formatCost(provider.price)));
+        body.append(row);
+        rowIndex += 1;
+      });
     });
   });
+}
+
+function priceBands(providers) {
+  if (!providers.length) return [{ label: "n/a", providers: [{ note: "n/a", price: null }] }];
+  const prices = [...new Set(providers.map((provider) => provider.price))].sort((left, right) => left - right);
+  if (prices.length === 1) return [{ label: "低价组", providers }];
+  const split = prices.slice(0, -1).reduce((best, price, index) => prices[index + 1] - price > prices[best + 1] - prices[best] ? index : best, 0);
+  const lower = new Set(prices.slice(0, split + 1));
+  return [
+    { label: "低价组", providers: providers.filter((provider) => lower.has(provider.price)) },
+    { label: "高价组", providers: providers.filter((provider) => !lower.has(provider.price)) },
+  ];
 }
 
 function metric(label, value) {

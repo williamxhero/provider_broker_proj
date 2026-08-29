@@ -212,47 +212,57 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke) -> dict:
     attempts = []
     tiers = ("standard", "smart", "expert")
-    groups = {}
     for candidate_tier in tiers[tiers.index(tier):]:
-        for provider in store.providers(candidate_tier):
-            groups.setdefault((candidate_tier, provider.price_group), []).append(provider)
-    for (candidate_tier, _), providers in sorted(groups.items(), key=lambda item: (tiers.index(item[0][0]), item[0][1])):
-        available = [provider for provider in providers if store.has_capacity(provider)]
-        selected = random.sample(available, k=min(len(available), max(1, parallel_cap)))
-        for provider in selected:
-            store.try_acquire(provider)
+        for providers in price_bands(store.providers(candidate_tier)):
+            available = [provider for provider in providers if store.has_capacity(provider)]
+            selected = random.sample(available, k=min(len(available), max(1, parallel_cap)))
+            for provider in selected:
+                store.try_acquire(provider)
 
-        async def invoke_with_capacity(provider):
-            try:
-                return await invoker(provider, body)
-            finally:
-                store.release(provider)
-
-        tasks = {asyncio.create_task(invoke_with_capacity(provider)): provider for provider in selected}
-        while tasks:
-            done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
-            for task in done:
-                provider = tasks.pop(task)
-                requested_model = canonicalize(provider.models[0])
+            async def invoke_with_capacity(provider):
                 try:
-                    output = task.result()
-                except AttemptFailure as exc:
-                    observe(store, provider, requested_model, candidate_tier, body, exc.status)
-                    attempts.append({"provider": provider.name, "status": exc.status})
-                    continue
-                if output["actual_model"] != requested_model:
+                    return await invoker(provider, body)
+                finally:
+                    store.release(provider)
+
+            tasks = {asyncio.create_task(invoke_with_capacity(provider)): provider for provider in selected}
+            while tasks:
+                done, _ = await asyncio.wait(tasks, return_when=asyncio.FIRST_COMPLETED)
+                for task in done:
+                    provider = tasks.pop(task)
+                    requested_model = canonicalize(provider.models[0])
+                    try:
+                        output = task.result()
+                    except AttemptFailure as exc:
+                        observe(store, provider, requested_model, candidate_tier, body, exc.status)
+                        attempts.append({"provider": provider.name, "status": exc.status})
+                        continue
+                    if output["actual_model"] != requested_model:
+                        observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
+                        store.block_route(provider.fingerprint, requested_model)
+                        attempts.append({"provider": provider.name, "status": "completed", "actual_model": output["actual_model"], "fulfilled": False})
+                        continue
                     observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
-                    store.block_route(provider.fingerprint, requested_model)
-                    attempts.append({"provider": provider.name, "status": "completed", "actual_model": output["actual_model"], "fulfilled": False})
-                    continue
-                observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
-                attempts.append({"provider": provider.name, "status": "completed", "actual_model": output["actual_model"], "fulfilled": True})
-                pending = list(tasks.items())
-                for pending_task, _ in pending:
-                    pending_task.cancel()
-                await asyncio.gather(*(pending_task for pending_task, _ in pending), return_exceptions=True)
-                for _, pending_provider in pending:
-                    observe(store, pending_provider, canonicalize(pending_provider.models[0]), candidate_tier, body, "cancelled")
-                    attempts.append({"provider": pending_provider.name, "status": "cancelled"})
-                return output | {"provider": provider.name, "attempts": attempts, "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint}
+                    attempts.append({"provider": provider.name, "status": "completed", "actual_model": output["actual_model"], "fulfilled": True})
+                    pending = list(tasks.items())
+                    for pending_task, _ in pending:
+                        pending_task.cancel()
+                    await asyncio.gather(*(pending_task for pending_task, _ in pending), return_exceptions=True)
+                    for _, pending_provider in pending:
+                        observe(store, pending_provider, canonicalize(pending_provider.models[0]), candidate_tier, body, "cancelled")
+                        attempts.append({"provider": pending_provider.name, "status": "cancelled"})
+                    return output | {"provider": provider.name, "attempts": attempts, "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint}
     raise UpstreamFailure(attempts)
+
+
+def price_bands(providers):
+    """Return at most two price bands, ordered from lower to higher price."""
+    prices = sorted({provider.price_group for provider in providers})
+    if len(prices) < 2:
+        return [providers] if providers else []
+    split = max(range(len(prices) - 1), key=lambda index: prices[index + 1] - prices[index])
+    lower_prices = set(prices[:split + 1])
+    return [
+        [provider for provider in providers if provider.price_group in lower_prices],
+        [provider for provider in providers if provider.price_group not in lower_prices],
+    ]
