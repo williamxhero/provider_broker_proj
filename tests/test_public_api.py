@@ -415,12 +415,13 @@ async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
     assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
 
 
-def test_price_bands_split_all_key_prices_at_the_median():
-    providers = [SimpleNamespace(price_group=price, id=index) for index, price in enumerate((100, 110, 115, 400))]
+def test_price_bands_mix_models_and_split_all_key_prices_at_the_median():
+    providers = [SimpleNamespace(price_group=price, id=index, models=[model]) for index, (price, model) in enumerate(((100, 'luna'), (110, 'terra'), (115, 'nova'), (400, 'sol')))]
 
     bands = price_bands(providers)
 
     assert [[provider.price_group for provider in band] for band in bands] == [[100, 110], [115, 400]]
+    assert [[provider.models[0] for provider in band] for band in bands] == [['luna', 'terra'], ['nova', 'sol']]
 
 
 async def test_max_parallel_skips_a_busy_key_until_its_request_finishes(client, cpa):

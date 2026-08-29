@@ -255,58 +255,42 @@ function stageOrder(value) {
 
 function renderModelView() {
   const table = byId("model-view");
-  const columns = [{ key: "intellect", label: "模型分组" }, { key: "model", label: "模型名称" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "模型价格 / 1M" }];
+  const columns = [{ key: "intellect", label: "模型分组" }, { key: "price_band", label: "价格组" }, { key: "note", label: "备注名" }, { key: "price", label: "路由价格 / 1M" }];
   const body = tableHead(table, columns, "modelView", renderModelView);
-  const models = Object.entries(state.catalog).map(([model, item]) => ({
-    model,
-    intellect: item.intellect,
-    providers: state.providers.filter((provider) => provider.models.includes(model)).map((provider) => ({
-      note: provider.note || "n/a",
-      price: Number(item.blended_price) * Number(provider.multiplier),
-    })),
-  }));
-  const sorted = sortItems(models, "modelView", (item, key) => {
-    if (key === "intellect") return stageOrder(item.intellect);
-    if (key === "price_band" || key === "price") return item.providers.length ? Math.min(...item.providers.map((provider) => provider.price)) : null;
-    if (key === "note") return item.providers.map((provider) => provider.note).join(" ");
-    return item.model;
+  const groups = sortItems(["standard", "smart", "expert"].map((intellect) => ({
+    intellect,
+    providers: state.providers.flatMap((provider) => {
+      if (provider.enabled === false || provider.calibrated === false || (provider.tiers && !provider.tiers.includes(intellect))) return [];
+      const model = provider.models.find((candidate) => state.catalog[candidate]?.intellect === intellect);
+      if (!model) return [];
+      const price = Number(state.catalog[model].blended_price) * Number(provider.multiplier);
+      return [{ note: provider.note || "n/a", price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint }];
+    }),
+  })).filter((group) => group.providers.length), "modelView", (group, key) => {
+    if (key === "intellect") return stageOrder(group.intellect);
+    if (key === "price_band" || key === "price") return Math.min(...group.providers.map((provider) => provider.price));
+    return group.providers.map((provider) => provider.note).join(" ");
   });
-  const groups = [...sorted.reduce((byStage, item) => {
-    const group = byStage.get(item.intellect) || { intellect: item.intellect, models: [] };
-    group.models.push(item);
-    byStage.set(item.intellect, group);
-    return byStage;
-  }, new Map()).values()];
   groups.forEach((group) => {
-    const groupRowCount = group.models.reduce((count, item) => count + priceBands(item.providers).reduce((total, band) => total + band.providers.length, 0), 0);
+    const bands = priceBands(group.providers);
+    const groupRowCount = bands.reduce((count, band) => count + band.providers.length, 0);
     let groupRowIndex = 0;
-    group.models.forEach((item) => {
-      const bands = priceBands(item.providers);
-      const modelRowCount = bands.reduce((count, band) => count + band.providers.length, 0);
-      let modelRowIndex = 0;
-      bands.forEach((band) => {
-        band.providers.forEach((provider, index) => {
-          const row = document.createElement("tr");
-          if (groupRowIndex === 0) {
-            const intellect = cell(group.intellect);
-            intellect.rowSpan = groupRowCount;
-            row.append(intellect);
-          }
-          if (modelRowIndex === 0) {
-            const model = cell(item.model);
-            model.rowSpan = modelRowCount;
-            row.append(model);
-          }
-          if (index === 0) {
-            const priceBand = cell(band.label);
-            priceBand.rowSpan = band.providers.length;
-            row.append(priceBand);
-          }
-          row.append(cell(provider.note), cell(formatCost(provider.price)));
-          body.append(row);
-          groupRowIndex += 1;
-          modelRowIndex += 1;
-        });
+    bands.forEach((band) => {
+      band.providers.forEach((provider, index) => {
+        const row = document.createElement("tr");
+        if (groupRowIndex === 0) {
+          const intellect = cell(group.intellect);
+          intellect.rowSpan = groupRowCount;
+          row.append(intellect);
+        }
+        if (index === 0) {
+          const priceBand = cell(band.label);
+          priceBand.rowSpan = band.providers.length;
+          row.append(priceBand);
+        }
+        row.append(cell(provider.note), cell(formatCost(provider.price)));
+        body.append(row);
+        groupRowIndex += 1;
       });
     });
   });
@@ -314,11 +298,11 @@ function renderModelView() {
 
 function priceBands(providers) {
   if (!providers.length) return [{ label: "n/a", providers: [{ note: "n/a", price: null }] }];
-  const ordered = [...providers].sort((left, right) => left.price - right.price || compareValues(left.note, right.note));
+  const ordered = [...providers].sort((left, right) => left.priceGroup - right.priceGroup || compareValues(left.fingerprint, right.fingerprint));
   const midpoint = Math.floor(ordered.length / 2);
-  const median = ordered.length % 2 ? ordered[midpoint].price : (ordered[midpoint - 1].price + ordered[midpoint].price) / 2;
-  const lower = ordered.filter((provider) => provider.price <= median);
-  const higher = ordered.filter((provider) => provider.price > median);
+  const median = ordered.length % 2 ? ordered[midpoint].priceGroup : (ordered[midpoint - 1].priceGroup + ordered[midpoint].priceGroup) / 2;
+  const lower = ordered.filter((provider) => provider.priceGroup <= median);
+  const higher = ordered.filter((provider) => provider.priceGroup > median);
   return [{ label: "低价组", providers: lower }, ...(higher.length ? [{ label: "高价组", providers: higher }] : [])];
 }
 
