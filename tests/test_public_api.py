@@ -58,23 +58,23 @@ async def cpa(client):
         if payload.get('input') == 'hold':
             request.app['hold_started'].set()
             await request.app['hold_release'].wait()
-        if payload.get('stream'):
-            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
-            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-one"}\n\n')
-            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-two"}\n\n')
-            await stream.write(b'data: {"type":"response.completed","response":{"id":"req-stream","model":"gpt-5.6-luna","usage":{"input_tokens":3,"output_tokens":2}}}\n\n')
-            await stream.write_eof(); return stream
         if payload.get('input') == 'empty':
             return web.json_response({'id':'req-empty','model':'gpt-5.6-luna','output':[],'usage':{}})
         if payload.get('input') == 'fail-secret':
             return web.json_response({'error':'provider-secret must never escape'},status=500)
         if payload.get('input') == 'mismatch':
             return web.json_response({'id':'req-mismatch','model':'gpt-5.6-terra','output_text':'complete but wrong model','usage':{'input_tokens':2,'output_tokens':3}})
+        if payload.get('stream'):
+            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-one"}\n\n')
+            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-two"}\n\n')
+            await stream.write((f'data: {{"type":"response.completed","response":{{"id":"req-stream","model":"{payload.get("model", "gpt-5.6-luna")}","usage":{{"input_tokens":3,"output_tokens":2}}}}}}\n\n').encode())
+            await stream.write_eof(); return stream
         return web.json_response({'id':'req-test','model':payload.get('model','gpt-5.6-luna'),'output':[{'type':'message','content':[{'type':'output_text','text':'hello broker'}]}],'usage':{'output_tokens':2}})
     upstream=web.Application(); app['upstream_app']=upstream; upstream.router.add_post('/v1/responses',response)
     async def chat(request):
         payload=await request.json(); assert 'tools' not in payload
-        return web.json_response({'id':'req-chat','model':'gpt-5.6-luna','choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
+        return web.json_response({'id':'req-chat','model':payload.get('model','gpt-5.6-luna'),'choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
     upstream.router.add_post('/v1/chat/completions',chat)
     async def models(request): return web.json_response({'data':[{'id': model} for model in request.app.get('models', ['gpt-5.6-luna'])]})
     upstream.router.add_get('/models',models)
@@ -102,12 +102,12 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     result=await client.post('/v1/generate',json={'prompt':'hi','intellect':'standard','effort':'medium'})
     result_body=await result.json()
     assert result_body['actual_model'] == 'gpt-5.6-luna'
-    assert result_body['request_id'] == 'req-test'
-    assert result_body['usage'] == {'output_tokens':2}
+    assert result_body['request_id'] == 'req-stream'
+    assert result_body['usage'] == {'input_tokens':3,'output_tokens':2}
     assert result_body['ttft_ms'] >= 0
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
-    assert audit['output_tokens']==2 and audit['request_id']=='req-test' and audit['cost'] is None
+    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] == 0.000003
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
     streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
@@ -173,7 +173,8 @@ async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     failed=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'fail-secret','intellect':'standard'})
     body=await failed.json()
     assert failed.status == 503
-    assert body == {'error':'all eligible providers failed','attempts':[{'provider':'Test OpenAI','status':'unavailable'}]}
+    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable']
+    assert body['attempts'][0]['provider'] == 'Test OpenAI'
     assert 'provider-secret' not in str(body)
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status'] == 'unavailable'
@@ -421,7 +422,7 @@ async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
         result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'random', 'intellect': 'standard'})
 
     assert result.status == 200
-    assert sample.call_args.kwargs['k'] == 1
+    assert sample.call_args.kwargs['k'] == 2
     assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
 
 

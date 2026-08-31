@@ -22,7 +22,13 @@ async def generate(request):
     if tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "model must be standard, smart, or expert"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap())
+        settings = request.app["settings"]
+        result = await route(
+            request.app["store"], tier, body, request.app["store"].race_parallel_cap(),
+            hedge_delay_ms=settings.hedge_delay_ms,
+            first_event_timeout_ms=settings.first_event_timeout_ms,
+            route_attempt_budget=settings.route_attempt_budget,
+        )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     return web.json_response({
@@ -40,7 +46,13 @@ async def stream(request):
     if "model" in body or not isinstance(body.get("prompt"), str) or tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "prompt and valid intellect are required"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream)
+        settings = request.app["settings"]
+        result = await route(
+            request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
+            hedge_delay_ms=settings.hedge_delay_ms,
+            first_event_timeout_ms=settings.first_event_timeout_ms,
+            route_attempt_budget=settings.route_attempt_budget,
+        )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})

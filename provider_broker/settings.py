@@ -13,6 +13,9 @@ class Settings:
     cpa_url: str = "http://127.0.0.1:8317"
     cpa_token: str = ""
     parallel_cap: int = 3
+    hedge_delay_ms: int = 750
+    first_event_timeout_ms: int = 20_000
+    route_attempt_budget: int = 32
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -24,6 +27,9 @@ class Settings:
             cpa_url=os.getenv("CPA_URL", "http://127.0.0.1:8317"),
             cpa_token=os.getenv("CPA_MANAGEMENT_KEY", ""),
             parallel_cap=int(os.getenv("BROKER_PARALLEL_CAP", "3")),
+            hedge_delay_ms=int(os.getenv("BROKER_HEDGE_DELAY_MS", "750")),
+            first_event_timeout_ms=int(os.getenv("BROKER_FIRST_EVENT_TIMEOUT_MS", "20000")),
+            route_attempt_budget=int(os.getenv("BROKER_ROUTE_ATTEMPT_BUDGET", "32")),
         )
 
     def key_bytes(self) -> bytes:
