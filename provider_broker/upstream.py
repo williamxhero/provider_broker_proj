@@ -186,7 +186,14 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
             "validation_path": [str(part) for part in list(exc.absolute_path)[:8]],
         }) from exc
     if finish_reason in {"length", "max_tokens", "max_output_tokens", "response.incomplete"}:
-        raise AttemptFailure("output_truncated", diagnostic=diagnostic | {"structured_error_kind": "truncated"})
+        raise AttemptFailure(
+            "output_truncated",
+            diagnostic=diagnostic | {"structured_error_kind": "truncated"},
+            repair_note=(
+                "The prior response reached the output limit. Regenerate concise, complete JSON: "
+                "keep every required field, remove repetition, and finish well within the token limit."
+            ),
+        )
     try:
         parsed = json.loads(text.strip())
     except json.JSONDecodeError as exc:
@@ -666,7 +673,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                         store, provider, requested_model, candidate_tier, body, exc.status,
                         attempt=audit.row(sequence), route_id=route_id,
                     )
-                    retry_key = (provider.fingerprint, requested_model, candidate_tier)
+                    retry_kind = "repair" if exc.repair_note else "transient"
+                    retry_key = (provider.fingerprint, requested_model, candidate_tier, retry_kind)
                     if retryable_attempt(exc) and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
                         route_score = candidate_score(provider, candidate_tier)

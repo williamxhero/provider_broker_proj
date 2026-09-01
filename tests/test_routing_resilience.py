@@ -720,6 +720,47 @@ async def test_recent_exact_winner_gets_one_priority_transient_retry():
     assert [row["diagnostic"]["queue_kind"] for row in result["attempts"]] == ["primary", "priority_retry"]
 
 
+async def test_exact_winner_can_repair_truncation_after_one_transient_retry():
+    exact_winner = provider(0, secret="exact-winner")
+    store = FakeStore([exact_winner])
+    store.route_scores = {0: 1000}
+    calls = 0
+
+    async def invoke(_item, _body):
+        nonlocal calls
+        calls += 1
+        if calls == 1:
+            raise AttemptFailure("first_token_timeout")
+        if calls == 2:
+            raise AttemptFailure(
+                "output_truncated",
+                repair_note="The prior response reached the output limit. Regenerate concise, complete JSON.",
+            )
+        return completed()
+
+    result = await route(
+        store, "standard", {"prompt": "same exact request", "deadline_ms": 500},
+        parallel_cap=1, invoker=invoke, hedge_delay_ms=0,
+        route_attempt_budget=3, response_reserve_ms=0,
+    )
+
+    assert result["text"] == "recovered"
+    assert [row["diagnostic"]["queue_kind"] for row in result["attempts"]] == [
+        "primary", "priority_retry", "repair",
+    ]
+
+
+def test_truncated_structured_output_requests_a_concise_complete_repair():
+    with pytest.raises(AttemptFailure) as failure:
+        validate_structured_output(
+            '{"answer":"partial', {"type": "object"}, "length", {"output_token_limit": 6000},
+        )
+
+    assert failure.value.status == "output_truncated"
+    assert "concise" in failure.value.repair_note
+    assert "complete JSON" in failure.value.repair_note
+
+
 def test_route_score_uses_only_safe_exact_request_shape_history(tmp_path):
     store = Store(tmp_path / "broker.sqlite3", b"x" * 32)
     exact_winner = provider(0, secret="exact-winner")
