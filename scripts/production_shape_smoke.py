@@ -82,8 +82,8 @@ SCHEMA = {
 }
 
 
-def schema_hash():
-    encoded = json.dumps(SCHEMA, sort_keys=True, separators=(",", ":")).encode()
+def schema_hash(schema):
+    encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
@@ -100,8 +100,8 @@ def safe_attempts(value):
     }
 
 
-def run_once(base_url, token_count, deadline_ms, output_token_limit):
-    prompt = (
+def default_prompt(token_count):
+    return (
         "synthetic evidence\n" + "e " * token_count
         + "\nReturn exactly one JSON object. Write a coherent reply_markdown of at least 800 characters "
         "with a summary, three independently reasoned findings, counterevidence, and next-session implications. "
@@ -111,9 +111,32 @@ def run_once(base_url, token_count, deadline_ms, output_token_limit):
         "proposition and action must use source_span message_id=synthetic-message, start=0, end=18, "
         "quote=synthetic evidence. Do not use empty arrays or placeholder prose."
     )
+
+
+def sized_prompt(char_count, byte_count):
+    instruction = (
+        "\nReturn exactly one JSON object matching the authoritative schema. Write a substantial "
+        "reply_markdown, multiple meaningful propositions, and one concrete action. Every source_span "
+        "must refer to message_id synthetic-message with a non-empty exact quote. Do not emit prose "
+        "outside JSON, wrappers, placeholders, empty arrays, or undeclared properties."
+    )
+    extra_bytes = byte_count - char_count
+    if char_count < len(instruction) or extra_bytes < 0:
+        raise ValueError("requested prompt shape is smaller than its instruction")
+    three_byte_chars, two_byte_chars = divmod(extra_bytes, 2)
+    ascii_chars = char_count - len(instruction) - three_byte_chars - two_byte_chars
+    if ascii_chars < 0:
+        raise ValueError("requested prompt byte/character shape is impossible")
+    prompt = "证" * three_byte_chars + "é" * two_byte_chars + "e" * ascii_chars + instruction
+    if len(prompt) != char_count or len(prompt.encode("utf-8")) != byte_count:
+        raise AssertionError("constructed prompt shape does not match requested size")
+    return prompt
+
+
+def run_once(base_url, prompt, schema, deadline_ms, output_token_limit):
     payload = {
         "prompt": prompt, "intellect": "smart", "effort": "medium",
-        "deadline_ms": deadline_ms, "output_token_limit": output_token_limit, "output_schema": SCHEMA,
+        "deadline_ms": deadline_ms, "output_token_limit": output_token_limit, "output_schema": schema,
     }
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/generate/stream",
@@ -139,21 +162,21 @@ def run_once(base_url, token_count, deadline_ms, output_token_limit):
             failure = {}
         return False, {
             "http_status": exc.code, "attempts": safe_attempts(failure.get("attempts")),
-            "prompt_chars": len(prompt), "schema_hash": schema_hash(),
+            "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
         }
     except Exception as exc:
         return False, {
             "http_status": "transport_error", "error_type": type(exc).__name__,
-            "prompt_chars": len(prompt), "schema_hash": schema_hash(),
+            "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
         }
     try:
         output = json.loads(final["output_text"])
-        Draft202012Validator(SCHEMA).validate(output)
+        Draft202012Validator(schema).validate(output)
     except Exception as exc:
         return False, {
             "http_status": 200, "error_type": type(exc).__name__,
             "attempts": safe_attempts(final.get("attempts") if isinstance(final, dict) else None),
-            "prompt_chars": len(prompt), "schema_hash": schema_hash(),
+            "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
         }
     return True, {
         "http_status": 200, "status": final.get("status"),
@@ -164,7 +187,7 @@ def run_once(base_url, token_count, deadline_ms, output_token_limit):
         "reply_chars": len(output["reply_markdown"]),
         "propositions": len(output["propositions"]),
         "actions": len(output["actions"]),
-        "prompt_chars": len(prompt), "schema_hash": schema_hash(),
+        "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
     }
 
 
@@ -175,12 +198,23 @@ def main():
     parser.add_argument("--token-count", type=int, default=72_000)
     parser.add_argument("--deadline-ms", type=int, default=260_000)
     parser.add_argument("--output-token-limit", type=int, default=6_000)
+    parser.add_argument("--schema-file")
+    parser.add_argument("--prompt-chars", type=int)
+    parser.add_argument("--prompt-bytes", type=int)
     args = parser.parse_args()
     if args.runs < 1 or args.token_count < 1 or args.deadline_ms < 1 or args.output_token_limit < 1:
         parser.error("runs, token-count, deadline-ms, and output-token-limit must be positive")
+    if (args.prompt_chars is None) != (args.prompt_bytes is None):
+        parser.error("prompt-chars and prompt-bytes must be provided together")
+    schema = SCHEMA
+    if args.schema_file:
+        with open(args.schema_file, "r", encoding="utf-8") as handle:
+            schema = json.load(handle)
+    Draft202012Validator.check_schema(schema)
+    prompt = sized_prompt(args.prompt_chars, args.prompt_bytes) if args.prompt_chars is not None else default_prompt(args.token_count)
     failures = 0
     for run in range(1, args.runs + 1):
-        passed, summary = run_once(args.url, args.token_count, args.deadline_ms, args.output_token_limit)
+        passed, summary = run_once(args.url, prompt, schema, args.deadline_ms, args.output_token_limit)
         failures += not passed
         print(json.dumps({"run": run, "passed": passed, **summary}, ensure_ascii=False), flush=True)
     return 1 if failures else 0

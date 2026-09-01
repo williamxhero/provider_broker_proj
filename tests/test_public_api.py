@@ -108,6 +108,12 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
     assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] == 0.000003
+    assert len(audit['diagnostic']['prompt_sha256']) == 64
+    assert audit['diagnostic']['prompt_chars'] == 2 and audit['diagnostic']['prompt_bytes'] == 2
+    assert audit['diagnostic']['request_bytes'] > 2
+    assert audit['diagnostic']['client_deadline_ms'] == 60000
+    assert audit['diagnostic']['route_budget_ms'] == 55000
+    assert audit['diagnostic']['response_reserve_ms'] == 5000
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
     streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')

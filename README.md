@@ -42,7 +42,7 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 4. `hedge_delay_ms` 到期仍无合格结果时启动下一个候选；候选失败会立即补位。Broker 分开约束首个可解析事件、事件间空闲和单 attempt 总时长。reasoning 事件只作为活性进度，绝不拼入输出；超过空闲或完成上限的半开流会释放槽位。
 5. 所有唯一候选首轮结束后，可重试的瞬态失败会轮转重试一次，但总启动数严格受 `BROKER_ROUTE_ATTEMPT_BUDGET` 和请求 `deadline_ms` 约束。
 6. `structured_output_invalid` 不会被当作成功；它可以在剩余预算内重试，最终仍无合格输出时返回 503，并包含按启动顺序稳定排列的完整 `attempts`。
-7. `effort` 不参与价格分组；它会透传给 OpenAI 兼容上游，并调整首事件窗口：未指定/low 为 1 倍、medium 为 2 倍、high 为 3 倍。默认基础窗口为 30 秒；流空闲上限 90 秒；单 attempt 完成上限 180 秒，分别可由 `BROKER_FIRST_EVENT_TIMEOUT_MS`、`BROKER_STREAM_IDLE_TIMEOUT_MS`、`BROKER_ATTEMPT_TIMEOUT_MS` 配置，且都不会突破请求总 deadline。
+7. `effort` 不参与价格分组；它会透传给 OpenAI 兼容上游，并调整首事件窗口：未指定/low 为 1 倍、medium 为 2 倍、high 为 3 倍。默认基础窗口为 30 秒；流空闲上限 90 秒；单 attempt 完成上限 180 秒，分别可由 `BROKER_FIRST_EVENT_TIMEOUT_MS`、`BROKER_STREAM_IDLE_TIMEOUT_MS`、`BROKER_ATTEMPT_TIMEOUT_MS` 配置，且都不会突破请求总 deadline。Broker 还会默认预留 5 秒（`BROKER_RESPONSE_RESERVE_MS`，短 deadline 最多预留 10%）用于最终校验、序列化和响应传输。
 
 ### 生产形状结构化回放
 
@@ -53,4 +53,4 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
   /data/provider-broker/current/production_shape_smoke.py --runs 3
 ```
 
-该脚本使用约 72k-token 级别的合成文本、2000-token 输出上限和复杂 Draft 2020-12 Schema，要求生成长 reply、多条 proposition、一个 action 及精确 source_span；默认 deadline 为 260 秒。它只输出输入/输出长度、结构计数、Schema 哈希、模型和 attempt 安全状态统计，不输出 prompt 或响应正文。
+该脚本使用约 72k-token 级别的合成文本、6000-token 输出上限和复杂 Draft 2020-12 Schema，要求生成长 reply、多条 proposition、一个 action 及精确 source_span；默认 deadline 为 260 秒。它只输出输入/输出长度、结构计数、Schema 哈希、模型和 attempt 安全状态统计，不输出 prompt 或响应正文。

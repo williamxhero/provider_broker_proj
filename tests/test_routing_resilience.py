@@ -11,6 +11,7 @@ from provider_broker.app import create_app
 from provider_broker.settings import Settings
 from provider_broker.upstream import (
     AttemptFailure,
+    UpstreamFailure,
     invoke_stream,
     route,
     strict_schema_prompt,
@@ -506,12 +507,12 @@ async def test_invalid_structured_output_continues_to_later_valid_candidate():
     with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
         result = await route(
             store, "standard", body, parallel_cap=1, invoker=invoke,
-            hedge_delay_ms=0, route_attempt_budget=2,
+            hedge_delay_ms=0, route_attempt_budget=3,
         )
 
     assert result["text"] == '{"healthy":true}'
     assert [attempt["status"] for attempt in result["attempts"]] == [
-        "structured_output_invalid", "completed",
+        "structured_output_invalid", "structured_output_invalid", "completed",
     ]
     assert result["attempts"][0]["diagnostic"]["structured_error_kind"] == "json_decode"
 
@@ -593,6 +594,7 @@ async def test_schema_repair_retry_is_a_separate_audited_attempt():
         result = await route(
             store, "standard", {"prompt": "repair", "output_schema": schema, "deadline_ms": 500},
             parallel_cap=1, invoker=invoke, hedge_delay_ms=0, route_attempt_budget=2,
+            response_reserve_ms=0,
         )
 
     assert result["text"] == '{"answer":"valid meaning"}'
@@ -630,6 +632,58 @@ async def test_schema_repair_retry_precedes_untried_unhealthy_candidates():
     assert result["text"] == '{"answer":"meaning"}'
     assert order == [0, 0]
     assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+
+
+async def test_json_decode_repair_precedes_untried_unhealthy_candidates():
+    items = [provider(index, secret=f"json-repair-priority-{index}") for index in range(3)]
+    store = FakeStore(items)
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["answer"], "properties": {"answer": {"type": "string"}},
+    }
+    order = []
+
+    async def invoke(item, request_body):
+        order.append(item.id)
+        if item.id == 0 and "_structured_repair_note" not in request_body:
+            validate_structured_output("ordinary prose", schema, "stop", {"endpoint": "/chat/completions"})
+        if item.id == 0:
+            return completed('{"answer":"recovered"}')
+        raise AttemptFailure("unavailable", diagnostic={"http_status": 503})
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "repair", "output_schema": schema, "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0, route_attempt_budget=2,
+        )
+
+    assert result["text"] == '{"answer":"recovered"}'
+    assert order == [0, 0]
+    assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+
+
+async def test_route_reserves_time_to_serialize_and_transmit_before_client_deadline():
+    item = provider(0, secret="deadline-reserve-secret")
+    store = FakeStore([item])
+
+    async def stalled(_provider, _body):
+        await asyncio.Event().wait()
+
+    started = asyncio.get_running_loop().time()
+    with pytest.raises(UpstreamFailure) as failure:
+        await route(
+            store, "standard", {"prompt": "deadline", "deadline_ms": 300},
+            parallel_cap=1, invoker=stalled, hedge_delay_ms=0,
+            route_attempt_budget=1, response_reserve_ms=30,
+        )
+    elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
+
+    assert 240 <= elapsed_ms < 300
+    assert failure.value.attempts[0]["status"] == "timed_out"
+    assert failure.value.attempts[0]["diagnostic"]["client_deadline_ms"] == 300
+    assert failure.value.attempts[0]["diagnostic"]["response_reserve_ms"] == 30
+    assert failure.value.attempts[0]["diagnostic"]["route_budget_ms"] == 270
+    assert store.inflight == {}
 
 
 async def test_invalid_schema_is_rejected_by_broker_before_contacting_provider():

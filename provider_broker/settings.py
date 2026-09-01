@@ -18,6 +18,7 @@ class Settings:
     stream_idle_timeout_ms: int = 90_000
     attempt_timeout_ms: int = 180_000
     route_attempt_budget: int = 32
+    response_reserve_ms: int = 5_000
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -34,6 +35,7 @@ class Settings:
             stream_idle_timeout_ms=int(os.getenv("BROKER_STREAM_IDLE_TIMEOUT_MS", "90000")),
             attempt_timeout_ms=int(os.getenv("BROKER_ATTEMPT_TIMEOUT_MS", "180000")),
             route_attempt_budget=int(os.getenv("BROKER_ROUTE_ATTEMPT_BUDGET", "32")),
+            response_reserve_ms=int(os.getenv("BROKER_RESPONSE_RESERVE_MS", "5000")),
         )
 
     def key_bytes(self) -> bytes:

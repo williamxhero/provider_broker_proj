@@ -30,6 +30,7 @@ async def generate(request):
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
             attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
+            response_reserve_ms=settings.response_reserve_ms,
         )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
@@ -56,6 +57,7 @@ async def stream(request):
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
             attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
+            response_reserve_ms=settings.response_reserve_ms,
         )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)

@@ -33,6 +33,8 @@ DIAGNOSTIC_FIELDS = {
     "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
     "output_chars", "repair_retry", "unexpected_properties",
     "normalized_properties",
+    "client_deadline_ms", "route_budget_ms", "response_reserve_ms",
+    "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -133,6 +135,27 @@ def schema_hash(schema: dict | None) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def full_schema_hash(schema: dict | None) -> str | None:
+    if schema is None:
+        return None
+    encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
+
+
+def request_shape_diagnostic(body: dict) -> dict:
+    prompt = body.get("prompt") if isinstance(body.get("prompt"), str) else ""
+    prompt_bytes = prompt.encode("utf-8")
+    public_body = {key: value for key, value in body.items() if not key.startswith("_")}
+    schema = structured_schema(body)
+    return {
+        "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        "prompt_chars": len(prompt), "prompt_bytes": len(prompt_bytes),
+        "request_bytes": len(json.dumps(public_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+        "schema_hash": schema_hash(schema), "schema_sha256": full_schema_hash(schema),
+        "output_token_limit": body.get("output_token_limit", 1024),
+    }
+
+
 def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | None = None) -> str:
     """Reinforce strictness for OpenAI-compatible gateways that only partially honor response_format."""
     if schema is None:
@@ -166,7 +189,11 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
     try:
         parsed = json.loads(text.strip())
     except json.JSONDecodeError as exc:
-        raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {"structured_error_kind": "json_decode"}) from exc
+        raise AttemptFailure(
+            "structured_output_invalid",
+            diagnostic=diagnostic | {"structured_error_kind": "json_decode"},
+            repair_note="The prior response was not one complete JSON value. Return only a complete JSON value with no prose or fences.",
+        ) from exc
     validator = Draft202012Validator(schema)
     normalized = []
     while True:
@@ -190,6 +217,8 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
         repair_note = None
         if unexpected:
             repair_note = f"At {location}, omit undeclared properties: {', '.join(unexpected)}."
+        elif str(exc.validator):
+            repair_note = f"At {location}, satisfy the JSON Schema {exc.validator} constraint exactly."
         raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {
             "structured_error_kind": "schema_validation", "validator": str(exc.validator),
             "validation_path": path, "unexpected_properties": unexpected,
@@ -234,11 +263,12 @@ async def invoke_stream(provider, body: dict) -> dict:
     response_status = None
     content_type = None
     normalized_properties = []
+    request_shape = request_shape_diagnostic(body)
 
     def diagnostic():
         return sanitize_diagnostic({
             "endpoint": endpoint, "http_status": response_status, "content_type": content_type,
-            "schema_hash": schema_hash(schema), "output_token_limit": body.get("output_token_limit", 1024),
+            **request_shape,
             "event_types": event_types, "finish_reason": finish_reason, "stream_completed": completed,
             "received_bytes": received_bytes, "ttfb_ms": ttfb_ms, "ttft_ms": ttft_ms,
             "first_event_timeout_ms": round(first_event_timeout * 1000),
@@ -249,6 +279,9 @@ async def invoke_stream(provider, body: dict) -> dict:
             "output_chars": sum(len(chunk) for chunk in chunks),
             "repair_retry": bool(repair_note),
             "normalized_properties": normalized_properties,
+            "client_deadline_ms": body.get("_client_deadline_ms"),
+            "route_budget_ms": body.get("_route_budget_ms"),
+            "response_reserve_ms": body.get("_response_reserve_ms"),
         })
 
     def record_progress():
@@ -490,10 +523,14 @@ def retryable_attempt(failure: AttemptFailure) -> bool:
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
                 *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
                 stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
-                route_attempt_budget: int = 32) -> dict:
+                route_attempt_budget: int = 32, response_reserve_ms: int = 5000) -> dict:
     route_started = time.monotonic()
     deadline_ms = body.get("deadline_ms", 60000)
-    deadline_seconds = max(.001, float(deadline_ms) / 1000) if isinstance(deadline_ms, (int, float)) else 60
+    client_deadline_ms = max(1, int(deadline_ms)) if isinstance(deadline_ms, (int, float)) else 60000
+    reserve_cap_ms = max(0, client_deadline_ms // 10)
+    reserve_ms = min(max(0, int(response_reserve_ms)), reserve_cap_ms, max(0, client_deadline_ms - 1))
+    route_budget_ms = max(1, client_deadline_ms - reserve_ms)
+    deadline_seconds = route_budget_ms / 1000
     route_deadline = route_started + deadline_seconds
     attempt_budget = max(1, int(route_attempt_budget))
     cap = max(1, int(parallel_cap))
@@ -508,6 +545,9 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         "_first_event_timeout_ms": effective_first_event_timeout_ms,
         "_stream_idle_timeout_ms": max(1, int(stream_idle_timeout_ms)),
         "_attempt_timeout_ms": max(1, int(attempt_timeout_ms)),
+        "_client_deadline_ms": client_deadline_ms,
+        "_route_budget_ms": route_budget_ms,
+        "_response_reserve_ms": reserve_ms,
     }
     tiers = ("standard", "smart", "expert")
     primary = deque()
@@ -549,7 +589,12 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     async def cancel_active(status: str):
         for task, (sequence, provider, candidate_tier) in active.items():
             task.cancel()
-            diagnostic = {"first_event_timeout_ms": effective_first_event_timeout_ms} if status == "timed_out" else None
+            diagnostic = request_shape_diagnostic(body) | {
+                "client_deadline_ms": client_deadline_ms, "route_budget_ms": route_budget_ms,
+                "response_reserve_ms": reserve_ms,
+            }
+            if status == "timed_out":
+                diagnostic["first_event_timeout_ms"] = effective_first_event_timeout_ms
             audit.finish(sequence, status, diagnostic=diagnostic)
             observe(
                 store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
