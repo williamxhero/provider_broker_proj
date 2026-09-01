@@ -198,15 +198,22 @@ def run_once(base_url, prompt, schema, deadline_ms, output_token_limit, intellec
             "attempts": safe_attempts(final.get("attempts") if isinstance(final, dict) else None),
             "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
         }
+    contract_summary = (
+        {"operation": output.get("operation"), "source_reference_kind": type(output.get("source_reference")).__name__}
+        if schema_hash(schema) == schema_hash(MEMORY_RESEARCH_SCHEMA)
+        else {
+            "reply_chars": len(output["reply_markdown"]),
+            "propositions": len(output["propositions"]),
+            "actions": len(output["actions"]),
+        }
+    )
     return True, {
         "http_status": 200, "status": final.get("status"),
         "actual_model": final.get("actual_model"),
         "fulfilled_intellect": final.get("fulfilled_intellect"), "ttft_ms": final.get("ttft_ms"),
         "attempts": safe_attempts(final.get("attempts")),
         "output_chars": len(final["output_text"]),
-        "reply_chars": len(output["reply_markdown"]),
-        "propositions": len(output["propositions"]),
-        "actions": len(output["actions"]),
+        **contract_summary,
         "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
     }
 
