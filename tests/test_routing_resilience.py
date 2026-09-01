@@ -185,6 +185,23 @@ def test_strict_prompt_resurfaces_instruction_buried_in_large_request_envelope()
     assert reinforced.rfind(instruction) > reinforced.rfind("Exact JSON Schema")
 
 
+def test_research_plan_prompt_repeats_exact_requirement_keys_and_gaps():
+    schema = {"type": "object"}
+    prompt = json.dumps({
+        "output_schema": schema,
+        "input": {
+            "stage": "research_plan", "instruction": "Return a valid plan.",
+            "evidence_contract": {"requirements": [{"key": "turnover_compare"}, {"key": "portfolio_close"}]},
+            "coverage_gaps": ["research_plan_missing_requirement:turnover_compare"],
+        },
+    })
+    reinforced = strict_schema_prompt(prompt, schema)
+    assert "Use only these exact requirement_key values" in reinforced
+    assert "turnover_compare, portfolio_close" in reinforced
+    assert "research_plan_missing_requirement:turnover_compare" in reinforced
+    assert "never split, suffix, prefix, or invent" in reinforced
+
+
 def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():
     schema = {
         "type": "object", "additionalProperties": False,

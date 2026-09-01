@@ -240,7 +240,24 @@ def _enveloped_task_instruction(prompt: str) -> str | None:
         return None
     packet = envelope.get("input") if isinstance(envelope, dict) else None
     instruction = packet.get("instruction") if isinstance(packet, dict) else None
-    return instruction if isinstance(instruction, str) and instruction.strip() else None
+    if not isinstance(instruction, str) or not instruction.strip():
+        return None
+    contract = packet.get("evidence_contract") if isinstance(packet, dict) else None
+    requirements = contract.get("requirements") if isinstance(contract, dict) else None
+    keys = [
+        str(row.get("key")) for row in requirements or []
+        if isinstance(row, dict) and row.get("key")
+    ]
+    if keys and packet.get("stage") == "research_plan":
+        gaps = [str(item) for item in packet.get("coverage_gaps") or []]
+        instruction += (
+            "\nUse only these exact requirement_key values; never split, suffix, prefix, or invent a requirement key: "
+            + ", ".join(keys) + "."
+            " Cover every requirement named by the current coverage gaps using its exact key."
+        )
+        if gaps:
+            instruction += " Current coverage gaps: " + " | ".join(gaps) + "."
+    return instruction
 
 
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,

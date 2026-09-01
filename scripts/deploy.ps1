@@ -25,3 +25,12 @@ scp $Wheel "$Project\scripts\install.sh" "$Project\scripts\smoke.py" "$Project\s
 if ($LASTEXITCODE -ne 0) { throw "Could not upload release files" }
 ssh $HostName "sudo -n bash '$Stage/install.sh' '$Version' '$Stage'"
 if ($LASTEXITCODE -ne 0) { throw "Remote install failed or was rolled back" }
+
+$InstalledRuntimePython = Join-Path $env:LOCALAPPDATA "AITradingCompanion\runtime\python\Scripts\python.exe"
+if (-not (Test-Path -LiteralPath $InstalledRuntimePython)) { throw "Installed stock_advisor runtime Python was not found" }
+& $InstalledRuntimePython "$Project\scripts\stock_planner_canary.py" --runs 3 --deadline-ms 300000
+if ($LASTEXITCODE -ne 0) {
+    $RollbackCommand = 'set -e; previous=$(readlink -f /data/provider-broker/previous); test -d "$previous"; sudo -n ln -sfn "$previous" /data/provider-broker/current.rollback; sudo -n mv -Tf /data/provider-broker/current.rollback /data/provider-broker/current; sudo -n systemctl restart provider-broker.service'
+    ssh $HostName $RollbackCommand
+    throw "Real stock_advisor planner verifier failed; remote release was rolled back"
+}
