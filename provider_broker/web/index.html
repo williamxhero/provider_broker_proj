@@ -33,9 +33,12 @@
     <section aria-labelledby="model-view-title">
       <div class="section-heading">
         <div><p class="index">03 / STAGE VIEW</p><h2 id="model-view-title">Stage视角</h2></div>
-        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
+        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
       <div class="table-wrap"><table id="model-view"></table></div>
+      <div class="section-actions"><label>健康 Stage<select id="probe-stage"><option value="standard">standard</option><option value="smart">smart</option><option value="expert">expert</option></select></label><button id="probe-race" class="secondary" type="button">竞速探针</button><button id="probe-all" class="secondary" type="button">全量探针</button></div>
+      <output id="proberesult" class="notice" aria-live="polite"></output>
+      <div class="table-wrap"><table id="probe-results"></table></div>
     </section>
 
     <section aria-labelledby="catalog-title">

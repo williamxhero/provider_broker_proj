@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
 
@@ -61,6 +62,21 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS route_block (fingerprint TEXT NOT NULL, model TEXT NOT NULL, blocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(fingerprint,model));
         CREATE TABLE IF NOT EXISTS broker_setting (name TEXT PRIMARY KEY, value TEXT NOT NULL);
+        CREATE TABLE IF NOT EXISTS provider_health (
+          fingerprint TEXT NOT NULL, model TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unknown',
+          consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_level INTEGER NOT NULL DEFAULT 0,
+          last_real_attempt TEXT, last_real_success TEXT, last_probe_at TEXT, next_probe_at TEXT,
+          smoothed_success REAL, smoothed_ttft_ms REAL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(fingerprint, model)
+        );
+        CREATE TABLE IF NOT EXISTS probe_event (
+          id INTEGER PRIMARY KEY, fingerprint TEXT NOT NULL, model TEXT NOT NULL, tier TEXT NOT NULL,
+          mode TEXT NOT NULL, reachable INTEGER NOT NULL, responded INTEGER NOT NULL,
+          first_token INTEGER NOT NULL, model_matched INTEGER NOT NULL, ttfb_ms REAL,
+          ttft_ms REAL, duration_ms REAL, error_type TEXT, error TEXT, created_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP
+        );
+        CREATE INDEX IF NOT EXISTS provider_health_due ON provider_health(next_probe_at);
+        CREATE INDEX IF NOT EXISTS probe_event_target ON probe_event(fingerprint, model, id DESC);
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
@@ -71,7 +87,7 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE observation ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
         except sqlite3.OperationalError: pass
-        for name, definition in [('input_tokens','INTEGER'),('output_tokens','INTEGER'),('cost','REAL'),('request_id','TEXT')]:
+        for name, definition in [('input_tokens','INTEGER'),('output_tokens','INTEGER'),('cost','REAL'),('request_id','TEXT'),('diagnostic_json','TEXT')]:
             try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
@@ -83,7 +99,118 @@ class Store:
                 [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
             )
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('race_parallel_cap',?)", (str(self.default_race_parallel_cap),))
+        self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('hedge_delay_ms','750')")
         self.conn.commit()
+
+    @staticmethod
+    def _timestamp(now: datetime | None = None) -> str:
+        return (now or datetime.now(UTC)).astimezone(UTC).isoformat()
+
+    @staticmethod
+    def _parse_timestamp(value: str | None) -> datetime | None:
+        if not value:
+            return None
+        try:
+            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+        except ValueError:
+            return None
+
+    def ensure_health_targets(self, now: datetime | None = None) -> list[tuple[str, str]]:
+        """Create health rows for newly discovered usable Provider/model pairs."""
+        stamp = self._timestamp(now)
+        catalog = set(self.catalog())
+        rows = self.conn.execute("SELECT fingerprint,models_json FROM source_provider").fetchall()
+        created = []
+        with self.conn:
+            for row in rows:
+                for model in json.loads(row["models_json"]):
+                    if model not in catalog:
+                        continue
+                    inserted = self.conn.execute(
+                        "INSERT OR IGNORE INTO provider_health(fingerprint,model,next_probe_at,updated_at) VALUES(?,?,?,?)",
+                        (row["fingerprint"], model, stamp, stamp),
+                    ).rowcount
+                    if inserted:
+                        created.append((row["fingerprint"], model))
+        return created
+
+    def health(self, fingerprint: str, model: str) -> dict:
+        row = self.conn.execute("SELECT * FROM provider_health WHERE fingerprint=? AND model=?", (fingerprint, model)).fetchone()
+        if row is None:
+            return {"state": "unknown", "consecutive_failures": 0, "backoff_level": 0}
+        return dict(row)
+
+    def health_allows_route(self, fingerprint: str, model: str) -> bool:
+        return self.health(fingerprint, model)["state"] != "open"
+
+    def record_health(self, fingerprint: str, model: str, *, success: bool, real: bool,
+                      ttft_ms: float | None = None, immediate_open: bool = False,
+                      now: datetime | None = None) -> dict:
+        """Apply passive or probe evidence without touching ordinary call statistics."""
+        stamp = self._timestamp(now)
+        current = self.health(fingerprint, model)
+        state = current["state"]
+        failures = int(current.get("consecutive_failures") or 0)
+        level = int(current.get("backoff_level") or 0)
+        last_real_attempt = stamp if real else current.get("last_real_attempt")
+        last_real_success = stamp if real and success else current.get("last_real_success")
+        last_probe_at = stamp if not real else current.get("last_probe_at")
+        smooth_success = current.get("smoothed_success")
+        smooth_ttft = current.get("smoothed_ttft_ms")
+        if real:
+            smooth_success = (float(smooth_success) * .8 + (1.0 if success else 0.0) * .2) if smooth_success is not None else float(success)
+        if success and ttft_ms is not None:
+            smooth_ttft = (float(smooth_ttft) * .8 + float(ttft_ms) * .2) if smooth_ttft is not None else float(ttft_ms)
+        if success:
+            failures, level, next_probe = 0, 0, None
+            # Recovery probes deliberately require one real request before full health.
+            state = "half_open" if not real and state == "open" else "healthy"
+        else:
+            failures += 1
+            if immediate_open or failures >= 3:
+                state = "open"
+                level = min(level + 1, 4)
+                delay = (2, 5, 15, 30, 60)[level]
+                next_probe = self._timestamp((now or datetime.now(UTC)) + timedelta(minutes=delay))
+            else:
+                state, next_probe = "suspect", stamp
+        with self.conn:
+            self.conn.execute("""INSERT INTO provider_health(fingerprint,model,state,consecutive_failures,backoff_level,last_real_attempt,last_real_success,last_probe_at,next_probe_at,smoothed_success,smoothed_ttft_ms,updated_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(fingerprint,model) DO UPDATE SET state=excluded.state,consecutive_failures=excluded.consecutive_failures,backoff_level=excluded.backoff_level,last_real_attempt=excluded.last_real_attempt,last_real_success=excluded.last_real_success,last_probe_at=excluded.last_probe_at,next_probe_at=excluded.next_probe_at,smoothed_success=excluded.smoothed_success,smoothed_ttft_ms=excluded.smoothed_ttft_ms,updated_at=excluded.updated_at""",
+                (fingerprint, model, state, failures, level, last_real_attempt, last_real_success, last_probe_at, next_probe, smooth_success, smooth_ttft, stamp))
+        return self.health(fingerprint, model)
+
+    def due_health_targets(self, now: datetime | None = None, stale_seconds: int = 1800) -> list[tuple[str, str]]:
+        now = now or datetime.now(UTC)
+        stamp = self._timestamp(now)
+        stale = self._timestamp(now - timedelta(seconds=stale_seconds))
+        rows = self.conn.execute("""SELECT h.fingerprint,h.model FROM provider_health h
+            JOIN source_provider s USING(fingerprint) JOIN policy p USING(fingerprint)
+            WHERE p.enabled=1 AND p.calibrated=1 AND (
+              (h.state='open' AND h.next_probe_at IS NOT NULL AND h.next_probe_at<=?) OR
+              (h.state!='open' AND (h.next_probe_at IS NOT NULL AND h.next_probe_at<=? OR (h.last_real_attempt IS NULL OR h.last_real_attempt<?) AND (h.last_probe_at IS NULL OR h.last_probe_at<?)))
+            ) ORDER BY h.next_probe_at, h.updated_at""", (stamp, stamp, stale, stale)).fetchall()
+        return [(row["fingerprint"], row["model"]) for row in rows]
+
+    def record_probe(self, *, fingerprint: str, model: str, tier: str, mode: str, reachable: bool,
+                     responded: bool, first_token: bool, model_matched: bool, ttfb_ms: float | None,
+                     ttft_ms: float | None, duration_ms: float | None, error_type: str | None,
+                     error: str | None, now: datetime | None = None) -> None:
+        with self.conn:
+            self.conn.execute("""INSERT INTO probe_event(fingerprint,model,tier,mode,reachable,responded,first_token,model_matched,ttfb_ms,ttft_ms,duration_ms,error_type,error,created_at)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (fingerprint, model, tier, mode, int(reachable), int(responded), int(first_token), int(model_matched), ttfb_ms, ttft_ms, duration_ms, error_type, error, self._timestamp(now)))
+
+    def health_results(self, tier: str, fingerprint: str | None = None, model: str | None = None) -> list[dict]:
+        clauses = ["c.intellect=?"]; params: list[object] = [tier]
+        if fingerprint: clauses.append("h.fingerprint=?"); params.append(fingerprint)
+        if model: clauses.append("h.model=?"); params.append(model)
+        rows = self.conn.execute("""SELECT h.*,s.name,p.note,e.id probe_id,e.ttft_ms probe_ttft_ms,e.error_type probe_error_type,e.created_at probe_at
+            FROM provider_health h JOIN source_provider s USING(fingerprint) JOIN policy p USING(fingerprint)
+            JOIN model_catalog c ON c.model=h.model
+            LEFT JOIN probe_event e ON e.id=(SELECT id FROM probe_event WHERE fingerprint=h.fingerprint AND model=h.model ORDER BY id DESC LIMIT 1)
+            WHERE """ + " AND ".join(clauses) + " ORDER BY s.name,h.model", params).fetchall()
+        return [{"fingerprint": r["fingerprint"], "provider": r["name"], "note": r["note"], "model": r["model"], "state": r["state"], "consecutive_failures": r["consecutive_failures"], "backoff_level": r["backoff_level"], "last_real_attempt": r["last_real_attempt"], "last_real_success": r["last_real_success"], "last_probe_at": r["probe_at"] or r["last_probe_at"], "next_probe_at": r["next_probe_at"], "ttft_ms": r["probe_ttft_ms"], "error_type": r["probe_error_type"]} for r in rows]
 
     def catalog(self):
         return {r['model']:{'family':r['family'],'intellect':r['intellect'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price']} for r in self.conn.execute('SELECT * FROM model_catalog ORDER BY model')}
@@ -125,6 +252,14 @@ class Store:
     def update_race_parallel_cap(self, value):
         with self.conn:
             self.conn.execute("UPDATE broker_setting SET value=? WHERE name='race_parallel_cap'", (str(value),))
+    def hedge_delay_ms(self):
+        return int(self.conn.execute("SELECT value FROM broker_setting WHERE name='hedge_delay_ms'").fetchone()[0])
+    def update_routing(self, *, race_parallel_cap=None, hedge_delay_ms=None):
+        with self.conn:
+            if race_parallel_cap is not None:
+                self.conn.execute("UPDATE broker_setting SET value=? WHERE name='race_parallel_cap'", (str(race_parallel_cap),))
+            if hedge_delay_ms is not None:
+                self.conn.execute("UPDATE broker_setting SET value=? WHERE name='hedge_delay_ms'", (str(hedge_delay_ms),))
     def catalog_counts(self):
         rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.catalog()}
         for name in counts:
@@ -179,9 +314,29 @@ class Store:
             if models and tier in json.loads(r['tiers_json']):
                 header_blob = r['request_headers']
                 headers = json.loads(self._decrypt(header_blob)) if header_blob else {}
-                pricing = catalog[models[0]]
-                result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,models,pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
+                # A key can expose several catalog models in the same stage.  Health is
+                # per model, so make each routing candidate explicit rather than letting
+                # an open model hide behind the first item in a shared list.
+                for model in models:
+                    if not self.health_allows_route(r['fingerprint'], model):
+                        continue
+                    pricing = catalog[model]
+                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
         return result
+
+    def probe_provider(self, fingerprint: str, model: str) -> Provider | None:
+        """Return one enabled inventory target, including open targets for recovery probes."""
+        row = self.conn.execute("""SELECT s.*,p.enabled,p.multiplier,p.calibrated,p.tiers_json,p.max_parallel
+            FROM source_provider s JOIN policy p USING(fingerprint) WHERE s.fingerprint=?""", (fingerprint,)).fetchone()
+        catalog = self.catalog()
+        if row is None or not row['enabled'] or not row['calibrated'] or model not in json.loads(row['models_json']) or model not in catalog:
+            return None
+        tier = catalog[model]['intellect']
+        if tier not in json.loads(row['tiers_json']):
+            return None
+        headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
+        pricing = catalog[model]
+        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']))
 
     def try_acquire(self, provider: Provider) -> bool:
         active = self._inflight.get(provider.fingerprint, 0)
@@ -232,8 +387,9 @@ class Store:
         return True
 
     def observe(self, **data):
+        data["diagnostic_json"] = json.dumps(data.pop("diagnostic", None), sort_keys=True) if data.get("diagnostic") else None
         with self.conn:
-            self.conn.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,input_tokens,output_tokens,cost,request_id) VALUES(:fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,:input_tokens,:output_tokens,:cost,:request_id)", data)
+            self.conn.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,input_tokens,output_tokens,cost,request_id,diagnostic_json) VALUES(:fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,:input_tokens,:output_tokens,:cost,:request_id,:diagnostic_json)", data)
 
     def quality(self, window='24h'):
         modifier={'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]
@@ -254,4 +410,4 @@ class Store:
         values=[*params,limit]
         if offset is not None: query += ' OFFSET ?'; values.append(offset)
         rows=self.conn.execute(query,values).fetchall()
-        return [{'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],'request_id':r['request_id']} for r in rows]
+        return [{'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],'request_id':r['request_id'],'diagnostic':json.loads(r['diagnostic_json']) if r['diagnostic_json'] else None} for r in rows]

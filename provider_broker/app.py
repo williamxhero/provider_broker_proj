@@ -1,6 +1,8 @@
 import json
 import math
 import re
+import asyncio
+from datetime import UTC, datetime
 from pathlib import Path
 
 from aiohttp import web
@@ -10,6 +12,7 @@ from .catalog import blended_price
 from .settings import Settings
 from .source import sync_cpa
 from .upstream import UpstreamFailure, invoke_stream, route
+from .health import run_probe, scheduler
 
 WEB_ROOT = Path(__file__).with_name("web")
 
@@ -22,15 +25,25 @@ async def generate(request):
     if tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "model must be standard, smart, or expert"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap())
+        # All production attempts are streaming internally.  The non-stream API only
+        # buffers the winning stream before serialising its completed response.
+        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), request.app["store"].hedge_delay_ms(), request.app["settings"].first_event_timeout_ms, request.app["settings"].route_attempt_budget)
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
+    try:
+        output = await result["attempt"].result()
+    except UpstreamFailure as exc:
+        return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
+    provider = result["attempt"].provider
+    from .upstream import observe
+    observe(request.app["store"], provider, result["attempt"].model, result["fulfilled_intellect"], body, "completed", output=output)
+    request.app["store"].record_health(provider.fingerprint, result["attempt"].model, success=True, real=True, ttft_ms=output["latency_ms"])
     return web.json_response({
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
         "effort": body.get("effort"), "deadline_ms": body.get("deadline_ms"), "output_token_limit": body.get("output_token_limit"),
-        "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
-        "request_id": result["request_id"], "usage": result["usage"],
-        "ttft_ms": result["latency_ms"], "attempts": result["attempts"], "cost_estimate": result["cost"],
+        "actual_model": output["actual_model"], "output_text": output["text"], "provider": result["provider"],
+        "request_id": output["request_id"], "usage": output["usage"],
+        "ttft_ms": output["latency_ms"], "attempts": result["attempts"], "cost_estimate": output["cost"],
     })
 
 
@@ -40,18 +53,28 @@ async def stream(request):
     if "model" in body or not isinstance(body.get("prompt"), str) or tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "prompt and valid intellect are required"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream)
+        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), request.app["store"].hedge_delay_ms(), request.app["settings"].first_event_timeout_ms, request.app["settings"].route_attempt_budget)
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
     await sse.prepare(request)
-    for chunk in result["chunks"]:
-        await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
+    attempt = result["attempt"]
+    try:
+        async for chunk in attempt.iter_text():
+            await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
+        output = await attempt.result()
+    except (ConnectionResetError, asyncio.CancelledError):
+        await attempt.close()
+        raise
+    provider = attempt.provider
+    from .upstream import observe
+    observe(request.app["store"], provider, attempt.model, result["fulfilled_intellect"], body, "completed", output=output)
+    request.app["store"].record_health(provider.fingerprint, attempt.model, success=True, real=True, ttft_ms=output["latency_ms"])
     final = {
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
-        "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
-        "attempts": result["attempts"], "request_id": result["request_id"], "usage": result["usage"],
-        "cost_estimate": result["cost"], "ttft_ms": result["latency_ms"],
+        "actual_model": output["actual_model"], "output_text": output["text"], "provider": result["provider"],
+        "attempts": result["attempts"], "request_id": output["request_id"], "usage": output["usage"],
+        "cost_estimate": output["cost"], "ttft_ms": output["latency_ms"],
     }
     await sse.write(f"event: final\ndata: {json.dumps(final)}\n\n".encode())
     await sse.write_eof()
@@ -65,6 +88,7 @@ async def sync(request):
     except Exception:
         return web.json_response({"error": "sync failed"}, status=502)
     providers_now = request.app["store"].inventory()
+    request.app["store"].ensure_health_targets(request.app["clock"]())
     after = {provider["fingerprint"] for provider in providers_now}
     return web.json_response({"added": len(after - before), "updated": len(after & before), "offlined": len(before - after), "inventory_failures": sync_result["inventory_failures"], "last_successful_sync": max((provider["synced_at"] for provider in providers_now), default=None)})
 
@@ -189,12 +213,12 @@ async def apply_catalog(request):
 async def routing(request):
     store = request.app['store']
     if request.method == 'GET':
-        return web.json_response({'race_parallel_cap': store.race_parallel_cap()})
+        return web.json_response({'race_parallel_cap': store.race_parallel_cap(), 'hedge_delay_ms': store.hedge_delay_ms()})
     body = await request.json()
-    if not isinstance(body, dict) or set(body) != {'race_parallel_cap'} or type(body['race_parallel_cap']) is not int or not 1 <= body['race_parallel_cap'] <= 32:
+    if not isinstance(body, dict) or not body or not set(body) <= {'race_parallel_cap', 'hedge_delay_ms'} or ('race_parallel_cap' in body and (type(body['race_parallel_cap']) is not int or not 1 <= body['race_parallel_cap'] <= 32)) or ('hedge_delay_ms' in body and (type(body['hedge_delay_ms']) is not int or not 0 <= body['hedge_delay_ms'] <= 10000)):
         return web.json_response({'error': 'invalid routing policy'}, status=400)
-    store.update_race_parallel_cap(body['race_parallel_cap'])
-    return web.json_response({'race_parallel_cap': store.race_parallel_cap()})
+    store.update_routing(race_parallel_cap=body.get('race_parallel_cap'), hedge_delay_ms=body.get('hedge_delay_ms'))
+    return web.json_response({'race_parallel_cap': store.race_parallel_cap(), 'hedge_delay_ms': store.hedge_delay_ms()})
 
 
 async def update_policy(request):
@@ -226,10 +250,60 @@ async def health(request):
     return web.json_response({"status": "ok"})
 
 
-def create_app(settings: Settings):
-    app = web.Application()
+@web.middleware
+async def json_contract(request, handler):
+    """Keep malformed client JSON inside the Broker's structured error contract."""
+    try:
+        return await handler(request)
+    except (json.JSONDecodeError, UnicodeDecodeError):
+        return web.json_response({"error": "request body must be valid JSON"}, status=400)
+
+
+async def health_results(request):
+    tier = request.query.get("stage")
+    if tier not in ("standard", "smart", "expert"):
+        return web.json_response({"error": "invalid stage"}, status=400)
+    return web.json_response({"items": request.app["store"].health_results(tier, request.query.get("fingerprint"), request.query.get("model"))})
+
+
+async def probe(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {"stage", "mode", "fingerprint", "model", "timeout_ms", "concurrency", "contract", "record"}
+    if not isinstance(body, dict) or not set(body) <= allowed or body.get("stage") not in ("standard", "smart", "expert") or body.get("mode") not in ("race", "all"):
+        return web.json_response({"error": "invalid probe request"}, status=400)
+    timeout_ms = body.get("timeout_ms", request.app["settings"].probe_timeout_ms)
+    concurrency = body.get("concurrency", request.app["settings"].probe_concurrency)
+    contract = body.get("contract", "structured")
+    record = body.get("record", True)
+    if type(timeout_ms) is not int or not 100 <= timeout_ms <= 120_000 or type(concurrency) is not int or not 1 <= concurrency <= 32 or contract not in {"plain", "structured"} or type(record) is not bool:
+        return web.json_response({"error": "invalid probe request"}, status=400)
+    results = await run_probe(request.app["store"], tier=body["stage"], mode=body["mode"], fingerprint=body.get("fingerprint"),
+                              model=body.get("model"), timeout_ms=timeout_ms, concurrency=concurrency, contract=contract, record=record,
+                              clock=request.app["clock"])
+    return web.json_response({"items": results})
+
+
+def create_app(settings: Settings, *, clock=None):
+    app = web.Application(middlewares=[json_contract])
     app["settings"] = settings
     app["store"] = Store(settings.database_path, settings.key_bytes(), settings.parallel_cap)
+    app["clock"] = clock or (lambda: datetime.now(UTC))
+
+    async def start_scheduler(app):
+        app["store"].ensure_health_targets(app["clock"]())
+        app["health_scheduler"] = asyncio.create_task(scheduler(app))
+
+    async def stop_scheduler(app):
+        task = app.get("health_scheduler")
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+
+    app.on_startup.append(start_scheduler)
+    app.on_cleanup.append(stop_scheduler)
     app.router.add_static("/static/", WEB_ROOT)
     app.add_routes([
         web.get("/", home), web.get("/healthz", health),
@@ -239,6 +313,7 @@ def create_app(settings: Settings):
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),
+        web.get("/admin/v1/health", health_results), web.post("/admin/v1/probes", probe),
     ])
     return app
 

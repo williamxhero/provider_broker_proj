@@ -10,7 +10,7 @@ from aiohttp.test_utils import TestClient, TestServer
 from provider_broker.app import create_app
 from provider_broker.db import Store
 from provider_broker.settings import Settings
-from provider_broker.upstream import price_bands
+from provider_broker.upstream import StreamingAttempt, price_bands
 
 
 @pytest.fixture
@@ -36,6 +36,44 @@ async def test_generate_does_not_require_client_bearer(client):
     assert await response.json() == {"error": "prompt and intellect are required; model is not a capability selector"}
 
 
+async def test_generate_rejects_utf8_bom_with_structured_json_error(client):
+    response = await client.post(
+        "/v1/generate",
+        data=b'\xef\xbb\xbf{"prompt":"x","intellect":"standard"}',
+        headers={"Content-Type": "application/json"},
+    )
+    assert response.status == 400
+    assert response.content_type == "application/json"
+    assert await response.json() == {"error": "request body must be valid JSON"}
+
+
+async def test_cancelled_attempt_start_closes_its_session():
+    class StalledSession:
+        def __init__(self):
+            self.started = asyncio.Event()
+            self.closed = False
+
+        async def post(self, *args, **kwargs):
+            self.started.set()
+            await asyncio.Event().wait()
+
+        async def close(self):
+            self.closed = True
+
+    session = StalledSession()
+    provider = SimpleNamespace(
+        models=["gpt-5.6-luna"], provider_type="openai", base_url="http://upstream",
+        request_headers={}, api_key="test-key", multiplier=1, pricing=None,
+    )
+    with patch("provider_broker.upstream.ClientSession", return_value=session):
+        task = asyncio.create_task(StreamingAttempt.start(provider, {"prompt": "x"}))
+        await session.started.wait()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+    assert session.closed is True
+
+
 async def test_console_and_management_api_are_available_without_login(client):
     response = await client.get('/')
     assert response.status == 200
@@ -54,26 +92,61 @@ async def cpa(client):
     async def response(request):
         request.app['last_response_headers'] = dict(request.headers)
         payload=await request.json()
+        request.app['last_response_payload'] = payload
         assert 'tools' not in payload
         if payload.get('input') == 'hold':
             request.app['hold_started'].set()
             await request.app['hold_release'].wait()
-        if payload.get('stream'):
-            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
-            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-one"}\n\n')
-            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-two"}\n\n')
-            await stream.write(b'data: {"type":"response.completed","response":{"id":"req-stream","model":"gpt-5.6-luna","usage":{"input_tokens":3,"output_tokens":2}}}\n\n')
-            await stream.write_eof(); return stream
         if payload.get('input') == 'empty':
             return web.json_response({'id':'req-empty','model':'gpt-5.6-luna','output':[],'usage':{}})
         if payload.get('input') == 'fail-secret':
             return web.json_response({'error':'provider-secret must never escape'},status=500)
         if payload.get('input') == 'mismatch':
             return web.json_response({'id':'req-mismatch','model':'gpt-5.6-terra','output_text':'complete but wrong model','usage':{'input_tokens':2,'output_tokens':3}})
+        try:
+            structured_envelope = json.loads(payload.get('input', ''))
+        except (TypeError, json.JSONDecodeError):
+            structured_envelope = None
+        if isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict):
+            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
+            await stream.write(b'data: {"type":"response.output_text.delta","delta":"{\\"healthy\\":true}"}\n\n')
+            await stream.write((f'data: {{"type":"response.completed","response":{{"id":"req-structured-probe","model":"{payload["model"]}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}\n\n').encode())
+            await stream.write_eof()
+            return stream
+        behavior = request.app.get('hedge_behaviors', {}).get(request.headers.get('Authorization'))
+        if behavior:
+            request.app.setdefault('hedge_requests', []).append(request.headers['Authorization'])
+            if behavior.get('status'):
+                return web.json_response({'error': 'synthetic upstream failure'}, status=behavior['status'])
+            stream = web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            if behavior.get('heartbeat'):
+                await stream.write(b': keepalive\n\n')
+            await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
+            await asyncio.sleep(behavior.get('delay', 0))
+            if behavior.get('close_without_text'):
+                await stream.write_eof(); return stream
+            if behavior.get('failure'):
+                await stream.write(b'data: {not-json}\n\n'); await stream.write_eof(); return stream
+            await stream.write((f'data: {{"type":"response.output_text.delta","delta":"{behavior.get("text", "ok")}"}}\n\n').encode())
+            await asyncio.sleep(behavior.get('tail_delay', 0))
+            try:
+                await stream.write((f'data: {{"type":"response.completed","response":{{"id":"hedge","model":"{payload["model"]}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}\n\n').encode())
+                await stream.write_eof()
+            except ConnectionResetError:
+                pass
+            return stream
+        if payload.get('stream'):
+            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-one"}\n\n')
+            await stream.write(b'data: {"type":"response.output_text.delta","delta":"upstream-two"}\n\n')
+            await stream.write((f'data: {{"type":"response.completed","response":{{"id":"req-stream","model":"{payload.get("model", "gpt-5.6-luna")}","usage":{{"input_tokens":3,"output_tokens":2}}}}}}\n\n').encode())
+            await stream.write_eof(); return stream
         return web.json_response({'id':'req-test','model':payload.get('model','gpt-5.6-luna'),'output':[{'type':'message','content':[{'type':'output_text','text':'hello broker'}]}],'usage':{'output_tokens':2}})
     upstream=web.Application(); app['upstream_app']=upstream; upstream.router.add_post('/v1/responses',response)
     async def chat(request):
         payload=await request.json(); assert 'tools' not in payload
+        request.app['last_chat_payload'] = payload
         return web.json_response({'id':'req-chat','model':'gpt-5.6-luna','choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
     upstream.router.add_post('/v1/chat/completions',chat)
     async def models(request): return web.json_response({'data':[{'id': model} for model in request.app.get('models', ['gpt-5.6-luna'])]})
@@ -102,12 +175,12 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     result=await client.post('/v1/generate',json={'prompt':'hi','intellect':'standard','effort':'medium'})
     result_body=await result.json()
     assert result_body['actual_model'] == 'gpt-5.6-luna'
-    assert result_body['request_id'] == 'req-test'
-    assert result_body['usage'] == {'output_tokens':2}
+    assert result_body['request_id'] == 'req-stream'
+    assert result_body['usage'] == {'input_tokens':3, 'output_tokens':2}
     assert result_body['ttft_ms'] >= 0
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
-    assert audit['output_tokens']==2 and audit['request_id']=='req-test' and audit['cost'] is None
+    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] is not None
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
     streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
@@ -167,6 +240,29 @@ async def test_generate_parses_chat_completions_without_native_tools(client, cpa
     assert result.status == 200 and body['output_text'] == 'hello chat' and body['request_id'] == 'req-chat'
 
 
+async def test_schema_envelope_requires_json_before_a_chat_provider_can_win(client, cpa):
+    cpa.app['config'] = {'claude-api-key': [{'name': 'Claude compatible', 'base_url': cpa.app['upstream'], 'api_key': 'claude-secret'}]}
+    assert (await client.post('/admin/v1/sync')).status == 200
+    prompt = json.dumps({
+        'instruction': 'Return only one JSON object matching output_schema.',
+        'output_schema': {'type': 'object', 'required': ['reply'], 'properties': {'reply': {'type': 'string'}}},
+        'input': {'request': 'test'},
+    })
+
+    response = await client.post('/v1/generate', json={'prompt': prompt, 'intellect': 'standard'})
+
+    assert response.status == 503
+    assert await response.json() == {
+        'error': 'all eligible providers failed',
+        'attempts': [{'provider': 'Claude compatible', 'status': 'structured_output_invalid'}],
+    }
+    response_format = cpa.app['upstream_app']['last_chat_payload']['response_format']
+    assert response_format['type'] == 'json_schema'
+    assert response_format['json_schema']['schema']['required'] == ['reply']
+    audit = (await (await client.get('/admin/v1/calls?limit=1')).json())['items'][0]
+    assert audit['diagnostic']['structured_error_kind'] == 'json_decode'
+
+
 async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     headers={'Authorization':'Bearer admin-secret'}
     await client.post('/admin/v1/sync',headers=headers)
@@ -181,23 +277,75 @@ async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     assert empty.status == 503
     empty_audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert empty_audit['status'] == 'protocol_failed'
+    diagnostic = audit['diagnostic']
+    assert diagnostic['endpoint'] == '/responses' and diagnostic['http_status'] == 500
+    assert 'provider-secret' not in str(diagnostic)
 
 
-async def test_model_mismatch_is_completed_but_blocked_until_manual_sync(client, cpa):
+async def test_model_upgrade_is_accepted_and_recorded_as_fulfilled_intellect(client, cpa):
     headers={'Authorization':'Bearer admin-secret'}
     await client.post('/admin/v1/sync',headers=headers)
     request={'prompt':'mismatch','intellect':'standard'}
     first=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json=request)
-    assert first.status == 503
+    body = await first.json()
+    assert first.status == 200
+    assert body['actual_model'] == 'gpt-5.6-terra'
+    assert body['fulfilled_intellect'] == 'smart'
     audit=(await (await client.get('/admin/v1/calls?limit=10',headers=headers)).json())['items']
     assert len(audit)==1 and audit[0]['status']=='completed'
     assert audit[0]['requested_model']=='gpt-5.6-luna' and audit[0]['actual_model']=='gpt-5.6-terra'
-    second=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json=request)
-    assert second.status == 503 and (await second.json())['attempts'] == []
-    await client.post('/admin/v1/sync',headers=headers)
-    third=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json=request)
-    assert third.status == 503
-    assert len((await (await client.get('/admin/v1/calls?limit=10',headers=headers)).json())['items']) == 2
+    health = await client.get('/admin/v1/health?stage=standard', headers=headers)
+    assert (await health.json())['items'][0]['state'] == 'healthy'
+
+
+async def test_manual_probe_can_target_an_open_provider(client, cpa):
+    await client.post('/admin/v1/sync')
+    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    store = client.app['store']
+    store.record_health(provider['fingerprint'], 'gpt-5.6-luna', success=False, real=True, immediate_open=True)
+
+    probe = await client.post('/admin/v1/probes', json={
+        'stage': 'standard', 'mode': 'all', 'fingerprint': provider['fingerprint'],
+        'model': 'gpt-5.6-luna', 'timeout_ms': 10_000, 'concurrency': 1,
+    })
+
+    body = await probe.json()
+    assert probe.status == 200
+    assert len(body['items']) == 1
+    assert body['items'][0]['model'] == 'gpt-5.6-luna'
+
+
+async def test_plain_diagnostic_probe_does_not_mutate_health(client, cpa):
+    await client.post('/admin/v1/sync')
+    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    before = client.app['store'].health(provider['fingerprint'], 'gpt-5.6-luna')
+
+    response = await client.post('/admin/v1/probes', json={
+        'stage': 'standard', 'mode': 'all', 'fingerprint': provider['fingerprint'],
+        'model': 'gpt-5.6-luna', 'timeout_ms': 10_000, 'concurrency': 1,
+        'contract': 'plain', 'record': False,
+    })
+
+    assert response.status == 200 and len((await response.json())['items']) == 1
+    assert client.app['store'].health(provider['fingerprint'], 'gpt-5.6-luna') == before
+
+
+async def test_manual_probe_is_isolated_from_call_quality_and_records_health(client, cpa):
+    headers = {'Authorization': 'Bearer admin-secret'}
+    await client.post('/admin/v1/sync', headers=headers)
+    before = await (await client.get('/admin/v1/quality?window=24h', headers=headers)).json()
+    probe = await client.post('/admin/v1/probes', headers=headers, json={'stage': 'standard', 'mode': 'all'})
+    result = await probe.json()
+    assert probe.status == 200 and len(result['items']) == 1 and result['items'][0]['state'] == 'succeeded'
+    envelope = json.loads(cpa.app['upstream_app']['last_response_payload']['input'])
+    assert envelope['output_schema'] == {
+        'type': 'object', 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}},
+        'additionalProperties': False,
+    }
+    after = await (await client.get('/admin/v1/quality?window=24h', headers=headers)).json()
+    assert after == before
+    health = await (await client.get('/admin/v1/health?stage=standard', headers=headers)).json()
+    assert health['items'][0]['state'] == 'healthy' and health['items'][0]['ttft_ms'] is not None
 
 
 async def test_web_console_is_direct_and_management_api_needs_no_session(client):
@@ -415,14 +563,133 @@ async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
     ]}]}
     headers = {'Authorization': 'Bearer admin-secret'}
     assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
-    assert await (await client.patch('/admin/v1/routing', headers=headers, json={'race_parallel_cap': 1})).json() == {'race_parallel_cap': 1}
-    assert await (await client.get('/admin/v1/routing', headers=headers)).json() == {'race_parallel_cap': 1}
+    assert await (await client.patch('/admin/v1/routing', headers=headers, json={'race_parallel_cap': 1})).json() == {'race_parallel_cap': 1, 'hedge_delay_ms': 750}
+    assert await (await client.get('/admin/v1/routing', headers=headers)).json() == {'race_parallel_cap': 1, 'hedge_delay_ms': 750}
     with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: [next(provider for provider in providers if provider.api_key == 'high-key')]) as sample:
         result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'random', 'intellect': 'standard'})
 
     assert result.status == 200
-    assert sample.call_args.kwargs['k'] == 1
+    assert sample.call_args.kwargs['k'] == 2
     assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
+
+
+async def test_delayed_hedge_skips_second_key_when_first_has_valid_first_text(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Hedge', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'first-key', 'models': ['gpt-5.6-luna']}, {'key': 'second-key', 'models': ['gpt-5.6-luna']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer first-key': {'delay': .01, 'tail_delay': .05, 'text': 'first'}, 'Bearer second-key': {'delay': .01, 'text': 'second'}}
+    await client.post('/admin/v1/sync')
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 2, 'hedge_delay_ms': 100})
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: providers[:k]):
+        response = await client.post('/v1/generate', json={'prompt': 'hedge', 'intellect': 'standard'})
+    assert response.status == 200 and (await response.json())['output_text'] == 'first'
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer first-key']
+
+
+async def test_delayed_hedge_starts_second_key_and_uses_its_earlier_first_text(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Hedge', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'slow-key', 'models': ['gpt-5.6-luna']}, {'key': 'fast-key', 'models': ['gpt-5.6-luna']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer slow-key': {'delay': .2, 'text': 'slow'}, 'Bearer fast-key': {'delay': .01, 'text': 'fast'}}
+    await client.post('/admin/v1/sync')
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 2, 'hedge_delay_ms': 30})
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: providers[:k]):
+        response = await client.post('/v1/generate', json={'prompt': 'hedge', 'intellect': 'standard'})
+    assert response.status == 200 and (await response.json())['output_text'] == 'fast'
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer slow-key', 'Bearer fast-key']
+
+
+async def test_sse_without_valid_output_times_out_and_releases_slot_to_next_candidate(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Fallback', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'bad-key', 'models': ['gpt-5.6-terra']},
+        {'key': 'silent-key', 'models': ['gpt-5.6-terra']},
+        {'key': 'healthy-key', 'models': ['gpt-5.6-terra']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        'Bearer bad-key': {'status': 400},
+        'Bearer silent-key': {'heartbeat': True, 'delay': .3, 'close_without_text': True},
+        'Bearer healthy-key': {'delay': .01, 'text': 'recovered'},
+    }
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
+    client.app['settings'] = SimpleNamespace(**(client.app['settings'].__dict__ | {'first_event_timeout_ms': 40}))
+    await client.post('/admin/v1/sync')
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 1, 'hedge_delay_ms': 10})
+
+    started = asyncio.get_running_loop().time()
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: providers[:k]):
+        response = await client.post('/v1/generate', json={'prompt': 'fallback', 'intellect': 'smart', 'deadline_ms': 1000})
+    elapsed = asyncio.get_running_loop().time() - started
+
+    body = await response.json()
+    assert response.status == 200 and body['output_text'] == 'recovered'
+    assert elapsed < .2
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer bad-key', 'Bearer silent-key', 'Bearer healthy-key']
+    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable', 'first_token_timeout', 'completed']
+
+
+async def test_route_continues_past_twelve_failed_candidates(client, cpa):
+    keys = [f'failed-{index}' for index in range(12)] + ['healthy-key']
+    cpa.app['config'] = {'providers': [{'name': 'Attempt budget', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': key, 'models': ['gpt-5.6-terra']} for key in keys
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        **{f'Bearer failed-{index}': {'status': 400} for index in range(12)},
+        'Bearer healthy-key': {'delay': .01, 'text': 'later-candidate-wins'},
+    }
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
+    await client.post('/admin/v1/sync')
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 2, 'hedge_delay_ms': 0})
+
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: providers[:k]):
+        response = await client.post('/v1/generate', json={
+            'prompt': 'attempt-budget', 'intellect': 'smart', 'effort': 'medium', 'deadline_ms': 1000,
+        })
+
+    body = await response.json()
+    assert response.status == 200 and body['output_text'] == 'later-candidate-wins'
+    assert cpa.app['upstream_app']['hedge_requests'] == [f'Bearer {key}' for key in keys]
+    assert [attempt['status'] for attempt in body['attempts']].count('unavailable') == 12
+
+
+async def test_race_prefers_a_candidate_with_real_success_evidence(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Quality order', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'unknown-key', 'models': ['gpt-5.6-terra']},
+        {'key': 'proven-key', 'models': ['gpt-5.6-terra']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        'Bearer unknown-key': {'status': 400},
+        'Bearer proven-key': {'delay': .01, 'text': 'proven-wins'},
+    }
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
+    await client.post('/admin/v1/sync')
+    proven = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'proven-key')
+    client.app['store'].record_health(proven.fingerprint, proven.models[0], success=True, real=True, ttft_ms=10)
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 1, 'hedge_delay_ms': 100})
+
+    with patch('provider_broker.upstream.random.sample', side_effect=lambda providers, k: providers[:k]):
+        response = await client.post('/v1/generate', json={'prompt': 'quality', 'intellect': 'smart'})
+
+    assert response.status == 200 and (await response.json())['output_text'] == 'proven-wins'
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer proven-key']
+
+
+async def test_medium_effort_gets_a_larger_first_output_budget(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Slow reasoning', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'slow-reasoning-key', 'models': ['gpt-5.6-terra']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        'Bearer slow-reasoning-key': {'delay': .06, 'text': 'reasoning-complete'},
+    }
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
+    client.app['settings'] = SimpleNamespace(**(client.app['settings'].__dict__ | {'first_event_timeout_ms': 40}))
+    await client.post('/admin/v1/sync')
+
+    response = await client.post('/v1/generate', json={
+        'prompt': 'slow-medium', 'intellect': 'smart', 'effort': 'medium', 'deadline_ms': 500,
+    })
+
+    assert response.status == 200
+    assert (await response.json())['output_text'] == 'reasoning-complete'
 
 
 def test_price_bands_mix_models_and_split_all_key_prices_at_the_median():

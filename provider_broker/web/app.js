@@ -3,9 +3,10 @@ const sortDefaults = {
   providers: { key: "note", direction: "asc" },
   catalog: { key: "model", direction: "asc" },
   modelView: { key: "intellect", direction: "asc" },
+  probeResults: { key: "provider", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, summary: {}, sorts: {} };
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, summary: {}, sorts: {}, probeResults: [] };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
@@ -45,6 +46,27 @@ function restoreControls() {
   state.qualityWindow = preferences.qualityWindow || state.qualityWindow;
   state.sorts = { ...sortDefaults, ...(preferences.sorts || {}) };
   setQualityWindow(state.qualityWindow);
+  if (preferences.probeStage) byId("probe-stage").value = preferences.probeStage;
+}
+
+function renderProbeResults(items = state.probeResults) {
+  state.probeResults = items;
+  const table = byId("probe-results");
+  const columns = [{ key: "provider", label: "Provider" }, { key: "model", label: "模型" }, { key: "state", label: "健康" }, { key: "last_probe_at", label: "最近探针" }, { key: "ttft_ms", label: "TTFT" }, { key: "error_type", label: "结果" }];
+  const body = tableHead(table, columns, "probeResults", () => renderProbeResults());
+  sortItems(items, "probeResults", (item, key) => item[key]).forEach((item) => {
+    const row = document.createElement("tr");
+    [item.provider, item.model, item.state, formatShanghaiTime(item.last_probe_at), formatMs(item.ttft_ms), displayStatus(item.error_type) === "n/a" ? "成功" : displayStatus(item.error_type)].forEach((value) => row.append(cell(value)));
+    body.append(row);
+  });
+}
+
+async function loadProbeResults() {
+  const stage = byId("probe-stage").value;
+  preferences.probeStage = stage;
+  savePreferences();
+  const payload = await requestJson(`/admin/v1/health?stage=${encodeURIComponent(stage)}`);
+  renderProbeResults(payload.items);
 }
 
 function persistControl(id) {
@@ -416,6 +438,7 @@ async function load() {
   renderModelView();
   renderQuality(quality);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
+  byId("hedge-delay-ms").value = routing.hedge_delay_ms;
   await loadCalls("");
 }
 
@@ -437,10 +460,22 @@ byId("policy").addEventListener("submit", async (event) => {
 
 byId("save-routing").addEventListener("click", async () => {
   const race_parallel_cap = Number(byId("race-parallel-cap").value);
-  const result = await requestJson("/admin/v1/routing", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ race_parallel_cap }) });
+  const hedge_delay_ms = Number(byId("hedge-delay-ms").value);
+  const result = await requestJson("/admin/v1/routing", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ race_parallel_cap, hedge_delay_ms }) });
   byId("race-parallel-cap").value = result.race_parallel_cap;
-  byId("syncresult").textContent = `同价竞速 Key 数已设为 ${result.race_parallel_cap}`;
+  byId("hedge-delay-ms").value = result.hedge_delay_ms;
+  byId("syncresult").textContent = `同价竞速 Key 数已设为 ${result.race_parallel_cap}，对冲延迟 ${result.hedge_delay_ms} ms`;
 });
+byId("probe-stage").addEventListener("change", () => loadProbeResults().catch(() => { byId("proberesult").textContent = "健康数据加载失败"; }));
+["race", "all"].forEach((mode) => byId(`probe-${mode}`).addEventListener("click", async () => {
+  const output = byId("proberesult");
+  output.textContent = "正在执行探针…";
+  try {
+    const result = await requestJson("/admin/v1/probes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage: byId("probe-stage").value, mode }) });
+    output.textContent = `已完成 ${result.items.length} 个探针`;
+    await loadProbeResults();
+  } catch (_) { output.textContent = "探针执行失败"; }
+}));
 
 byId("catalog-create").addEventListener("click", () => openCatalogEditor());
 byId("catalog-apply").addEventListener("click", async () => {

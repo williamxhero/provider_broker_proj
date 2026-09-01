@@ -38,8 +38,41 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 1. 先找 `standard` 下可路由的 Key：已启用、已校准、该 Key 有此分组模型、未被模型履约校验拉黑、且未达到单 Key 并发上限。
 2. 所有这些 Key 不按模型隔离；按“该模型整合价 × Key 倍率”算路由价格，用中位数切成低价组、高价组。
-3. 先从低价组随机抽取全局设定的 N 个 Key 并发竞速。谁先返回、且实际模型与该 Key 要求模型一致，谁获胜；其余请求取消。
-4. 本批全部失败或模型不符，才进入高价组；当前批中未被抽到的低价 Key 不会继续补抽。
+3. 将低价组中健康且有容量的 Key 先随机打散，再按真实成功证据、平滑成功率和 TTFT 稳定排序；同质量候选仍保持随机负载均衡。`race_parallel_cap`（N）只限制同时运行的候选数。先启动第一个候选；若在路由设置的 `hedge_delay_ms`（默认 750 ms）内没有可验证的有效首字且仍有并发槽位，启动下一个候选。候选失败或超过首有效输出时限后会释放槽位，并立即由队列中的下一个健康候选补位。候选必须产生非空文本 token，且实际模型满足请求档位才能获胜；其余已启动请求取消。`hedge_delay_ms=0` 时立即并发启动最多 N 个候选。`unknown` 与 `suspect` 仍可参与路由，`open` 熔断的 Provider/model 不参与正常路由。
+4. 当前低价组的候选队列耗尽、达到整请求尝试预算（默认 32）或 deadline 后，才进入高价组。
 5. `standard` 两个价格组都失败后，依次降级尝试 `smart`、`expert`，每个 stage 同样遵循低价组再高价组。
 6. 全部失败则返回 503。
 7. `effort=medium` 不参与 Key 选择、价格分组或竞速；它仅透传给 OpenAI 兼容上游的 `reasoning.effort`。Anthropic 兼容调用目前不使用它。
+
+## 自适应健康探针与熔断
+
+`/models` 仍然只负责发现 Provider 声明的模型库存；它不代表某个 API Key 能真实完成生成。Broker 因此为每个 **Provider + model** 维护独立健康状态，并将业务调用的被动证据与主动探针严格分开。
+
+- 正常生成请求内部统一请求上游流式响应，记录真实的首个非空文本 token 延迟（TTFT）、实际模型和调用结果。普通调用继续写入调用记录、质量统计和费用统计。
+- 新同步到的 Provider/model 会进入 `unknown`，并被安排验证；已有真实业务成功时会转为 `healthy`，不需要为每次请求额外付费探测。
+- 一次可归因失败会转为 `suspect`，仍可参与路由；连续三次失败会转为 `open`，从正常路由中排除。实际模型不匹配会保留原有的 route block，并立即打开该 model 的健康熔断。
+- `open` 状态在冷却期后由恢复探针检查。成功探针进入 `half_open`，随后一个真实成功调用恢复为 `healthy`；失败则按 2、5、15、30、60 分钟的退避序列再次冷却。
+- 后台调度器只探测新目标、过期的被动证据、异常目标和到期的熔断恢复项，并增加少量抖动；不会每分钟扫描并付费请求全部 Key。
+- 探针使用固定提示词 `只输出1`、禁用工具、一个可见输出 token、低推理强度与流式协议。探针事件单独存储，绝不写入普通调用、质量汇总、普通成本或 route block。
+
+### 管理接口
+
+查看某个 Stage 的最新健康证据：
+
+```bash
+curl 'http://yosef-server:8817/admin/v1/health?stage=standard'
+```
+
+手动进行一次与生产价格组选择相同的竞速探针：
+
+```bash
+curl -X POST http://yosef-server:8817/admin/v1/probes \
+  -H 'Content-Type: application/json' \
+  -d '{"stage":"standard","mode":"race"}'
+```
+
+`mode: "all"` 会逐个检查指定 Stage 的所有可探测 Provider/model；两个模式都可附加 `fingerprint`、`model`、`timeout_ms` 和 `concurrency` 以缩小范围或控制执行上限。管理台的 Stage 视角提供相同的竞速探针、全量探针和最新结果表，并保存选定 Stage 与表格排序。
+
+可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（被动证据陈旧阈值，默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（基础首输出上限，默认 20000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（整请求最多启动的候选数，默认 32）。基础首输出上限按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；它只约束竞速获胜前，已开始正常输出的结构化生成仍使用整请求 deadline。
+
+路由设置接口 `GET/PATCH /admin/v1/routing` 同时管理 `race_parallel_cap` 与 `hedge_delay_ms`；两项可单独更新，后者的可选范围为 0–10000 ms。
