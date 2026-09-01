@@ -206,6 +206,52 @@ class Store:
         else:
             self._inflight[provider.fingerprint] = active - 1
 
+    def route_score(self, provider: Provider, requested_model: str, body: dict) -> int:
+        """Rank same-band candidates using recent, safe request-shape outcomes."""
+        prompt = body.get('prompt') if isinstance(body.get('prompt'), str) else ''
+        schema = body.get('output_schema') if isinstance(body.get('output_schema'), dict) else None
+        if schema is None:
+            try:
+                envelope = json.loads(prompt)
+            except (TypeError, ValueError):
+                envelope = None
+            embedded = envelope.get('output_schema') if isinstance(envelope, dict) else None
+            schema = embedded if isinstance(embedded, dict) else None
+        prompt_sha256 = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        schema_sha256 = None
+        if schema is not None:
+            encoded = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            schema_sha256 = hashlib.sha256(encoded).hexdigest()
+        rows = self.conn.execute("""
+            SELECT actual_model,status,diagnostic_json
+            FROM observation
+            WHERE fingerprint=? AND requested_model=? AND created_at>=datetime('now','-24 hours')
+            ORDER BY id DESC LIMIT 100
+        """, (provider.fingerprint, requested_model)).fetchall()
+        score = 0
+        for row in rows:
+            try:
+                diagnostic = json.loads(row['diagnostic_json']) if row['diagnostic_json'] else {}
+            except (TypeError, ValueError):
+                diagnostic = {}
+            exact_shape = (
+                diagnostic.get('prompt_sha256') == prompt_sha256
+                and diagnostic.get('schema_sha256') == schema_sha256
+            )
+            fulfilled = row['status'] == 'completed' and row['actual_model'] == requested_model
+            if exact_shape:
+                if fulfilled:
+                    score += 1000
+                elif row['status'] == 'structured_output_invalid':
+                    score -= 100
+                else:
+                    score -= 20
+            elif fulfilled:
+                score += 10
+            else:
+                score -= 1
+        return score
+
     def block_route(self, fingerprint: str, model: str):
         with self.conn:
             self.conn.execute('INSERT OR REPLACE INTO route_block(fingerprint,model) VALUES(?,?)',(fingerprint,model))

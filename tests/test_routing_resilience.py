@@ -1,4 +1,5 @@
 import asyncio
+import hashlib
 import json
 from types import SimpleNamespace
 from unittest.mock import patch
@@ -8,6 +9,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from provider_broker.app import create_app
+from provider_broker.db import Store
 from provider_broker.settings import Settings
 from provider_broker.upstream import (
     AttemptFailure,
@@ -44,6 +46,7 @@ class FakeStore:
         self.tier = tier
         self.inflight = {}
         self.observations = []
+        self.route_scores = {}
 
     def providers(self, tier):
         return self.items if tier == self.tier else []
@@ -65,6 +68,9 @@ class FakeStore:
 
     def block_route(self, *_):
         pass
+
+    def route_score(self, item, _model, _body):
+        return self.route_scores.get(item.id, 0)
 
 
 def completed(text="recovered"):
@@ -660,6 +666,84 @@ async def test_json_decode_repair_precedes_untried_unhealthy_candidates():
     assert result["text"] == '{"answer":"recovered"}'
     assert order == [0, 0]
     assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+
+
+async def test_recent_exact_winner_is_ranked_before_random_same_band_candidates():
+    unhealthy = provider(0, secret="unhealthy-first")
+    exact_winner = provider(1, secret="exact-winner")
+    store = FakeStore([unhealthy, exact_winner])
+    store.route_scores = {0: -10, 1: 1000}
+    order = []
+
+    async def invoke(item, _body):
+        order.append(item.id)
+        if item.id == 1:
+            return completed()
+        raise AttemptFailure("unavailable", diagnostic={"http_status": 503})
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "same exact request", "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0,
+            route_attempt_budget=1, response_reserve_ms=0,
+        )
+
+    assert result["text"] == "recovered"
+    assert order == [1]
+
+
+async def test_recent_exact_winner_gets_one_priority_transient_retry():
+    exact_winner = provider(0, secret="exact-winner")
+    untried = provider(1, secret="untried")
+    store = FakeStore([exact_winner, untried])
+    store.route_scores = {0: 1000, 1: 0}
+    order = []
+
+    async def invoke(item, _body):
+        order.append(item.id)
+        if item.id == 0 and order.count(0) == 1:
+            raise AttemptFailure("first_token_timeout", diagnostic={"first_event_timeout_ms": 60_000})
+        if item.id == 0:
+            return completed()
+        raise AttemptFailure("unavailable", diagnostic={"http_status": 503})
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "same exact request", "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0,
+            route_attempt_budget=2, response_reserve_ms=0,
+        )
+
+    assert result["text"] == "recovered"
+    assert order == [0, 0]
+    assert [row["status"] for row in result["attempts"]] == ["first_token_timeout", "completed"]
+    assert [row["diagnostic"]["queue_kind"] for row in result["attempts"]] == ["primary", "priority_retry"]
+
+
+def test_route_score_uses_only_safe_exact_request_shape_history(tmp_path):
+    store = Store(tmp_path / "broker.sqlite3", b"x" * 32)
+    exact_winner = provider(0, secret="exact-winner")
+    invalid = provider(1, secret="invalid")
+    schema = {"type": "object", "required": ["answer"], "properties": {"answer": {"type": "string"}}}
+    body = {"prompt": "same exact request", "output_schema": schema}
+    diagnostic = {
+        "prompt_sha256": hashlib.sha256(body["prompt"].encode()).hexdigest(),
+        "schema_sha256": hashlib.sha256(json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(",", ":")).encode()).hexdigest(),
+    }
+
+    def observe(item, status, actual_model):
+        store.observe(
+            fingerprint=item.fingerprint, requested_model="gpt-5.6-luna", actual_model=actual_model,
+            tier="standard", effort="medium", success=int(status == "completed"), latency_ms=1,
+            error=None, status=status, input_tokens=None, output_tokens=None, cost=None,
+            request_id=f"safe-{item.id}", diagnostic_json=json.dumps(diagnostic),
+        )
+
+    observe(exact_winner, "completed", "gpt-5.6-luna")
+    observe(invalid, "structured_output_invalid", None)
+
+    assert store.route_score(exact_winner, "gpt-5.6-luna", body) == 1000
+    assert store.route_score(invalid, "gpt-5.6-luna", body) == -100
 
 
 async def test_route_reserves_time_to_serialize_and_transmit_before_client_deadline():

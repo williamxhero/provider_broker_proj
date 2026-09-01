@@ -35,6 +35,7 @@ DIAGNOSTIC_FIELDS = {
     "normalized_properties",
     "client_deadline_ms", "route_budget_ms", "response_reserve_ms",
     "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
+    "route_score", "queue_kind",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -484,11 +485,12 @@ class AttemptAudit:
         self.route_started = route_started
         self.rows = {}
 
-    def start(self, sequence: int, provider):
+    def start(self, sequence: int, provider, *, queue_kind: str, route_score: int):
         self.rows[sequence] = {
             "attempt": sequence + 1, "provider": provider.name,
             "model": canonicalize(provider.models[0]),
             "started_ms": round((time.monotonic() - self.route_started) * 1000, 2),
+            "diagnostic": {"queue_kind": queue_kind, "route_score": route_score},
             "_started": time.monotonic(),
         }
 
@@ -500,7 +502,8 @@ class AttemptAudit:
             row["actual_model"] = output["actual_model"]
         if fulfilled is not None:
             row["fulfilled"] = fulfilled
-        safe = sanitize_diagnostic(diagnostic or {})
+        incoming = {key: value for key, value in (diagnostic or {}).items() if value is not None}
+        safe = sanitize_diagnostic(row.get("diagnostic", {}) | incoming)
         if safe:
             row["diagnostic"] = safe
 
@@ -552,25 +555,54 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     tiers = ("standard", "smart", "expert")
     primary = deque()
     repair = deque()
+    priority_retry = deque()
     retry = deque()
     retries_scheduled = set()
+    route_scores = {}
+
+    def candidate_score(provider, candidate_tier):
+        key = (provider.fingerprint, canonicalize(provider.models[0]), candidate_tier)
+        if key not in route_scores:
+            route_scores[key] = store.route_score(provider, key[1], body)
+        return route_scores[key]
+
     for candidate_tier in tiers[tiers.index(tier):]:
         for band in price_bands(store.providers(candidate_tier)):
             available = [provider for provider in band if store.has_capacity(provider)]
-            primary.extend((provider, candidate_tier, None) for provider in random.sample(available, k=len(available)))
+            randomized = random.sample(available, k=len(available))
+            ranked = sorted(
+                randomized,
+                key=lambda provider: candidate_score(provider, candidate_tier),
+                reverse=True,
+            )
+            primary.extend(
+                (provider, candidate_tier, None, candidate_score(provider, candidate_tier))
+                for provider in ranked
+            )
 
     active = {}
     next_hedge_at = route_started
 
     def launch_one():
         nonlocal attempts_started, next_hedge_at
-        while (repair or primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
-            provider, candidate_tier, repair_note = repair.popleft() if repair else primary.popleft() if primary else retry.popleft()
+        while (repair or priority_retry or primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
+            if repair:
+                provider, candidate_tier, repair_note, route_score = repair.popleft()
+                queue_kind = "repair"
+            elif priority_retry:
+                provider, candidate_tier, repair_note, route_score = priority_retry.popleft()
+                queue_kind = "priority_retry"
+            elif primary:
+                provider, candidate_tier, repair_note, route_score = primary.popleft()
+                queue_kind = "primary"
+            else:
+                provider, candidate_tier, repair_note, route_score = retry.popleft()
+                queue_kind = "retry"
             if not store.try_acquire(provider):
                 continue
             sequence = attempts_started
             attempts_started += 1
-            audit.start(sequence, provider)
+            audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)
 
             async def run(selected=provider, selected_repair_note=repair_note):
                 try:
@@ -605,7 +637,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     launch_one()
     try:
-        while active or repair or primary or retry:
+        while active or repair or priority_retry or primary or retry:
             now = time.monotonic()
             if now >= route_deadline or attempts_started >= attempt_budget and not active:
                 if active:
@@ -615,7 +647,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if not launch_one():
                     break
                 continue
-            can_hedge = bool(repair or primary or retry) and attempts_started < attempt_budget and len(active) < cap
+            can_hedge = bool(repair or priority_retry or primary or retry) and attempts_started < attempt_budget and len(active) < cap
             timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
             done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if not done:
@@ -637,8 +669,9 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     retry_key = (provider.fingerprint, requested_model, candidate_tier)
                     if retryable_attempt(exc) and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
-                        target = repair if exc.repair_note else retry
-                        target.append((provider, candidate_tier, exc.repair_note))
+                        route_score = candidate_score(provider, candidate_tier)
+                        target = repair if exc.repair_note else priority_retry if route_score >= 500 else retry
+                        target.append((provider, candidate_tier, exc.repair_note, route_score))
                     continue
                 if output["actual_model"] != requested_model:
                     store.block_route(provider.fingerprint, requested_model)
@@ -664,7 +697,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
                 }
 
-            while len(active) < cap and attempts_started < attempt_budget and (repair or primary or retry):
+            while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or retry):
                 if not launch_one():
                     break
                 if hedge_delay_ms > 0:
