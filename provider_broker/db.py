@@ -77,6 +77,18 @@ class Store:
         );
         CREATE INDEX IF NOT EXISTS provider_health_due ON provider_health(next_probe_at);
         CREATE INDEX IF NOT EXISTS probe_event_target ON probe_event(fingerprint, model, id DESC);
+        CREATE TABLE IF NOT EXISTS balance_site (
+          id TEXT PRIMARY KEY, name TEXT NOT NULL, adapter TEXT NOT NULL, base_url TEXT NOT NULL,
+          currency TEXT NOT NULL, low_threshold REAL NOT NULL, enabled INTEGER NOT NULL DEFAULT 1,
+          credential BLOB, last_balance REAL, last_checked_at TEXT, last_error TEXT,
+          low_alert_active INTEGER NOT NULL DEFAULT 0, last_notification_at TEXT, notification_error TEXT
+        );
+        CREATE TABLE IF NOT EXISTS balance_snapshot (
+          id INTEGER PRIMARY KEY, site_id TEXT NOT NULL REFERENCES balance_site(id), balance REAL NOT NULL,
+          checked_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS balance_setting (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+        CREATE INDEX IF NOT EXISTS balance_snapshot_site_time ON balance_snapshot(site_id, id DESC);
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
@@ -100,6 +112,12 @@ class Store:
             )
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('race_parallel_cap',?)", (str(self.default_race_parallel_cap),))
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('hedge_delay_ms','750')")
+        from .balances import SITES
+        self.conn.executemany(
+            """INSERT OR IGNORE INTO balance_site(id,name,adapter,base_url,currency,low_threshold)
+               VALUES(?,?,?,?,?,?)""",
+            [(site.id, site.name, site.adapter, site.base_url, site.currency, site.default_threshold) for site in SITES],
+        )
         self.conn.commit()
 
     @staticmethod
@@ -272,6 +290,91 @@ class Store:
 
     def _decrypt(self, value: bytes) -> str:
         return self.aes.decrypt(value[:12], value[12:], None).decode()
+
+    def balance_sites(self) -> list[dict]:
+        rows = self.conn.execute("SELECT * FROM balance_site ORDER BY rowid").fetchall()
+        return [{
+            "id": row["id"], "name": row["name"], "currency": row["currency"], "low_threshold": row["low_threshold"],
+            "enabled": bool(row["enabled"]), "configured": row["credential"] is not None, "last_balance": row["last_balance"],
+            "last_checked_at": row["last_checked_at"], "last_error": row["last_error"], "low": bool(row["low_alert_active"]),
+            "last_notification_at": row["last_notification_at"], "notification_error": row["notification_error"],
+        } for row in rows]
+
+    def balance_site_secret(self, site_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM balance_site WHERE id=?", (site_id,)).fetchone()
+        if row is None:
+            return None
+        credential = None
+        if row["credential"] is not None:
+            try:
+                credential = json.loads(self._decrypt(row["credential"]))
+            except Exception:
+                credential = None
+        return {"id": row["id"], "name": row["name"], "adapter": row["adapter"], "base_url": row["base_url"],
+                "currency": row["currency"], "low_threshold": row["low_threshold"], "credential": credential}
+
+    def update_balance_site(self, site_id: str, *, low_threshold: float | None = None, enabled: bool | None = None) -> bool:
+        if low_threshold is None and enabled is None:
+            return False
+        assignments, params = [], []
+        if low_threshold is not None:
+            assignments.append("low_threshold=?"); params.append(low_threshold)
+        if enabled is not None:
+            assignments.append("enabled=?"); params.append(int(enabled))
+        params.append(site_id)
+        with self.conn:
+            return bool(self.conn.execute(f"UPDATE balance_site SET {','.join(assignments)} WHERE id=?", params).rowcount)
+
+    def save_balance_login(self, site_id: str, credential: dict) -> bool:
+        encoded = self._encrypt(json.dumps(credential, separators=(",", ":")))
+        with self.conn:
+            return bool(self.conn.execute("UPDATE balance_site SET credential=?,last_error=NULL WHERE id=?", (encoded, site_id)).rowcount)
+
+    def record_balance(self, site_id: str, balance: float, credential: dict) -> dict:
+        row = self.conn.execute("SELECT * FROM balance_site WHERE id=?", (site_id,)).fetchone()
+        if row is None:
+            raise ValueError("unknown balance site")
+        low = balance < float(row["low_threshold"])
+        entered_low = low and not bool(row["low_alert_active"])
+        stamp = self._timestamp()
+        with self.conn:
+            self.conn.execute("""UPDATE balance_site SET credential=?,last_balance=?,last_checked_at=?,last_error=NULL,
+                low_alert_active=?,notification_error=CASE WHEN ? THEN NULL ELSE notification_error END WHERE id=?""",
+                (self._encrypt(json.dumps(credential, separators=(",", ":"))), balance, stamp, int(low), int(entered_low), site_id))
+            self.conn.execute("INSERT INTO balance_snapshot(site_id,balance,checked_at) VALUES(?,?,?)", (site_id, balance, stamp))
+        return {"site": site_id, "name": row["name"], "currency": row["currency"], "balance": balance,
+                "threshold": float(row["low_threshold"]), "low": low, "entered_low": entered_low}
+
+    def record_balance_error(self, site_id: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE balance_site SET last_checked_at=?,last_error=? WHERE id=?", (self._timestamp(), error[:200], site_id))
+
+    def balance_webhook(self) -> str | None:
+        row = self.conn.execute("SELECT value FROM balance_setting WHERE name='webhook_url'").fetchone()
+        if row is None:
+            return None
+        try:
+            return self._decrypt(row["value"])
+        except Exception:
+            return None
+
+    def update_balance_webhook(self, webhook: str | None) -> None:
+        with self.conn:
+            if webhook:
+                self.conn.execute("INSERT INTO balance_setting(name,value) VALUES('webhook_url',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value", (self._encrypt(webhook),))
+            else:
+                self.conn.execute("DELETE FROM balance_setting WHERE name='webhook_url'")
+
+    def balance_configuration(self) -> dict:
+        return {"webhook_configured": self.balance_webhook() is not None}
+
+    def record_balance_notification_sent(self, site_id: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE balance_site SET last_notification_at=?,notification_error=NULL WHERE id=?", (self._timestamp(), site_id))
+
+    def record_balance_notification_error(self, site_id: str, error: str) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE balance_site SET notification_error=? WHERE id=?", (error[:200], site_id))
 
     @staticmethod
     def fingerprint(base_url: str, api_key: str, model: str) -> str:

@@ -87,6 +87,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             return {"catalog": catalog}
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
+        if path == "/admin/v1/balances":
+            return {"sites": [], "configuration": {"webhook_configured": False}}
         if path.startswith("/admin/v1/quality"):
             return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):

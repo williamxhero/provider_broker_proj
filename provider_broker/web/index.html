@@ -49,9 +49,24 @@
       <div class="table-wrap"><table id="catalog"></table></div>
     </section>
 
+    <section aria-labelledby="balances-title">
+      <div class="section-heading">
+        <div><p class="index">05 / BALANCES</p><h2 id="balances-title">中转站余额</h2></div>
+        <div class="section-actions"><button id="balance-sync" class="primary" type="button">立即更新余额</button></div>
+      </div>
+      <p class="field-help">登录密码与会话仅在小电脑以加密形式保存，管理页不会再次显示。余额每 15 分钟更新；低余额只在首次跌破阈值时告警，恢复后会重新布防。</p>
+      <output id="balance-result" class="notice" aria-live="polite"></output>
+      <div class="table-wrap"><table id="balances"></table></div>
+      <form id="balance-webhook" class="section-actions compact-form">
+        <label>低余额告警 Webhook（HTTPS）<input name="webhook_url" type="url" placeholder="https://…；留空可关闭告警推送"></label>
+        <button class="secondary" type="submit">保存告警地址</button>
+        <small id="webhook-state"></small>
+      </form>
+    </section>
+
     <section aria-labelledby="calls-title">
       <div class="section-heading">
-        <div><p class="index">05 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
+        <div><p class="index">06 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
         <div class="filters">
           <label>时间窗<select id="callwindow"><option>1h</option><option selected>24h</option><option>7d</option><option>30d</option></select></label>
           <label>每页<select id="calllimit"><option>2</option><option>10</option><option selected>25</option></select></label>
@@ -89,6 +104,16 @@
       <label>输出费率 / 1M<input name="official_output_price" type="number" min="0" step="0.0001" required></label>
       <label>整合价 / 1M<input name="blended_price" type="text" readonly aria-readonly="true"></label>
       <div class="editor-actions"><button id="catalog-delete" type="button" class="danger" hidden>删除模型</button><button id="cancel-catalog-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </aside>
+
+  <aside id="balance-login-editor" class="editor" aria-labelledby="balance-login-title" hidden>
+    <form id="balance-login-form">
+      <div class="editor-heading"><div><p class="index">BALANCE LOGIN</p><h2 id="balance-login-title">登录中转站</h2></div><button id="close-balance-login" type="button" aria-label="关闭">×</button></div>
+      <p id="balance-login-site" class="source-note"></p>
+      <label>账号（邮箱或用户名）<input name="account" type="text" autocomplete="username" required></label>
+      <label>密码<input name="password" type="password" autocomplete="current-password" required></label>
+      <div class="editor-actions"><button id="cancel-balance-login" type="button" class="secondary">取消</button><button type="submit" class="primary">登录并更新</button></div>
     </form>
   </aside>
 

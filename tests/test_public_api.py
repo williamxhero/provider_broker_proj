@@ -1,7 +1,7 @@
 import asyncio
 import json
 from types import SimpleNamespace
-from unittest.mock import patch
+from unittest.mock import AsyncMock, patch
 
 import pytest
 from aiohttp import web
@@ -34,6 +34,31 @@ async def test_generate_does_not_require_client_bearer(client):
     response = await client.post("/v1/generate", json={"model": "standard"})
     assert response.status == 400
     assert await response.json() == {"error": "prompt and intellect are required; model is not a capability selector"}
+
+
+async def test_balance_management_encrypts_login_and_tracks_low_threshold(client):
+    initial = await client.get("/admin/v1/balances")
+    sites = (await initial.json())["sites"]
+    assert [site["id"] for site in sites] == ["liangrekui", "cola", "wawapi", "topapi"]
+    assert all(not site["configured"] for site in sites)
+
+    with patch("provider_broker.app.balance_login", new=AsyncMock(return_value=(3.5, {"account": "me@example.test", "password": "secret", "cookies": {"session": "token"}}))):
+        response = await client.post("/admin/v1/balances/topapi/login", json={"account": "me@example.test", "password": "secret"})
+    assert response.status == 200
+    assert await response.json() == {"logged_in": True, "balance": 3.5, "currency": "USD", "low": True}
+
+    stored = (await (await client.get("/admin/v1/balances")).json())["sites"]
+    topapi = next(site for site in stored if site["id"] == "topapi")
+    assert topapi["configured"] and topapi["low"] and "secret" not in str(topapi)
+    assert b"secret" not in client.app["store"].conn.execute("SELECT credential FROM balance_site WHERE id='topapi'").fetchone()[0]
+
+    updated = await client.patch("/admin/v1/balances/topapi", json={"low_threshold": 2})
+    assert updated.status == 200
+    assert (await client.patch("/admin/v1/balances/topapi", json={"low_threshold": -1})).status == 400
+    assert (await client.patch("/admin/v1/balances/configuration", json={"webhook_url": "http://unsafe.test"})).status == 400
+    configured = await client.patch("/admin/v1/balances/configuration", json={"webhook_url": "https://notify.example.test/hook"})
+    assert await configured.json() == {"webhook_configured": True}
+    assert "notify.example.test" not in str(await (await client.get("/admin/v1/balances")).json())
 
 
 async def test_generate_rejects_utf8_bom_with_structured_json_error(client):

@@ -19,6 +19,7 @@ class Settings:
     health_scheduler_seconds: int = 60
     first_event_timeout_ms: int = 20_000
     route_attempt_budget: int = 32
+    balance_scheduler_seconds: int = 15 * 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -36,6 +37,7 @@ class Settings:
             health_scheduler_seconds=int(os.getenv("BROKER_HEALTH_SCHEDULER_SECONDS", "60")),
             first_event_timeout_ms=int(os.getenv("BROKER_FIRST_EVENT_TIMEOUT_MS", "20000")),
             route_attempt_budget=int(os.getenv("BROKER_ROUTE_ATTEMPT_BUDGET", "32")),
+            balance_scheduler_seconds=int(os.getenv("BROKER_BALANCE_SCHEDULER_SECONDS", str(15 * 60))),
         )
 
     def key_bytes(self) -> bytes:

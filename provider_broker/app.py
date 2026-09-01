@@ -13,6 +13,7 @@ from .settings import Settings
 from .source import sync_cpa
 from .upstream import UpstreamFailure, invoke_stream, route
 from .health import run_probe, scheduler
+from .balances import BalanceFailure, login as balance_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
 
 WEB_ROOT = Path(__file__).with_name("web")
 
@@ -250,6 +251,72 @@ async def health(request):
     return web.json_response({"status": "ok"})
 
 
+async def balance_sites(request):
+    return web.json_response({"sites": request.app["store"].balance_sites(), "configuration": request.app["store"].balance_configuration()})
+
+
+async def update_balance_site(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {"low_threshold", "enabled"}
+    threshold = body.get("low_threshold") if isinstance(body, dict) else None
+    enabled = body.get("enabled") if isinstance(body, dict) else None
+    valid_threshold = type(threshold) in (int, float) and math.isfinite(threshold) and 0 <= threshold <= 1_000_000
+    if not isinstance(body, dict) or not body or not set(body) <= allowed or ("low_threshold" in body and not valid_threshold) or ("enabled" in body and type(enabled) is not bool):
+        return web.json_response({"error": "invalid balance site settings"}, status=400)
+    if not request.app["store"].update_balance_site(request.match_info["site"], low_threshold=float(threshold) if "low_threshold" in body else None, enabled=enabled if "enabled" in body else None):
+        return web.json_response({"error": "balance site not found"}, status=404)
+    return web.json_response({"updated": True})
+
+
+async def login_balance_site(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or set(body) != {"account", "password"} or not all(isinstance(body[key], str) and body[key] for key in ("account", "password")):
+        return web.json_response({"error": "account and password are required"}, status=400)
+    site_id = request.match_info["site"]
+    site = request.app["store"].balance_site_secret(site_id)
+    if site is None:
+        return web.json_response({"error": "balance site not found"}, status=404)
+    try:
+        balance, credential = await balance_login(site, body["account"], body["password"])
+    except BalanceFailure as exc:
+        request.app["store"].record_balance_error(site_id, str(exc))
+        return web.json_response({"error": "site login failed", "detail": str(exc)}, status=502)
+    event = request.app["store"].record_balance(site_id, balance, credential)
+    if event["entered_low"]:
+        await notify_low_balance(request.app["store"], event)
+    return web.json_response({"logged_in": True, "balance": balance, "currency": site["currency"], "low": event["low"]})
+
+
+async def sync_balance_sites(request):
+    site_id = request.match_info.get("site")
+    if site_id:
+        result = await sync_balance(request.app["store"], site_id)
+        return web.json_response(result, status=200 if result["ok"] else 502)
+    sites = [site for site in request.app["store"].balance_sites() if site["enabled"] and site["configured"]]
+    results = await asyncio.gather(*(sync_balance(request.app["store"], site["id"]) for site in sites))
+    return web.json_response({"results": results})
+
+
+async def balance_configuration(request):
+    if request.method == "GET":
+        return web.json_response(request.app["store"].balance_configuration())
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    webhook = body.get("webhook_url") if isinstance(body, dict) else None
+    if not isinstance(body, dict) or set(body) != {"webhook_url"} or (webhook is not None and (not isinstance(webhook, str) or len(webhook) > 2048 or (webhook and not webhook.startswith("https://")))):
+        return web.json_response({"error": "webhook_url must be an HTTPS URL or null"}, status=400)
+    request.app["store"].update_balance_webhook(webhook.strip() if webhook else None)
+    return web.json_response(request.app["store"].balance_configuration())
+
+
 @web.middleware
 async def json_contract(request, handler):
     """Keep malformed client JSON inside the Broker's structured error contract."""
@@ -295,9 +362,14 @@ def create_app(settings: Settings, *, clock=None):
     async def start_scheduler(app):
         app["store"].ensure_health_targets(app["clock"]())
         app["health_scheduler"] = asyncio.create_task(scheduler(app))
+        app["balance_scheduler"] = asyncio.create_task(balance_scheduler(app))
 
     async def stop_scheduler(app):
         task = app.get("health_scheduler")
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        task = app.get("balance_scheduler")
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -307,6 +379,9 @@ def create_app(settings: Settings, *, clock=None):
     app.router.add_static("/static/", WEB_ROOT)
     app.add_routes([
         web.get("/", home), web.get("/healthz", health),
+        web.get("/admin/v1/balances", balance_sites), web.post("/admin/v1/balances/sync", sync_balance_sites),
+        web.patch("/admin/v1/balances/configuration", balance_configuration), web.get("/admin/v1/balances/configuration", balance_configuration),
+        web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
