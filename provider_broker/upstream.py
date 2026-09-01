@@ -13,10 +13,11 @@ from .catalog import CATALOG, canonicalize
 
 
 class AttemptFailure(Exception):
-    def __init__(self, status: str, *, diagnostic: dict | None = None):
+    def __init__(self, status: str, *, diagnostic: dict | None = None, repair_note: str | None = None):
         super().__init__(status)
         self.status = status
         self.diagnostic = sanitize_diagnostic(diagnostic or {})
+        self.repair_note = repair_note
 
 
 class UpstreamFailure(Exception):
@@ -30,7 +31,7 @@ DIAGNOSTIC_FIELDS = {
     "event_types", "finish_reason", "stream_completed", "received_bytes", "ttfb_ms",
     "ttft_ms", "first_event_timeout_ms", "idle_timeout_ms", "structured_error_kind", "validator",
     "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
-    "output_chars",
+    "output_chars", "repair_retry", "unexpected_properties",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -131,17 +132,20 @@ def schema_hash(schema: dict | None) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-def strict_schema_prompt(prompt: str, schema: dict | None) -> str:
+def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | None = None) -> str:
     """Reinforce strictness for OpenAI-compatible gateways that only partially honor response_format."""
     if schema is None:
         return prompt
-    return prompt + (
+    reinforced = prompt + (
         "\n\n[Provider Broker structured-output contract]\n"
         "Return only the JSON value required by the supplied JSON Schema. "
         "Use exactly the declared object properties at every nesting level; do not add metadata, "
         "explanations, labels, identifiers, or any property absent from the schema. "
         "The response will be rejected unless it validates without repair."
     )
+    if repair_note:
+        reinforced += "\nA prior attempt was rejected. " + repair_note + " Generate the entire JSON again from scratch."
+    return reinforced
 
 
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict):
@@ -161,17 +165,28 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
     try:
         Draft202012Validator(schema).validate(parsed)
     except ValidationError as exc:
+        path = [str(part) for part in list(exc.absolute_path)[:8]]
+        unexpected = []
+        if exc.validator == "additionalProperties" and isinstance(exc.instance, dict) and isinstance(exc.schema, dict):
+            declared = exc.schema.get("properties")
+            if isinstance(declared, dict):
+                unexpected = sorted(str(key) for key in set(exc.instance) - set(declared))[:12]
+        location = ".".join(path) or "the root object"
+        repair_note = None
+        if unexpected:
+            repair_note = f"At {location}, omit undeclared properties: {', '.join(unexpected)}."
         raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {
             "structured_error_kind": "schema_validation", "validator": str(exc.validator),
-            "validation_path": [str(part) for part in list(exc.absolute_path)[:8]],
-        }) from exc
+            "validation_path": path, "unexpected_properties": unexpected,
+        }, repair_note=repair_note) from exc
 
 
 async def invoke_stream(provider, body: dict) -> dict:
     model = canonicalize(provider.models[0])
     schema = structured_schema(body)
     effort = body.get("effort")
-    provider_prompt = strict_schema_prompt(body["prompt"], schema)
+    repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
+    provider_prompt = strict_schema_prompt(body["prompt"], schema, repair_note)
     if provider.provider_type in ("anthropic", "claude"):
         payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
         if schema is not None:
@@ -215,6 +230,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "progress_event_count": progress_event_count,
             "max_event_gap_ms": round(max_event_gap_ms, 2),
             "output_chars": sum(len(chunk) for chunk in chunks),
+            "repair_retry": bool(repair_note),
         })
 
     def record_progress():
@@ -478,7 +494,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     for candidate_tier in tiers[tiers.index(tier):]:
         for band in price_bands(store.providers(candidate_tier)):
             available = [provider for provider in band if store.has_capacity(provider)]
-            primary.extend((provider, candidate_tier) for provider in random.sample(available, k=len(available)))
+            primary.extend((provider, candidate_tier, None) for provider in random.sample(available, k=len(available)))
 
     active = {}
     next_hedge_at = route_started
@@ -486,16 +502,19 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     def launch_one():
         nonlocal attempts_started, next_hedge_at
         while (primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
-            provider, candidate_tier = primary.popleft() if primary else retry.popleft()
+            provider, candidate_tier, repair_note = primary.popleft() if primary else retry.popleft()
             if not store.try_acquire(provider):
                 continue
             sequence = attempts_started
             attempts_started += 1
             audit.start(sequence, provider)
 
-            async def run(selected=provider):
+            async def run(selected=provider, selected_repair_note=repair_note):
                 try:
-                    return await invoker(selected, invocation_body)
+                    selected_body = invocation_body
+                    if selected_repair_note:
+                        selected_body = {**invocation_body, "_structured_repair_note": selected_repair_note}
+                    return await invoker(selected, selected_body)
                 finally:
                     store.release(selected)
 
@@ -550,7 +569,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     retry_key = (provider.fingerprint, requested_model, candidate_tier)
                     if retryable_attempt(exc) and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
-                        retry.append((provider, candidate_tier))
+                        retry.append((provider, candidate_tier, exc.repair_note))
                     continue
                 if output["actual_model"] != requested_model:
                     store.block_route(provider.fingerprint, requested_model)

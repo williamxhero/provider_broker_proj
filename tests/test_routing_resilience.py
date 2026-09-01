@@ -158,6 +158,8 @@ def test_strict_schema_prompt_only_reinforces_structured_requests():
     assert reinforced.startswith(prompt)
     assert "exactly the declared object properties" in reinforced
     assert "validates without repair" in reinforced
+    repaired = strict_schema_prompt(prompt, production_like_schema(), "At propositions.0, omit undeclared properties: rationale.")
+    assert "Generate the entire JSON again from scratch" in repaired
 
 
 async def test_claude_compat_payload_reinforces_and_still_validates_strict_schema():
@@ -524,6 +526,53 @@ def test_structured_failure_statuses_are_distinct(text, schema, finish_reason, e
     with pytest.raises(AttemptFailure, match=expected) as failure:
         validate_structured_output(text, schema, finish_reason, {"endpoint": "/responses"})
     assert failure.value.status == expected
+
+
+def test_additional_properties_failure_exposes_only_a_bounded_repair_note():
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "properties": {"allowed": {"type": "string"}},
+    }
+    with pytest.raises(AttemptFailure) as failure:
+        validate_structured_output(
+            '{"allowed":"private value","rationale":"also private"}', schema, "stop",
+            {"endpoint": "/chat/completions"},
+        )
+    assert failure.value.status == "structured_output_invalid"
+    assert failure.value.diagnostic["unexpected_properties"] == ["rationale"]
+    assert failure.value.repair_note == "At the root object, omit undeclared properties: rationale."
+    assert "private value" not in failure.value.repair_note
+    assert "also private" not in failure.value.repair_note
+
+
+async def test_schema_repair_retry_is_a_separate_audited_attempt():
+    item = provider(0, secret="repair-secret")
+    store = FakeStore([item])
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["answer"], "properties": {"answer": {"type": "string"}},
+    }
+    bodies = []
+
+    async def invoke(_item, request_body):
+        bodies.append(request_body)
+        if len(bodies) == 1:
+            validate_structured_output(
+                '{"answer":"valid meaning","rationale":"undeclared"}', schema, "stop",
+                {"endpoint": "/chat/completions"},
+            )
+        return completed('{"answer":"valid meaning"}')
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "repair", "output_schema": schema, "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0, route_attempt_budget=2,
+        )
+
+    assert result["text"] == '{"answer":"valid meaning"}'
+    assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+    assert "_structured_repair_note" not in bodies[0]
+    assert bodies[1]["_structured_repair_note"] == "At the root object, omit undeclared properties: rationale."
 
 
 async def test_invalid_schema_is_rejected_by_broker_before_contacting_provider():
