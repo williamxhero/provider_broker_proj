@@ -101,6 +101,20 @@ async def cpa(client):
             return web.json_response({'error':'provider-secret must never escape'},status=500)
         if payload.get('input') == 'mismatch':
             return web.json_response({'id':'req-mismatch','model':'gpt-5.6-terra','output_text':'complete but wrong model','usage':{'input_tokens':2,'output_tokens':3}})
+        if payload.get('input', '').startswith('production-schema-near-miss'):
+            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
+            invalid = json.dumps({
+                'reply_markdown': 'r' * 800, 'needs_fresh_search': False, 'public_search_request': None,
+                'propositions': [{'kind': 'ai_inference', 'subject': 'x', 'predicate': 'y', 'object_json': 7,
+                                  'confidence': .8, 'source_span': {'message_id': 'synthetic-message', 'start': 0, 'end': 18, 'quote': 'synthetic evidence'},
+                                  'rationale': 'undeclared'}] * 3,
+                'actions': [{'action_type': 'analysis.request', 'subject': 'x', 'time_scope': 'next', 'goal': 'test',
+                             'source_span': {'message_id': 'synthetic-message', 'start': 0, 'end': 18, 'quote': 'synthetic evidence'}}],
+            }, separators=(',', ':'))
+            await stream.write((f'data: {json.dumps({"type":"response.output_text.delta","delta":invalid})}\n\n').encode())
+            await stream.write((f'data: {{"type":"response.completed","response":{{"id":"near-miss","model":"{payload["model"]}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}\n\n').encode())
+            await stream.write_eof(); return stream
         try:
             structured_envelope = json.loads(payload.get('input', ''))
         except (TypeError, json.JSONDecodeError):
@@ -259,6 +273,21 @@ async def test_schema_envelope_requires_json_before_a_chat_provider_can_win(clie
     assert response_format['json_schema']['schema']['required'] == ['reply']
     audit = (await (await client.get('/admin/v1/calls?limit=1')).json())['items'][0]
     assert audit['diagnostic']['structured_error_kind'] == 'json_decode'
+
+
+async def test_stream_rejects_production_schema_near_miss_before_committing_http_200(client, cpa):
+    await client.post('/admin/v1/sync')
+    from scripts.production_shape_smoke import SCHEMA
+    response = await client.post('/v1/generate/stream', json={
+        'prompt': 'production-schema-near-miss', 'intellect': 'standard', 'effort': 'medium',
+        'deadline_ms': 2000, 'output_token_limit': 2000, 'output_schema': SCHEMA,
+    })
+    body = await response.json()
+    assert response.status == 503
+    assert body['error'] == 'all eligible providers failed'
+    assert body['attempts']
+    assert all(item['status'] == 'structured_output_invalid' for item in body['attempts'])
+    assert all((item.get('diagnostic') or {}).get('structured_error_kind') == 'schema_validation' for item in body['attempts'])
 
 
 async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):

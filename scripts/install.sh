@@ -20,6 +20,13 @@ install -d -o yosef -g yosef "$TEMP_RELEASE"
 python3 -m venv "$TEMP_RELEASE/venv"
 "$TEMP_RELEASE/venv/bin/pip" install --upgrade pip >/dev/null
 "$TEMP_RELEASE/venv/bin/pip" install "$WHEEL" >/dev/null
+"$TEMP_RELEASE/venv/bin/python" - <<'PY'
+from provider_broker import app, upstream
+
+assert hasattr(upstream, "AttemptAudit")
+assert not hasattr(upstream, "StreamingAttempt")
+assert "result[\"attempt\"]" not in open(app.__file__, encoding="utf-8").read()
+PY
 install -m 755 "$STAGE/smoke.py" "$TEMP_RELEASE/smoke.py"
 install -m 755 "$STAGE/transport_matrix.py" "$TEMP_RELEASE/transport_matrix.py"
 install -m 755 "$STAGE/production_shape_smoke.py" "$TEMP_RELEASE/production_shape_smoke.py"
