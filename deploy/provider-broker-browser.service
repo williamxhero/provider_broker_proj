@@ -1,0 +1,21 @@
+[Unit]
+Description=Provider Broker interactive balance browser
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=yosef
+Group=yosef
+WorkingDirectory=/data/provider-broker/current
+ExecStart=/data/provider-broker/current/browser-session.sh
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+ReadWritePaths=/data/provider-broker/browser
+
+[Install]
+WantedBy=multi-user.target

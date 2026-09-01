@@ -135,14 +135,23 @@ async def refresh(site: dict, credential: dict) -> tuple[float, dict]:
     return await login(site, account, password)
 
 
-async def sync_one(store, site_id: str) -> dict:
+async def sync_one(store, site_id: str, browser=None) -> dict:
     site = store.balance_site_secret(site_id)
     if site is None:
         raise BalanceFailure("unknown provider site")
     if not site["credential"]:
         raise BalanceFailure("not logged in")
     try:
-        balance, credential = await refresh(site, site["credential"])
+        credential = site["credential"]
+        if credential.get("browser_session"):
+            if browser is None:
+                raise BalanceFailure("interactive browser is unavailable")
+            try:
+                balance = await browser.fetch_balance(site)
+            except Exception as exc:
+                raise BalanceFailure(str(exc)) from exc
+        else:
+            balance, credential = await refresh(site, credential)
     except BalanceFailure as exc:
         store.record_balance_error(site_id, str(exc))
         return {"site": site_id, "ok": False, "error": str(exc)}
@@ -180,4 +189,4 @@ async def scheduler(app) -> None:
     while True:
         await asyncio.sleep(app["settings"].balance_scheduler_seconds)
         sites = app["store"].balance_sites()
-        await asyncio.gather(*(sync_one(app["store"], site["id"]) for site in sites if site["enabled"] and site["configured"]), return_exceptions=True)
+        await asyncio.gather(*(sync_one(app["store"], site["id"], app.get("balance_browser")) for site in sites if site["enabled"] and site["configured"]), return_exceptions=True)
