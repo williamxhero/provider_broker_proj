@@ -1,5 +1,6 @@
 import asyncio
 import json
+from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
 
@@ -848,3 +849,13 @@ async def test_quality_window_failures_and_cursor_pagination(client):
     assert all(x['status']=='cancelled' for x in (await filtered.json())['items'])
     recent=await client.get('/admin/v1/calls?window=1h&limit=100',headers=headers)
     assert all(x['ttft_ms'] != 999 for x in (await recent.json())['items'])
+def test_release_service_drains_long_requests_and_avoids_firewall_restart():
+    root = Path(__file__).parents[1]
+    service = (root / "deploy" / "provider-broker.service").read_text(encoding="utf-8")
+    install = (root / "scripts" / "install.sh").read_text(encoding="utf-8")
+    app_source = (root / "provider_broker" / "app.py").read_text(encoding="utf-8")
+    assert "TimeoutStopSec=360s" in service
+    assert "shutdown_timeout=330.0" in app_source
+    assert "systemctl restart provider-broker-firewall.service" not in install
+    assert "--runs 5 --intellect smart --contract memory-research" in install
+    assert "--runs 3 --intellect smart --contract research-plan" in install

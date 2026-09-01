@@ -13,6 +13,7 @@ EnvironmentFile=/data/provider-broker/secrets/broker.env
 ExecStart=/data/provider-broker/current/venv/bin/python -m provider_broker
 Restart=on-failure
 RestartSec=3
+TimeoutStopSec=360s
 NoNewPrivileges=true
 PrivateTmp=true
 ProtectSystem=strict

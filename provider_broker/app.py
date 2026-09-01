@@ -428,4 +428,6 @@ def create_app(settings: Settings, *, clock=None):
 
 def main():
     settings = Settings.from_env()
-    web.run_app(create_app(settings), host="192.168.50.2", port=8817)
+    # Let an in-flight client deadline finish during a release restart.  The
+    # systemd stop timeout is deliberately longer than this drain window.
+    web.run_app(create_app(settings), host="192.168.50.2", port=8817, shutdown_timeout=330.0)

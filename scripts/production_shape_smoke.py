@@ -273,6 +273,7 @@ def run_once(base_url, prompt, schema, deadline_ms, output_token_limit, intellec
         }
     return True, {
         "http_status": 200, "status": final.get("status"),
+        "request_id": final.get("request_id"),
         "actual_model": final.get("actual_model"),
         "fulfilled_intellect": final.get("fulfilled_intellect"), "ttft_ms": final.get("ttft_ms"),
         "attempts": safe_attempts(final.get("attempts")),
