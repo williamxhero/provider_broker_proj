@@ -280,6 +280,10 @@ async def login_balance_site(request):
     site = request.app["store"].balance_site_secret(site_id)
     if site is None:
         return web.json_response({"error": "balance site not found"}, status=404)
+    # Keep operator-entered credentials before contacting the upstream.  Some
+    # sites require an interactive challenge, and losing the encrypted retry
+    # material after that expected failure makes the management flow unusable.
+    request.app["store"].save_balance_login(site_id, {"account": body["account"], "password": body["password"]})
     try:
         balance, credential = await balance_login(site, body["account"], body["password"])
     except BalanceFailure as exc:

@@ -8,6 +8,7 @@ from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from provider_broker.app import create_app
+from provider_broker.balances import BalanceFailure
 from provider_broker.db import Store
 from provider_broker.settings import Settings
 from provider_broker.upstream import price_bands
@@ -59,6 +60,16 @@ async def test_balance_management_encrypts_login_and_tracks_low_threshold(client
     configured = await client.patch("/admin/v1/balances/configuration", json={"webhook_url": "https://notify.example.test/hook"})
     assert await configured.json() == {"webhook_configured": True}
     assert "notify.example.test" not in str(await (await client.get("/admin/v1/balances")).json())
+
+
+async def test_failed_balance_login_keeps_encrypted_credentials_for_retry(client):
+    with patch("provider_broker.app.balance_login", new=AsyncMock(side_effect=BalanceFailure("provider rejected request"))):
+        response = await client.post("/admin/v1/balances/liangrekui/login", json={"account": "me@example.test", "password": "retry-secret"})
+    assert response.status == 502
+    site = next(site for site in (await (await client.get("/admin/v1/balances")).json())["sites"] if site["id"] == "liangrekui")
+    assert site["configured"] and site["last_error"] == "provider rejected request"
+    stored = client.app["store"].conn.execute("SELECT credential FROM balance_site WHERE id='liangrekui'").fetchone()[0]
+    assert stored is not None and b"retry-secret" not in stored
 
 
 async def test_generate_rejects_utf8_bom_with_structured_json_error(client):
