@@ -32,6 +32,7 @@ DIAGNOSTIC_FIELDS = {
     "ttft_ms", "first_event_timeout_ms", "idle_timeout_ms", "structured_error_kind", "validator",
     "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
     "output_chars", "repair_retry", "unexpected_properties",
+    "normalized_properties",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -148,7 +149,8 @@ def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | No
     return reinforced
 
 
-def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict):
+def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,
+                               *, normalize_additional: bool = False) -> tuple[str, list[str]]:
     try:
         Draft202012Validator.check_schema(schema)
     except SchemaError as exc:
@@ -162,15 +164,25 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
         parsed = json.loads(text.strip())
     except json.JSONDecodeError as exc:
         raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {"structured_error_kind": "json_decode"}) from exc
-    try:
-        Draft202012Validator(schema).validate(parsed)
-    except ValidationError as exc:
+    validator = Draft202012Validator(schema)
+    normalized = []
+    while True:
+        errors = list(validator.iter_errors(parsed))
+        if not errors:
+            rendered = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")) if normalized else text
+            return rendered, normalized
+        exc = errors[0]
         path = [str(part) for part in list(exc.absolute_path)[:8]]
         unexpected = []
         if exc.validator == "additionalProperties" and isinstance(exc.instance, dict) and isinstance(exc.schema, dict):
             declared = exc.schema.get("properties")
             if isinstance(declared, dict):
                 unexpected = sorted(str(key) for key in set(exc.instance) - set(declared))[:12]
+        if normalize_additional and unexpected and len(normalized) + len(unexpected) <= 32:
+            for key in unexpected:
+                exc.instance.pop(key, None)
+                normalized.append((".".join(path) + "." if path else "") + key)
+            continue
         location = ".".join(path) or "the root object"
         repair_note = None
         if unexpected:
@@ -217,6 +229,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     saw_progress = False
     response_status = None
     content_type = None
+    normalized_properties = []
 
     def diagnostic():
         return sanitize_diagnostic({
@@ -231,6 +244,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "max_event_gap_ms": round(max_event_gap_ms, 2),
             "output_chars": sum(len(chunk) for chunk in chunks),
             "repair_retry": bool(repair_note),
+            "normalized_properties": normalized_properties,
         })
 
     def record_progress():
@@ -391,7 +405,11 @@ async def invoke_stream(provider, body: dict) -> dict:
     if not completed or not text.strip():
         raise AttemptFailure("stream_incomplete", diagnostic=diagnostic())
     if schema is not None:
-        validate_structured_output(text, schema, finish_reason, diagnostic())
+        text, normalized_properties = validate_structured_output(
+            text, schema, finish_reason, diagnostic(), normalize_additional=bool(repair_note),
+        )
+        if normalized_properties:
+            chunks = [text]
     usage = normalize_usage(metadata)
     actual_model = canonicalize(str(metadata.get("model") or model))
     return {

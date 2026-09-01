@@ -545,6 +545,30 @@ def test_additional_properties_failure_exposes_only_a_bounded_repair_note():
     assert "also private" not in failure.value.repair_note
 
 
+def test_repair_attempt_can_only_remove_forbidden_properties_then_revalidates():
+    schema = {
+        "type": "object", "additionalProperties": False, "required": ["answer"],
+        "properties": {
+            "answer": {"type": "string"},
+            "nested": {
+                "type": "object", "additionalProperties": False, "required": ["kept"],
+                "properties": {"kept": {"type": "boolean"}},
+            },
+        },
+    }
+    rendered, removed = validate_structured_output(
+        '{"answer":"meaning","extra":"drop","nested":{"kept":true,"type":"drop"}}',
+        schema, "stop", {"endpoint": "/chat/completions"}, normalize_additional=True,
+    )
+    assert json.loads(rendered) == {"answer": "meaning", "nested": {"kept": True}}
+    assert removed == ["extra", "nested.type"]
+    with pytest.raises(AttemptFailure, match="structured_output_invalid"):
+        validate_structured_output(
+            '{"answer":7,"extra":"drop"}', schema, "stop",
+            {"endpoint": "/chat/completions"}, normalize_additional=True,
+        )
+
+
 async def test_schema_repair_retry_is_a_separate_audited_attempt():
     item = provider(0, secret="repair-secret")
     store = FakeStore([item])
