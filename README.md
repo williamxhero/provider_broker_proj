@@ -38,7 +38,7 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 1. 先找 `standard` 下可路由的 Key：已启用、已校准、该 Key 有此分组模型、未被模型履约校验拉黑、且未达到单 Key 并发上限。
 2. 所有这些 Key 不按模型隔离；按“该模型整合价 × Key 倍率”算路由价格，用中位数切成低价组、高价组。
-3. 将低价组中健康且有容量的 Key 先随机打散，再按真实成功证据、平滑成功率和 TTFT 稳定排序；同质量候选仍保持随机负载均衡。`race_parallel_cap`（N）只限制同时运行的候选数。先启动第一个候选；若在路由设置的 `hedge_delay_ms`（默认 750 ms）内没有可验证的有效首字且仍有并发槽位，启动下一个候选。候选失败或超过首有效输出时限后会释放槽位，并立即由队列中的下一个健康候选补位。候选必须产生非空文本 token，且实际模型满足请求档位才能获胜；其余已启动请求取消。`hedge_delay_ms=0` 时立即并发启动最多 N 个候选。`unknown` 与 `suspect` 仍可参与路由，`open` 熔断的 Provider/model 不参与正常路由。
+3. 将低价组中健康且有容量的 Key 先随机打散，再按真实成功证据、平滑成功率和 TTFT 稳定排序；同质量候选仍保持随机负载均衡。`race_parallel_cap`（N）限制同时运行数。`hedge_delay_ms` 到期仍无合格结果时启动下一个候选，失败会立即补位；当前组全部启动后，空闲槽位可继续补入下一组。候选必须产生非空文本 token，且实际模型满足请求档位才能获胜；其余已启动请求取消。`unknown` 与 `suspect` 仍可参与路由，`open` 不参与正常路由。
 4. 当前低价组的候选队列耗尽、达到整请求尝试预算（默认 32）或 deadline 后，才进入高价组。
 5. `standard` 两个价格组都失败后，依次降级尝试 `smart`、`expert`，每个 stage 同样遵循低价组再高价组。
 6. 全部失败则返回 503。
@@ -79,6 +79,8 @@ curl -X POST http://yosef-server:8817/admin/v1/probes \
 
 `mode: "all"` 会逐个检查指定 Stage 的所有可探测 Provider/model；两个模式都可附加 `fingerprint`、`model`、`timeout_ms` 和 `concurrency` 以缩小范围或控制执行上限。管理台的 Stage 视角提供相同的竞速探针、全量探针和最新结果表，并保存选定 Stage 与表格排序。
 
-可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（被动证据陈旧阈值，默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（基础首输出上限，默认 20000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（整请求最多启动的候选数，默认 32）。基础首输出上限按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；它只约束竞速获胜前，已开始正常输出的结构化生成仍使用整请求 deadline。
+可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（默认 30000）、`BROKER_STREAM_IDLE_TIMEOUT_MS`（默认 90000）、`BROKER_ATTEMPT_TIMEOUT_MS`（默认 180000）、`BROKER_RESPONSE_RESERVE_MS`（默认 5000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（默认 32）。首事件窗口按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；reasoning 事件只表示活性，不会拼入输出。
+
+长结构化输出可用 `/data/provider-broker/current/venv/bin/python /data/provider-broker/current/production_shape_smoke.py --runs 3` 做生产形态验证。该脚本使用长输入、复杂 Draft 2020-12 Schema 和精确 source span，只输出长度、结构计数、Schema 哈希、模型和安全状态统计，不输出正文。
 
 路由设置接口 `GET/PATCH /admin/v1/routing` 同时管理 `race_parallel_cap` 与 `hedge_delay_ms`；两项可单独更新，后者的可选范围为 0–10000 ms。

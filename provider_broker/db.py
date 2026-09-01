@@ -99,7 +99,11 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE observation ADD COLUMN status TEXT NOT NULL DEFAULT 'completed'")
         except sqlite3.OperationalError: pass
-        for name, definition in [('input_tokens','INTEGER'),('output_tokens','INTEGER'),('cost','REAL'),('request_id','TEXT'),('diagnostic_json','TEXT')]:
+        for name, definition in [
+            ('input_tokens','INTEGER'),('output_tokens','INTEGER'),('cost','REAL'),('request_id','TEXT'),
+            ('diagnostic_json','TEXT'),('route_id','TEXT'),('attempt_number','INTEGER'),
+            ('started_ms','REAL'),('elapsed_ms','REAL'),
+        ]:
             try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
@@ -462,6 +466,46 @@ class Store:
         with self.conn:
             self.conn.execute('INSERT OR REPLACE INTO route_block(fingerprint,model) VALUES(?,?)',(fingerprint,model))
 
+    def route_score(self, provider: Provider, requested_model: str, body: dict) -> int:
+        """Rank same-band candidates using recent, safe request-shape outcomes."""
+        prompt = body.get('prompt') if isinstance(body.get('prompt'), str) else ''
+        schema = body.get('output_schema') if isinstance(body.get('output_schema'), dict) else None
+        if schema is None:
+            try:
+                envelope = json.loads(prompt)
+            except (TypeError, ValueError):
+                envelope = None
+            embedded = envelope.get('output_schema') if isinstance(envelope, dict) else None
+            schema = embedded if isinstance(embedded, dict) else None
+        prompt_sha256 = hashlib.sha256(prompt.encode('utf-8')).hexdigest()
+        schema_sha256 = None
+        if schema is not None:
+            encoded = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
+            schema_sha256 = hashlib.sha256(encoded).hexdigest()
+        rows = self.conn.execute("""
+            SELECT actual_model,status,diagnostic_json FROM observation
+            WHERE fingerprint=? AND requested_model=? AND created_at>=datetime('now','-24 hours')
+            ORDER BY id DESC LIMIT 100
+        """, (provider.fingerprint, requested_model)).fetchall()
+        score = 0
+        health = self.health(provider.fingerprint, requested_model)
+        if health.get('state') in {'healthy', 'half_open'}:
+            score += 100
+        elif health.get('state') == 'suspect':
+            score -= 10
+        for row in rows:
+            try:
+                diagnostic = json.loads(row['diagnostic_json']) if row['diagnostic_json'] else {}
+            except (TypeError, ValueError):
+                diagnostic = {}
+            exact_shape = diagnostic.get('prompt_sha256') == prompt_sha256 and diagnostic.get('schema_sha256') == schema_sha256
+            fulfilled = row['status'] == 'completed' and row['actual_model'] == requested_model
+            if exact_shape:
+                score += 1000 if fulfilled else -100 if row['status'] == 'structured_output_invalid' else -20
+            else:
+                score += 10 if fulfilled else -1
+        return score
+
     def inventory(self, window='24h') -> list[dict]:
         modifier = {'1h': '-1 hour', '24h': '-24 hours', '7d': '-7 days', '30d': '-30 days'}[window]
         rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
@@ -490,9 +534,21 @@ class Store:
         return True
 
     def observe(self, **data):
-        data["diagnostic_json"] = json.dumps(data.pop("diagnostic", None), sort_keys=True) if data.get("diagnostic") else None
+        payload = {
+            'diagnostic_json': None, 'route_id': None, 'attempt_number': None,
+            'started_ms': None, 'elapsed_ms': None,
+        } | data
+        diagnostic = payload.pop("diagnostic", None)
+        if diagnostic:
+            payload["diagnostic_json"] = json.dumps(diagnostic, sort_keys=True)
         with self.conn:
-            self.conn.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,input_tokens,output_tokens,cost,request_id,diagnostic_json) VALUES(:fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,:input_tokens,:output_tokens,:cost,:request_id,:diagnostic_json)", data)
+            self.conn.execute("""INSERT INTO observation(
+                fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,
+                input_tokens,output_tokens,cost,request_id,diagnostic_json,route_id,attempt_number,started_ms,elapsed_ms
+            ) VALUES(
+                :fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,
+                :input_tokens,:output_tokens,:cost,:request_id,:diagnostic_json,:route_id,:attempt_number,:started_ms,:elapsed_ms
+            )""", payload)
 
     def quality(self, window='24h'):
         modifier={'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]
@@ -513,4 +569,12 @@ class Store:
         values=[*params,limit]
         if offset is not None: query += ' OFFSET ?'; values.append(offset)
         rows=self.conn.execute(query,values).fetchall()
-        return [{'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],'request_id':r['request_id'],'diagnostic':json.loads(r['diagnostic_json']) if r['diagnostic_json'] else None} for r in rows]
+        return [{
+            'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],
+            'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],
+            'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],
+            'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],
+            'request_id':r['request_id'],'route_id':r['route_id'],'attempt_number':r['attempt_number'],
+            'started_ms':r['started_ms'],'elapsed_ms':r['elapsed_ms'],
+            'diagnostic':json.loads(r['diagnostic_json']) if r['diagnostic_json'] else {},
+        } for r in rows]

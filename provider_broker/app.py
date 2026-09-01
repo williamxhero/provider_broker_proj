@@ -26,25 +26,24 @@ async def generate(request):
     if tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "model must be standard, smart, or expert"}, status=400)
     try:
-        # All production attempts are streaming internally.  The non-stream API only
-        # buffers the winning stream before serialising its completed response.
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), request.app["store"].hedge_delay_ms(), request.app["settings"].first_event_timeout_ms, request.app["settings"].route_attempt_budget)
+        settings = request.app["settings"]
+        result = await route(
+            request.app["store"], tier, body, request.app["store"].race_parallel_cap(),
+            hedge_delay_ms=request.app["store"].hedge_delay_ms(),
+            first_event_timeout_ms=settings.first_event_timeout_ms,
+            stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
+            attempt_timeout_ms=settings.attempt_timeout_ms,
+            route_attempt_budget=settings.route_attempt_budget,
+            response_reserve_ms=settings.response_reserve_ms,
+        )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
-    try:
-        output = await result["attempt"].result()
-    except UpstreamFailure as exc:
-        return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
-    provider = result["attempt"].provider
-    from .upstream import observe
-    observe(request.app["store"], provider, result["attempt"].model, result["fulfilled_intellect"], body, "completed", output=output)
-    request.app["store"].record_health(provider.fingerprint, result["attempt"].model, success=True, real=True, ttft_ms=output["latency_ms"])
     return web.json_response({
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
         "effort": body.get("effort"), "deadline_ms": body.get("deadline_ms"), "output_token_limit": body.get("output_token_limit"),
-        "actual_model": output["actual_model"], "output_text": output["text"], "provider": result["provider"],
-        "request_id": output["request_id"], "usage": output["usage"],
-        "ttft_ms": output["latency_ms"], "attempts": result["attempts"], "cost_estimate": output["cost"],
+        "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
+        "request_id": result["request_id"], "usage": result["usage"],
+        "ttft_ms": result["latency_ms"], "attempts": result["attempts"], "cost_estimate": result["cost"],
     })
 
 
@@ -54,28 +53,27 @@ async def stream(request):
     if "model" in body or not isinstance(body.get("prompt"), str) or tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "prompt and valid intellect are required"}, status=400)
     try:
-        result = await route(request.app["store"], tier, body, request.app["store"].race_parallel_cap(), request.app["store"].hedge_delay_ms(), request.app["settings"].first_event_timeout_ms, request.app["settings"].route_attempt_budget)
+        settings = request.app["settings"]
+        result = await route(
+            request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
+            hedge_delay_ms=request.app["store"].hedge_delay_ms(),
+            first_event_timeout_ms=settings.first_event_timeout_ms,
+            stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
+            attempt_timeout_ms=settings.attempt_timeout_ms,
+            route_attempt_budget=settings.route_attempt_budget,
+            response_reserve_ms=settings.response_reserve_ms,
+        )
     except UpstreamFailure as exc:
         return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
     sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
     await sse.prepare(request)
-    attempt = result["attempt"]
-    try:
-        async for chunk in attempt.iter_text():
-            await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
-        output = await attempt.result()
-    except (ConnectionResetError, asyncio.CancelledError):
-        await attempt.close()
-        raise
-    provider = attempt.provider
-    from .upstream import observe
-    observe(request.app["store"], provider, attempt.model, result["fulfilled_intellect"], body, "completed", output=output)
-    request.app["store"].record_health(provider.fingerprint, attempt.model, success=True, real=True, ttft_ms=output["latency_ms"])
+    for chunk in result["chunks"]:
+        await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
     final = {
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
-        "actual_model": output["actual_model"], "output_text": output["text"], "provider": result["provider"],
-        "attempts": result["attempts"], "request_id": output["request_id"], "usage": output["usage"],
-        "cost_estimate": output["cost"], "ttft_ms": output["latency_ms"],
+        "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
+        "attempts": result["attempts"], "request_id": result["request_id"], "usage": result["usage"],
+        "cost_estimate": result["cost"], "ttft_ms": result["latency_ms"],
     }
     await sse.write(f"event: final\ndata: {json.dumps(final)}\n\n".encode())
     await sse.write_eof()

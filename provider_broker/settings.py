@@ -17,8 +17,12 @@ class Settings:
     probe_timeout_ms: int = 15_000
     probe_concurrency: int = 2
     health_scheduler_seconds: int = 60
-    first_event_timeout_ms: int = 20_000
+    hedge_delay_ms: int = 750
+    first_event_timeout_ms: int = 30_000
+    stream_idle_timeout_ms: int = 90_000
+    attempt_timeout_ms: int = 180_000
     route_attempt_budget: int = 32
+    response_reserve_ms: int = 5_000
     balance_scheduler_seconds: int = 15 * 60
 
     @classmethod
@@ -35,8 +39,12 @@ class Settings:
             probe_timeout_ms=int(os.getenv("BROKER_PROBE_TIMEOUT_MS", "15000")),
             probe_concurrency=int(os.getenv("BROKER_PROBE_CONCURRENCY", "2")),
             health_scheduler_seconds=int(os.getenv("BROKER_HEALTH_SCHEDULER_SECONDS", "60")),
-            first_event_timeout_ms=int(os.getenv("BROKER_FIRST_EVENT_TIMEOUT_MS", "20000")),
+            hedge_delay_ms=int(os.getenv("BROKER_HEDGE_DELAY_MS", "750")),
+            first_event_timeout_ms=int(os.getenv("BROKER_FIRST_EVENT_TIMEOUT_MS", "30000")),
+            stream_idle_timeout_ms=int(os.getenv("BROKER_STREAM_IDLE_TIMEOUT_MS", "90000")),
+            attempt_timeout_ms=int(os.getenv("BROKER_ATTEMPT_TIMEOUT_MS", "180000")),
             route_attempt_budget=int(os.getenv("BROKER_ROUTE_ATTEMPT_BUDGET", "32")),
+            response_reserve_ms=int(os.getenv("BROKER_RESPONSE_RESERVE_MS", "5000")),
             balance_scheduler_seconds=int(os.getenv("BROKER_BALANCE_SCHEDULER_SECONDS", str(15 * 60))),
         )
 

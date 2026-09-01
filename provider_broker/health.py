@@ -30,7 +30,7 @@ def structured_probe_prompt() -> str:
 async def invoke_stream(provider, body: dict) -> dict:
     """Make every health probe prove the structured-output contract."""
     if body.get("probe_contract") == "structured":
-        body = {**body, "prompt": structured_probe_prompt(), "output_token_limit": 32}
+        body = {**body, "prompt": structured_probe_prompt(), "output_token_limit": 32, "_preserve_prompt_envelope": True}
     return await _invoke_stream(provider, body)
 
 

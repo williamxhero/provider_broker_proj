@@ -22,6 +22,7 @@ python3 -m venv "$TEMP_RELEASE/venv"
 "$TEMP_RELEASE/venv/bin/pip" install "$WHEEL" >/dev/null
 install -m 755 "$STAGE/smoke.py" "$TEMP_RELEASE/smoke.py"
 install -m 755 "$STAGE/transport_matrix.py" "$TEMP_RELEASE/transport_matrix.py"
+install -m 755 "$STAGE/production_shape_smoke.py" "$TEMP_RELEASE/production_shape_smoke.py"
 install -m 755 "$STAGE/firewall.sh" "$TEMP_RELEASE/firewall.sh"
 mv -- "$TEMP_RELEASE" "$RELEASE"
 

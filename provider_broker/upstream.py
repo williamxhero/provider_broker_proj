@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import json
 import random
@@ -10,23 +11,6 @@ from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from .catalog import CATALOG, canonicalize
 
-
-class AttemptFailure(Exception):
-    def __init__(self, status: str, *, actual_model=None, latency_ms=None, diagnostic=None):
-        super().__init__(status)
-        self.status = status
-        self.actual_model, self.latency_ms = actual_model, latency_ms
-        self.diagnostic = diagnostic or {}
-
-
-class UpstreamFailure(Exception):
-    def __init__(self, attempts: list[dict]):
-        super().__init__("all eligible providers failed")
-        self.attempts = attempts
-
-
-DEFAULT_ROUTE_ATTEMPT_BUDGET = 32
-
 INTELLECT_RANK = {"standard": 0, "smart": 1, "expert": 2}
 
 
@@ -36,10 +20,56 @@ def fulfilled_intellect(model: str) -> str | None:
 
 
 def model_fulfills(requested_model: str, actual_model: str | None) -> bool:
-    """Accept a transport substitution only when it meets the requested tier."""
     requested = fulfilled_intellect(requested_model)
     actual = fulfilled_intellect(actual_model or "")
     return requested is not None and actual is not None and INTELLECT_RANK[actual] >= INTELLECT_RANK[requested]
+
+
+class AttemptFailure(Exception):
+    def __init__(self, status: str, *, diagnostic: dict | None = None, repair_note: str | None = None):
+        super().__init__(status)
+        self.status = status
+        self.diagnostic = sanitize_diagnostic(diagnostic or {})
+        self.repair_note = repair_note
+
+
+class UpstreamFailure(Exception):
+    def __init__(self, attempts: list[dict]):
+        super().__init__("all eligible providers failed")
+        self.attempts = attempts
+
+
+DIAGNOSTIC_FIELDS = {
+    "endpoint", "http_status", "content_type", "schema_hash", "output_token_limit",
+    "event_types", "finish_reason", "stream_completed", "received_bytes", "ttfb_ms",
+    "ttft_ms", "first_event_timeout_ms", "idle_timeout_ms", "structured_error_kind", "validator",
+    "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
+    "output_chars", "repair_retry", "unexpected_properties",
+    "normalized_properties",
+    "client_deadline_ms", "route_budget_ms", "response_reserve_ms",
+    "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
+    "route_score", "queue_kind",
+}
+
+RETRYABLE_ATTEMPT_STATUSES = {
+    "first_token_timeout", "stream_incomplete", "transport_failed",
+    "protocol_failed", "timed_out", "structured_output_invalid",
+    "output_truncated",
+}
+
+
+def sanitize_diagnostic(value: dict) -> dict:
+    """Allowlist bounded transport facts; never return prompts, bodies, URLs, or headers."""
+    result = {}
+    for key in DIAGNOSTIC_FIELDS:
+        item = value.get(key)
+        if isinstance(item, str):
+            result[key] = item[:160]
+        elif isinstance(item, (int, float, bool)) or item is None:
+            result[key] = item
+        elif isinstance(item, list):
+            result[key] = [str(part)[:80] for part in item[:12]]
+    return result
 
 
 def api_url(base_url: str, suffix: str) -> str:
@@ -48,47 +78,59 @@ def api_url(base_url: str, suffix: str) -> str:
 
 
 def provider_headers(provider) -> dict[str, str]:
-    return {str(name): str(value) for name, value in provider.request_headers.items()} | {"Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json"}
+    return {str(name): str(value) for name, value in provider.request_headers.items()} | {
+        "Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json",
+    }
 
 
 def extract_text(data: dict) -> str:
-    if isinstance(data.get("output_text"), str): return data["output_text"]
+    if isinstance(data.get("output_text"), str):
+        return data["output_text"]
     chunks = []
     for item in data.get("output", []) if isinstance(data.get("output"), list) else []:
-        for part in item.get("content", []) if isinstance(item, dict) and isinstance(item.get("content"), list) else []:
-            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and isinstance(part.get("text"), str): chunks.append(part["text"])
+        if not isinstance(item, dict):
+            continue
+        for part in item.get("content", []) if isinstance(item.get("content"), list) else []:
+            if isinstance(part, dict) and part.get("type") in ("output_text", "text") and isinstance(part.get("text"), str):
+                chunks.append(part["text"])
     choices = data.get("choices")
     if isinstance(choices, list) and choices and isinstance(choices[0], dict):
         content = (choices[0].get("message") or {}).get("content")
-        if isinstance(content, str): chunks.append(content)
-        elif isinstance(content, list): chunks.extend(part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str))
+        if isinstance(content, str):
+            chunks.append(content)
+        elif isinstance(content, list):
+            chunks.extend(part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str))
+    content = data.get("content")
+    if isinstance(content, list):
+        chunks.extend(part.get("text", "") for part in content if isinstance(part, dict) and isinstance(part.get("text"), str))
     return "".join(chunks)
 
 
 def normalize_usage(data: dict) -> dict:
     usage = data.get("usage") if isinstance(data.get("usage"), dict) else {}
-    result = dict(usage)
-    if "input_tokens" not in result and isinstance(usage.get("prompt_tokens"), int): result["input_tokens"] = usage["prompt_tokens"]
-    if "output_tokens" not in result and isinstance(usage.get("completion_tokens"), int): result["output_tokens"] = usage["completion_tokens"]
-    return result
+    normalized = dict(usage)
+    if "input_tokens" not in normalized and isinstance(usage.get("prompt_tokens"), int):
+        normalized["input_tokens"] = usage["prompt_tokens"]
+    if "output_tokens" not in normalized and isinstance(usage.get("completion_tokens"), int):
+        normalized["output_tokens"] = usage["completion_tokens"]
+    return normalized
 
 
 def estimate_cost(model: str, usage: dict, multiplier: float, pricing=None) -> float | None:
-    pricing = pricing or CATALOG.get(canonicalize(model)); input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-    if pricing is None or not isinstance(input_tokens, int) or not isinstance(output_tokens, int): return None
+    pricing = pricing or CATALOG.get(canonicalize(model))
+    input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
+    if pricing is None or not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return None
     details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
     cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
-    return round((max(0, input_tokens - cached) * pricing["official_input_price"] + cached * pricing["official_cache_price"] + output_tokens * pricing["official_output_price"]) / 1_000_000 * multiplier, 10)
+    uncached = max(0, input_tokens - cached)
+    cost = (uncached * pricing["official_input_price"] + cached * pricing["official_cache_price"] + output_tokens * pricing["official_output_price"]) / 1_000_000
+    return round(cost * multiplier, 10)
 
 
 def structured_schema(body: dict) -> dict | None:
-    """Recover the schema embedded by the desktop client's stable prompt envelope.
-
-    The public Broker contract predates an explicit ``output_schema`` field.  The
-    desktop client therefore sends a JSON envelope containing it in ``prompt``.
-    Recognising that envelope here lets the Broker enforce the same contract at
-    the provider boundary, without a coordinated desktop rollout.
-    """
+    if isinstance(body.get("output_schema"), dict):
+        return body["output_schema"]
     prompt = body.get("prompt")
     if not isinstance(prompt, str):
         return None
@@ -103,339 +145,622 @@ def structured_schema(body: dict) -> dict | None:
 def schema_hash(schema: dict | None) -> str | None:
     if schema is None:
         return None
-    canonical = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False)
-    return hashlib.sha256(canonical.encode()).hexdigest()[:16]
+    encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()[:16]
 
 
-class StreamingAttempt:
-    """One capacity-owning upstream stream; it can be handed to the winning caller."""
-    def __init__(self, provider, body, store=None):
-        self.provider, self.body, self.store = provider, body, store
-        self.model = canonicalize(provider.models[0]); self.started = time.perf_counter()
-        self.schema = structured_schema(body)
-        self.session = self.response = None; self.ttfb_ms = self.ttft_ms = None
-        self.metadata, self.chunks = {}, []; self.first_text = None; self.completed = False
-        self.endpoint = None; self.response_status = None; self.content_type = None
-        self.received_bytes = 0; self.event_types = []; self.finish_reason = None
-        self.first_event_timeout_ms = max(1, int(body.get("_first_event_timeout_ms", 20_000)))
-        self.first_event_deadline = time.monotonic() + self.first_event_timeout_ms / 1000
-        self._acquired = False; self._closed = False
-
-    def diagnostic(self) -> dict:
-        """Return bounded transport evidence with no prompt, body, or credential."""
-        result = {
-            "endpoint": self.endpoint,
-            "http_status": self.response_status,
-            "content_type": self.content_type,
-            "schema_hash": schema_hash(self.schema),
-            "output_token_limit": self.body.get("output_token_limit", 1024),
-            "event_types": list(self.event_types),
-            "finish_reason": self.finish_reason,
-            "stream_completed": self.completed,
-            "received_bytes": self.received_bytes,
-            "ttfb_ms": self.ttfb_ms,
-            "ttft_ms": self.ttft_ms,
-            "first_event_timeout_ms": self.first_event_timeout_ms,
-        }
-        return {key: value for key, value in result.items() if value is not None}
-
-    def _request(self):
-        if self.provider.provider_type in ("anthropic", "claude"):
-            payload = {"model": self.model, "max_tokens": self.body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": self.body["prompt"]}], "stream": True}
-            if self.schema is not None:
-                payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": self.schema}}
-            return "/chat/completions", payload
-        payload = {"model": self.model, "input": self.body["prompt"], "max_output_tokens": self.body.get("output_token_limit", 1024), "stream": True}
-        if self.body.get("effort"): payload["reasoning"] = {"effort": self.body["effort"]}
-        if self.schema is not None:
-            payload["text"] = {"format": {"type": "json_schema", "name": "broker_output", "strict": True, "schema": self.schema}}
-        return "/responses", payload
-
-    @classmethod
-    async def start(cls, provider, body, store=None):
-        attempt = cls(provider, body, store)
-        try:
-            if store is not None:
-                if not store.try_acquire(provider): raise AttemptFailure("capacity_reached")
-                attempt._acquired = True
-            timeout_seconds = max(1, body.get("deadline_ms", 60000) / 1000)
-            route_deadline = body.get("_route_deadline")
-            if isinstance(route_deadline, (int, float)):
-                remaining = route_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AttemptFailure("timed_out")
-                timeout_seconds = min(timeout_seconds, remaining)
-            endpoint, payload = attempt._request(); attempt.endpoint = endpoint; timeout = ClientTimeout(total=max(.1, timeout_seconds))
-            attempt.session = ClientSession(timeout=timeout)
-            first_event_remaining = min(timeout_seconds, attempt.first_event_deadline - time.monotonic())
-            if first_event_remaining <= 0:
-                raise AttemptFailure("first_token_timeout", diagnostic=attempt.diagnostic())
-            try:
-                attempt.response = await asyncio.wait_for(
-                    attempt.session.post(api_url(provider.base_url, endpoint), json=payload, headers=provider_headers(provider)),
-                    timeout=first_event_remaining,
-                )
-            except (asyncio.TimeoutError, TimeoutError) as exc:
-                raise AttemptFailure("first_token_timeout", diagnostic=attempt.diagnostic()) from exc
-            attempt.ttfb_ms = round((time.perf_counter() - attempt.started) * 1000, 2)
-            attempt.response_status = attempt.response.status; attempt.content_type = attempt.response.content_type
-            if attempt.response.status >= 400: raise AttemptFailure("unavailable", diagnostic=attempt.diagnostic())
-            if attempt.response.content_type == "application/json":
-                data = await attempt.response.json(content_type=None)
-                text = extract_text(data) if isinstance(data, dict) else ""
-                if not text.strip(): raise AttemptFailure("protocol_failed", diagnostic=attempt.diagnostic())
-                attempt.metadata = data; attempt.first_text = text; attempt.chunks = [text]; attempt.completed = True
-                attempt.ttft_ms = round((time.perf_counter() - attempt.started) * 1000, 2)
-            return attempt
-        except asyncio.CancelledError:
-            await attempt.close()
-            raise
-        except AttemptFailure:
-            await attempt.close(); raise
-        except (asyncio.TimeoutError, TimeoutError):
-            diagnostic = attempt.diagnostic(); await attempt.close(); raise AttemptFailure("timed_out", diagnostic=diagnostic)
-        except (ClientConnectionError, ClientError, OSError, ValueError):
-            diagnostic = attempt.diagnostic(); await attempt.close(); raise AttemptFailure("transport_failed", diagnostic=diagnostic)
-
-    def _actual_model(self):
-        value = self.metadata.get("model") if isinstance(self.metadata, dict) else None
-        return canonicalize(str(value)) if value else None
-
-    def _consume_event(self, event):
-        if not isinstance(event, dict): return None
-        event_type = event.get("type") if isinstance(event.get("type"), str) else "chat.chunk"
-        if event_type not in self.event_types and len(self.event_types) < 12: self.event_types.append(event_type)
-        if event_type in ("response.completed", "response.incomplete") and isinstance(event.get("response"), dict):
-            self.metadata.update(event["response"]); self.completed = True
-            self.finish_reason = event["response"].get("incomplete_details", {}).get("reason") if isinstance(event["response"].get("incomplete_details"), dict) else event_type
-        else: self.metadata.update({key: event[key] for key in ("id", "model", "usage") if key in event})
-        delta = event.get("delta") if isinstance(event.get("delta"), str) else None
-        choices = event.get("choices")
-        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
-            choice = choices[0]; part = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
-            if isinstance(part.get("content"), str): delta = part["content"]
-            if choice.get("finish_reason") is not None: self.finish_reason = str(choice["finish_reason"]); self.completed = True
-        # reasoning and tool events intentionally have no recognised text delta.
-        if delta and delta.strip():
-            self.chunks.append(delta)
-            if self.first_text is None:
-                self.first_text = delta; self.ttft_ms = round((time.perf_counter() - self.started) * 1000, 2)
-            return delta
+def full_schema_hash(schema: dict | None) -> str | None:
+    if schema is None:
         return None
+    encoded = json.dumps(schema, sort_keys=True, separators=(",", ":"), ensure_ascii=False).encode()
+    return hashlib.sha256(encoded).hexdigest()
 
-    async def _read_event(self):
-        raw = await self.response.content.readline()
-        if not raw: self.completed = True; return None
-        self.received_bytes += len(raw)
-        line = raw.decode("utf-8", errors="replace").strip()
-        if not line.startswith("data:"): return None
-        value = line[5:].strip()
-        if value == "[DONE]": self.completed = True; return None
-        try: return self._consume_event(json.loads(value))
-        except Exception as exc: raise AttemptFailure("protocol_failed", diagnostic=self.diagnostic()) from exc
 
-    def _validate_structured_output(self):
-        try:
-            parsed = json.loads("".join(self.chunks).strip())
-        except json.JSONDecodeError as exc:
-            status = "output_truncated" if self.finish_reason in {"length", "max_tokens", "max_output_tokens"} else "structured_output_invalid"
-            diagnostic = self.diagnostic(); diagnostic["structured_error_kind"] = "json_decode"
-            raise AttemptFailure(status, diagnostic=diagnostic) from exc
-        if not isinstance(parsed, (dict, list)):
-            diagnostic = self.diagnostic(); diagnostic["structured_error_kind"] = "non_container"
-            raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic)
-        try:
-            Draft202012Validator(self.schema).validate(parsed)
-        except SchemaError as exc:
-            diagnostic = self.diagnostic()
-            diagnostic.update({"structured_error_kind": "schema_definition", "validator": str(exc.validator),
-                               "validation_path": [str(part) for part in list(exc.absolute_path)[:8]]})
-            raise AttemptFailure("structured_schema_invalid", diagnostic=diagnostic) from exc
-        except ValidationError as exc:
-            diagnostic = self.diagnostic()
-            diagnostic.update({"structured_error_kind": "schema_validation", "validator": str(exc.validator),
-                               "validation_path": [str(part) for part in list(exc.absolute_path)[:8]]})
-            raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic) from exc
+def request_shape_diagnostic(body: dict) -> dict:
+    prompt = body.get("prompt") if isinstance(body.get("prompt"), str) else ""
+    prompt_bytes = prompt.encode("utf-8")
+    public_body = {key: value for key, value in body.items() if not key.startswith("_")}
+    schema = structured_schema(body)
+    return {
+        "prompt_sha256": hashlib.sha256(prompt_bytes).hexdigest(),
+        "prompt_chars": len(prompt), "prompt_bytes": len(prompt_bytes),
+        "request_bytes": len(json.dumps(public_body, ensure_ascii=False, separators=(",", ":")).encode("utf-8")),
+        "schema_hash": schema_hash(schema), "schema_sha256": full_schema_hash(schema),
+        "output_token_limit": body.get("output_token_limit", 1024),
+    }
 
-    async def wait_for_winner(self):
-        """Wait for text and identity, and fully validate structured responses.
 
-        A schema-bound request is intentionally buffered until completion.  This
-        prevents a provider's ordinary prose from being leaked as a successful
-        stream before the Broker can reject it and route to another provider.
-        """
-        try:
-            while True:
-                if self.first_text is not None and self._actual_model() is not None:
-                    if not model_fulfills(self.model, self._actual_model()): raise AttemptFailure("model_mismatch", actual_model=self._actual_model(), latency_ms=self.ttft_ms, diagnostic=self.diagnostic())
-                    if self.schema is not None:
-                        if not self.completed:
-                            await self._read_event()
-                            continue
-                        self._validate_structured_output()
-                    return self
-                if self.completed:
-                    if self.first_text is None: raise AttemptFailure("stream_incomplete", diagnostic=self.diagnostic())
-                    # A protocol which completes without model metadata cannot prove identity.
-                    raise AttemptFailure("protocol_failed", diagnostic=self.diagnostic())
-                remaining = self.first_event_deadline - time.monotonic()
-                if remaining <= 0:
-                    raise AttemptFailure("first_token_timeout", diagnostic=self.diagnostic())
-                try:
-                    await asyncio.wait_for(self._read_event(), timeout=remaining)
-                except (asyncio.TimeoutError, TimeoutError) as exc:
-                    raise AttemptFailure("first_token_timeout", diagnostic=self.diagnostic()) from exc
-        except AttemptFailure:
-            await self.close(); raise
-        except (asyncio.TimeoutError, TimeoutError):
-            diagnostic = self.diagnostic(); await self.close(); raise AttemptFailure("timed_out", diagnostic=diagnostic)
-        except (ClientConnectionError, ClientError, OSError):
-            diagnostic = self.diagnostic(); await self.close(); raise AttemptFailure("transport_failed", diagnostic=diagnostic)
+def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | None = None) -> str:
+    """Reinforce strictness for OpenAI-compatible gateways that only partially honor response_format."""
+    if schema is None:
+        return prompt
+    reinforced = prompt + (
+        "\n\n[Provider Broker structured-output contract]\n"
+        "Return only the JSON value required by the supplied JSON Schema. "
+        "Use exactly the declared object properties at every nesting level; do not add metadata, "
+        "explanations, labels, identifiers, or any property absent from the schema. "
+        "The response will be rejected unless it validates without repair."
+    )
+    reinforced += "\nExact JSON Schema (authoritative):\n" + json.dumps(
+        schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
+    if repair_note:
+        reinforced += "\nA prior attempt was rejected. " + repair_note + " Generate the entire JSON again from scratch."
+    return reinforced
 
-    async def iter_text(self):
-        """Yield buffered first text once, then relay the winning response live."""
-        emitted = 0
-        while emitted < len(self.chunks):
-            yield self.chunks[emitted]; emitted += 1
-        try:
-            while not self.completed:
-                delta = await self._read_event()
-                if delta:
-                    emitted = len(self.chunks); yield delta
-        finally:
-            await self.close()
 
-    async def result(self):
-        async for _ in self.iter_text(): pass
-        actual = self._actual_model()
-        if not model_fulfills(self.model, actual): raise AttemptFailure("model_mismatch", actual_model=actual, latency_ms=self.ttft_ms, diagnostic=self.diagnostic())
-        if not self.first_text: raise AttemptFailure("stream_incomplete", diagnostic=self.diagnostic())
-        usage = normalize_usage(self.metadata)
-        return {"text": "".join(self.chunks), "chunks": list(self.chunks), "actual_model": actual,
-                "latency_ms": self.ttft_ms, "ttfb_ms": self.ttfb_ms, "duration_ms": round((time.perf_counter() - self.started) * 1000, 2),
-                "usage": usage, "request_id": str(self.metadata.get("id") or uuid.uuid4()),
-                "cost": estimate_cost(actual, usage, self.provider.multiplier, self.provider.pricing)}
-
-    async def close(self):
-        if self._closed: return
-        self._closed = True
-        if self.response is not None: self.response.close()
-        if self.session is not None: await self.session.close()
-        if self._acquired: self.store.release(self.provider); self._acquired = False
+def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,
+                               *, normalize_additional: bool = False) -> tuple[str, list[str]]:
+    try:
+        Draft202012Validator.check_schema(schema)
+    except SchemaError as exc:
+        raise AttemptFailure("structured_schema_invalid", diagnostic=diagnostic | {
+            "structured_error_kind": "schema_definition", "validator": str(exc.validator),
+            "validation_path": [str(part) for part in list(exc.absolute_path)[:8]],
+        }) from exc
+    if finish_reason in {"length", "max_tokens", "max_output_tokens", "response.incomplete"}:
+        raise AttemptFailure(
+            "output_truncated",
+            diagnostic=diagnostic | {"structured_error_kind": "truncated"},
+            repair_note=(
+                "The prior response reached the output limit. Regenerate concise, complete JSON: "
+                "keep every required field, remove repetition, and finish well within the token limit."
+            ),
+        )
+    try:
+        parsed = json.loads(text.strip())
+    except json.JSONDecodeError as exc:
+        raise AttemptFailure(
+            "structured_output_invalid",
+            diagnostic=diagnostic | {"structured_error_kind": "json_decode"},
+            repair_note="The prior response was not one complete JSON value. Return only a complete JSON value with no prose or fences.",
+        ) from exc
+    validator = Draft202012Validator(schema)
+    normalized = []
+    while True:
+        errors = list(validator.iter_errors(parsed))
+        if not errors:
+            rendered = json.dumps(parsed, ensure_ascii=False, separators=(",", ":")) if normalized else text
+            return rendered, normalized
+        exc = errors[0]
+        path = [str(part) for part in list(exc.absolute_path)[:8]]
+        unexpected = []
+        if exc.validator == "additionalProperties" and isinstance(exc.instance, dict) and isinstance(exc.schema, dict):
+            declared = exc.schema.get("properties")
+            if isinstance(declared, dict):
+                unexpected = sorted(str(key) for key in set(exc.instance) - set(declared))[:12]
+        if normalize_additional and unexpected and len(normalized) + len(unexpected) <= 32:
+            for key in unexpected:
+                exc.instance.pop(key, None)
+                normalized.append((".".join(path) + "." if path else "") + key)
+            continue
+        location = ".".join(path) or "the root object"
+        repair_note = None
+        if unexpected:
+            repair_note = f"At {location}, omit undeclared properties: {', '.join(unexpected)}."
+        elif str(exc.validator):
+            repair_note = f"At {location}, satisfy the JSON Schema {exc.validator} constraint exactly."
+        raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {
+            "structured_error_kind": "schema_validation", "validator": str(exc.validator),
+            "validation_path": path, "unexpected_properties": unexpected,
+            "normalized_properties": normalized,
+        }, repair_note=repair_note) from exc
 
 
 async def invoke_stream(provider, body: dict) -> dict:
-    attempt = await StreamingAttempt.start(provider, body)
-    try:
-        await attempt.wait_for_winner()
-        return await attempt.result()
-    finally:
-        await attempt.close()
+    model = canonicalize(provider.models[0])
+    schema = structured_schema(body)
+    effort = body.get("effort")
+    repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
+    provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
+    if provider.provider_type in ("anthropic", "claude"):
+        payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
+        if schema is not None:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": schema}}
+        endpoint = "/chat/completions"
+    else:
+        payload = {"model": model, "input": provider_prompt, "max_output_tokens": body.get("output_token_limit", 1024), "stream": True}
+        if effort:
+            payload["reasoning"] = {"effort": effort}
+        if schema is not None:
+            payload["text"] = {"format": {"type": "json_schema", "name": "broker_output", "strict": True, "schema": schema}}
+        endpoint = "/responses"
+    started = time.monotonic()
+    route_deadline = float(body.get("_route_deadline", started + max(.001, body.get("deadline_ms", 60000) / 1000)))
+    first_event_timeout = max(.001, float(body.get("_first_event_timeout_ms", 20000)) / 1000)
+    stream_idle_timeout = max(.001, float(body.get("_stream_idle_timeout_ms", 60000)) / 1000)
+    attempt_timeout = max(.001, float(body.get("_attempt_timeout_ms", 120000)) / 1000)
+    attempt_deadline = min(route_deadline, started + attempt_timeout)
+    first_event_deadline = min(attempt_deadline, started + first_event_timeout)
+    metadata, chunks, event_types = {}, [], []
+    completed = False
+    finish_reason = None
+    received_bytes = 0
+    ttfb_ms = ttft_ms = None
+    last_progress_at = started
+    progress_event_count = 0
+    max_event_gap_ms = 0.0
+    saw_progress = False
+    response_status = None
+    content_type = None
+    normalized_properties = []
+    request_shape = request_shape_diagnostic(body)
 
+    def diagnostic():
+        return sanitize_diagnostic({
+            "endpoint": endpoint, "http_status": response_status, "content_type": content_type,
+            **request_shape,
+            "event_types": event_types, "finish_reason": finish_reason, "stream_completed": completed,
+            "received_bytes": received_bytes, "ttfb_ms": ttfb_ms, "ttft_ms": ttft_ms,
+            "first_event_timeout_ms": round(first_event_timeout * 1000),
+            "idle_timeout_ms": round(stream_idle_timeout * 1000),
+            "attempt_timeout_ms": round(attempt_timeout * 1000),
+            "progress_event_count": progress_event_count,
+            "max_event_gap_ms": round(max_event_gap_ms, 2),
+            "output_chars": sum(len(chunk) for chunk in chunks),
+            "repair_retry": bool(repair_note),
+            "normalized_properties": normalized_properties,
+            "client_deadline_ms": body.get("_client_deadline_ms"),
+            "route_budget_ms": body.get("_route_budget_ms"),
+            "response_reserve_ms": body.get("_response_reserve_ms"),
+        })
 
-def observe(store, provider, requested_model, tier, body, status, *, output=None, diagnostic=None):
-    output = output or {}; usage = output.get("usage") or {}
-    store.observe(fingerprint=provider.fingerprint, requested_model=requested_model, actual_model=output.get("actual_model"), tier=tier, effort=body.get("effort"), success=int(status == "completed"), latency_ms=output.get("latency_ms"), error=None, status=status, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"), cost=output.get("cost"), request_id=output.get("request_id") or str(uuid.uuid4()), diagnostic=diagnostic)
+    def record_progress():
+        nonlocal last_progress_at, progress_event_count, max_event_gap_ms, saw_progress
+        now = time.monotonic()
+        max_event_gap_ms = max(max_event_gap_ms, (now - last_progress_at) * 1000)
+        last_progress_at = now
+        progress_event_count += 1
+        saw_progress = True
 
-
-async def _hedged_band(store, providers, tier, body, cap, hedge_delay_ms, attempts):
-    # cap limits simultaneous attempts, not the total number of candidates that
-    # may be tried.  Keep the full band queued so a failed or silent stream can
-    # immediately release its slot to the next healthy route.
-    shuffled = random.sample(providers, k=len(providers))
-    state_rank = {"healthy": 0, "half_open": 1, "unknown": 2, "suspect": 3}
-    def quality(provider):
-        evidence = store.health(provider.fingerprint, canonicalize(provider.models[0]))
-        success = evidence.get("smoothed_success")
-        ttft = evidence.get("smoothed_ttft_ms")
-        return (
-            state_rank.get(evidence.get("state"), 4),
-            0 if evidence.get("last_real_success") else 1,
-            -float(success) if success is not None else 1.0,
-            float(ttft) if ttft is not None else float("inf"),
-        )
-    # Shuffle first so equally evidenced routes remain load-balanced, then use
-    # stable quality ordering to keep proven real successes ahead of unknown or
-    # repeatedly failing candidates.
-    selected = sorted(shuffled, key=quality)
-    cap = min(len(selected), max(1, cap))
-    active, next_index, loop = {}, 0, asyncio.get_running_loop()
-    async def launch(provider):
-        if body["_route_attempts_started"] >= body["_route_attempt_budget"]:
+    def consume_event(event):
+        nonlocal completed, finish_reason, ttft_ms
+        if not isinstance(event, dict):
             return False
-        body["_route_attempts_started"] += 1
-        async def run():
-            attempt = None
+        event_type = event.get("type") if isinstance(event.get("type"), str) else "chat.chunk"
+        if event_type not in event_types and len(event_types) < 12:
+            event_types.append(event_type)
+        recognized = event_type.startswith("response.") or event_type in {
+            "chat.chunk", "message_start", "content_block_start", "content_block_delta",
+            "message_delta", "message_stop",
+        }
+        output_delta = None
+        if event_type in ("response.completed", "response.incomplete") and isinstance(event.get("response"), dict):
+            metadata.update(event["response"])
+            completed = True
+            details = event["response"].get("incomplete_details")
+            finish_reason = details.get("reason") if isinstance(details, dict) else event_type
+        else:
+            metadata.update({key: event[key] for key in ("id", "model", "usage") if key in event})
+        if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
+            output_delta = event["delta"]
+        elif event_type == "response.output_text.done" and not chunks and isinstance(event.get("text"), str):
+            output_delta = event["text"]
+        elif event_type == "content_block_start":
+            block = event.get("content_block")
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                output_delta = block["text"]
+        elif event_type == "content_block_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+                output_delta = delta["text"]
+        elif event_type == "message_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict) and delta.get("stop_reason") is not None:
+                finish_reason = str(delta["stop_reason"])
+        elif event_type == "message_stop":
+            completed = True
+        choices = event.get("choices")
+        if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            recognized = True
+            choice = choices[0]
+            choice_delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
+            if isinstance(choice_delta.get("content"), str):
+                output_delta = choice_delta["content"]
+            if choice.get("finish_reason") is not None:
+                finish_reason = str(choice["finish_reason"])
+                completed = True
+        elif event_type == "chat.chunk" and isinstance(event.get("delta"), str):
+            output_delta = event["delta"]
+        if output_delta:
+            if not chunks:
+                ttft_ms = round((time.monotonic() - started) * 1000, 2)
+            chunks.append(output_delta)
+        return recognized
+
+    if schema is not None:
+        try:
+            Draft202012Validator.check_schema(schema)
+        except SchemaError as exc:
+            raise AttemptFailure("structured_schema_invalid", diagnostic=diagnostic() | {
+                "structured_error_kind": "schema_definition", "validator": str(exc.validator),
+                "validation_path": [str(part) for part in list(exc.absolute_path)[:8]],
+            }) from exc
+
+    timeout = ClientTimeout(total=max(.001, attempt_deadline - time.monotonic()))
+    try:
+        async with ClientSession(timeout=timeout) as session:
             try:
-                attempt = await StreamingAttempt.start(provider, body, store)
-                await attempt.wait_for_winner()
-                return attempt
-            except BaseException:
-                if attempt is not None: await attempt.close()
-                raise
-        active[asyncio.create_task(run())] = provider
+                response = await asyncio.wait_for(session.post(api_url(provider.base_url, endpoint), json=payload, headers=provider_headers(provider)), max(.001, first_event_deadline - time.monotonic()))
+            except (asyncio.TimeoutError, TimeoutError) as exc:
+                raise AttemptFailure("first_token_timeout", diagnostic=diagnostic()) from exc
+            async with response:
+                ttfb_ms = round((time.monotonic() - started) * 1000, 2)
+                response_status, content_type = response.status, response.content_type
+                if response.status >= 400:
+                    await response.read()
+                    raise AttemptFailure("unavailable", diagnostic=diagnostic())
+                if response.content_type == "application/json":
+                    try:
+                        remaining = attempt_deadline - time.monotonic()
+                        if remaining <= 0:
+                            raise AttemptFailure("timed_out", diagnostic=diagnostic())
+                        data = await asyncio.wait_for(response.json(content_type=None), remaining)
+                    except (asyncio.TimeoutError, TimeoutError) as exc:
+                        raise AttemptFailure("timed_out", diagnostic=diagnostic()) from exc
+                    except AttemptFailure:
+                        raise
+                    except Exception as exc:
+                        raise AttemptFailure("protocol_failed", diagnostic=diagnostic()) from exc
+                    text = extract_text(data) if isinstance(data, dict) else ""
+                    if not text.strip():
+                        raise AttemptFailure("protocol_failed", diagnostic=diagnostic())
+                    metadata = data
+                    chunks = [text]
+                    completed = True
+                    ttft_ms = round((time.monotonic() - started) * 1000, 2)
+                    record_progress()
+                else:
+                    sse_event_type = None
+                    while not completed:
+                        now = time.monotonic()
+                        if now >= attempt_deadline:
+                            raise AttemptFailure("timed_out", diagnostic=diagnostic())
+                        read_deadline = min(attempt_deadline, last_progress_at + stream_idle_timeout) if saw_progress else first_event_deadline
+                        if now >= read_deadline:
+                            status = "timed_out" if read_deadline >= attempt_deadline else "stream_incomplete" if saw_progress else "first_token_timeout"
+                            raise AttemptFailure(status, diagnostic=diagnostic())
+                        try:
+                            raw = await asyncio.wait_for(response.content.readline(), read_deadline - now)
+                        except (asyncio.TimeoutError, TimeoutError) as exc:
+                            status = "timed_out" if read_deadline >= attempt_deadline else "stream_incomplete" if saw_progress else "first_token_timeout"
+                            raise AttemptFailure(status, diagnostic=diagnostic()) from exc
+                        if not raw:
+                            break
+                        received_bytes += len(raw)
+                        line = raw.decode("utf-8", errors="replace").strip()
+                        if line.startswith("event:"):
+                            sse_event_type = line[6:].strip() or None
+                            continue
+                        if not line.startswith("data:"):
+                            continue
+                        value = line[5:].strip()
+                        if value == "[DONE]":
+                            completed = True
+                            record_progress()
+                            continue
+                        try:
+                            event = json.loads(value)
+                            if isinstance(event, dict) and sse_event_type and not isinstance(event.get("type"), str):
+                                event = {**event, "type": sse_event_type}
+                            sse_event_type = None
+                            if consume_event(event):
+                                record_progress()
+                        except json.JSONDecodeError as exc:
+                            raise AttemptFailure("protocol_failed", diagnostic=diagnostic()) from exc
+    except AttemptFailure:
+        raise
+    except (asyncio.TimeoutError, TimeoutError) as exc:
+        raise AttemptFailure("timed_out", diagnostic=diagnostic()) from exc
+    except (ClientConnectionError, ClientError, OSError, ValueError) as exc:
+        raise AttemptFailure("transport_failed", diagnostic=diagnostic()) from exc
+    if completed and not chunks:
+        buffered = extract_text(metadata)
+        if buffered.strip():
+            chunks.append(buffered)
+            ttft_ms = ttft_ms or round((time.monotonic() - started) * 1000, 2)
+    text = "".join(chunks)
+    if not completed or not text.strip():
+        raise AttemptFailure("stream_incomplete", diagnostic=diagnostic())
+    if schema is not None:
+        text, normalized_properties = validate_structured_output(
+            text, schema, finish_reason, diagnostic(), normalize_additional=bool(repair_note),
+        )
+        if normalized_properties:
+            chunks = [text]
+    usage = normalize_usage(metadata)
+    actual_model = canonicalize(str(metadata.get("model") or model))
+    return {
+        "text": text, "chunks": chunks, "actual_model": actual_model,
+        "latency_ms": ttft_ms, "usage": usage,
+        "request_id": str(metadata.get("id") or uuid.uuid4()),
+        "cost": estimate_cost(actual_model, usage, provider.multiplier, provider.pricing if actual_model == model else None),
+        "diagnostic": diagnostic(),
+    }
+
+
+async def invoke(provider, body: dict) -> dict:
+    """Non-stream callers also use upstream streaming so first-token timeouts are enforceable."""
+    return await invoke_stream(provider, body)
+
+
+def observe(store, provider, requested_model, tier, body, status, *, output=None, attempt=None, route_id=None):
+    output = output or {}
+    attempt = attempt or {}
+    usage = output.get("usage") or {}
+    store.observe(
+        fingerprint=provider.fingerprint, requested_model=requested_model,
+        actual_model=output.get("actual_model"), tier=tier, effort=body.get("effort"),
+        success=int(status == "completed"), latency_ms=output.get("latency_ms"), error=None,
+        status=status, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
+        cost=output.get("cost"), request_id=output.get("request_id") or str(uuid.uuid4()),
+        diagnostic_json=json.dumps(sanitize_diagnostic(attempt.get("diagnostic") or output.get("diagnostic") or {}), sort_keys=True),
+        route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
+        elapsed_ms=attempt.get("elapsed_ms"),
+    )
+    neutral = {"cancelled", "client_cancelled"}
+    if status not in neutral and hasattr(store, "record_health"):
+        store.record_health(
+            provider.fingerprint, requested_model, success=status == "completed", real=True,
+            ttft_ms=output.get("latency_ms"), immediate_open=status == "model_mismatch",
+        )
+
+
+class AttemptAudit:
+    def __init__(self, route_started: float):
+        self.route_started = route_started
+        self.rows = {}
+
+    def start(self, sequence: int, provider, *, queue_kind: str, route_score: int):
+        self.rows[sequence] = {
+            "attempt": sequence + 1, "provider": provider.name,
+            "model": canonicalize(provider.models[0]),
+            "started_ms": round((time.monotonic() - self.route_started) * 1000, 2),
+            "diagnostic": {"queue_kind": queue_kind, "route_score": route_score},
+            "_started": time.monotonic(),
+        }
+
+    def finish(self, sequence: int, status: str, *, output=None, diagnostic=None, fulfilled=None):
+        row = self.rows[sequence]
+        row["status"] = status
+        row["elapsed_ms"] = round((time.monotonic() - row.pop("_started")) * 1000, 2)
+        if output and output.get("actual_model"):
+            row["actual_model"] = output["actual_model"]
+        if fulfilled is not None:
+            row["fulfilled"] = fulfilled
+        incoming = {key: value for key, value in (diagnostic or {}).items() if value is not None}
+        safe = sanitize_diagnostic(row.get("diagnostic", {}) | incoming)
+        if safe:
+            row["diagnostic"] = safe
+
+    def public(self):
+        return [dict(self.rows[index]) for index in sorted(self.rows)]
+
+    def row(self, sequence: int):
+        return dict(self.rows[sequence])
+
+
+def retryable_attempt(failure: AttemptFailure) -> bool:
+    if failure.status in RETRYABLE_ATTEMPT_STATUSES:
         return True
-    if not await launch(selected[0]):
-        return None
-    next_index = 1; deadline = loop.time() + hedge_delay_ms / 1000
-    while active:
-        timeout = None if next_index >= len(selected) or len(active) >= cap else max(0, deadline - loop.time())
-        done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-        if not done:
-            if await launch(selected[next_index]):
-                next_index += 1; deadline = loop.time() + hedge_delay_ms / 1000
-            else:
-                deadline = loop.time() + hedge_delay_ms / 1000
-            continue
-        for task in done:
-            provider = active.pop(task); model = canonicalize(provider.models[0])
-            try: winner = task.result()
-            except AttemptFailure as exc:
-                mismatch_output = {"actual_model": exc.actual_model, "latency_ms": exc.latency_ms} if exc.status == "model_mismatch" else None
-                observe(store, provider, model, tier, body, "completed" if exc.status == "model_mismatch" else exc.status, output=mismatch_output, diagnostic=exc.diagnostic)
-                store.record_health(provider.fingerprint, model, success=False, real=True, immediate_open=exc.status == "model_mismatch")
-                if exc.status == "model_mismatch": store.block_route(provider.fingerprint, model)
-                attempts.append({"provider": provider.name, "status": "completed" if exc.status == "model_mismatch" else exc.status, "actual_model": exc.actual_model, "fulfilled": False} if exc.status == "model_mismatch" else {"provider": provider.name, "status": exc.status})
-                if next_index < len(selected) and len(active) < cap and await launch(selected[next_index]):
-                    next_index += 1; deadline = loop.time() + hedge_delay_ms / 1000
-                continue
-            for loser, loser_provider in list(active.items()):
-                loser.cancel(); await asyncio.gather(loser, return_exceptions=True)
-                observe(store, loser_provider, canonicalize(loser_provider.models[0]), tier, body, "cancelled")
-                attempts.append({"provider": loser_provider.name, "status": "cancelled"})
-            active.clear()
-            return winner
-    return None
+    if failure.status != "unavailable":
+        return False
+    status = failure.diagnostic.get("http_status")
+    return status is None or status in {408, 409, 425, 429} or isinstance(status, int) and status >= 500
 
 
-async def route(store, tier: str, body: dict, parallel_cap: int = 3, hedge_delay_ms: int = 750,
-                first_event_timeout_ms: int = 20_000,
-                route_attempt_budget: int = DEFAULT_ROUTE_ATTEMPT_BUDGET) -> dict:
-    attempts = []; tiers = ("standard", "smart", "expert")
+async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
+                *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
+                stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
+                route_attempt_budget: int = 32, response_reserve_ms: int = 5000,
+                cancel_grace_ms: int = 50) -> dict:
+    route_started = time.monotonic()
+    deadline_ms = body.get("deadline_ms", 60000)
+    client_deadline_ms = max(1, int(deadline_ms)) if isinstance(deadline_ms, (int, float)) else 60000
+    reserve_cap_ms = max(0, client_deadline_ms // 10)
+    reserve_ms = min(max(0, int(response_reserve_ms)), reserve_cap_ms, max(0, client_deadline_ms - 1))
+    route_budget_ms = max(1, client_deadline_ms - reserve_ms)
+    deadline_seconds = route_budget_ms / 1000
+    route_deadline = route_started + deadline_seconds
+    attempt_budget = max(1, int(route_attempt_budget))
+    cap = max(1, int(parallel_cap))
+    audit = AttemptAudit(route_started)
+    route_id = str(uuid.uuid4())
+    attempts_started = 0
     effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
-    effective_first_event_timeout_ms = max(1, first_event_timeout_ms) * effort_multiplier
-    body = {**body, "_route_deadline": time.monotonic() + max(1, body.get("deadline_ms", 60_000) / 1000),
-            "_route_attempts_started": 0, "_route_attempt_budget": max(1, route_attempt_budget),
-            "_first_event_timeout_ms": effective_first_event_timeout_ms}
+    effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
+    invocation_body = {
+        **body,
+        "_route_deadline": route_deadline,
+        "_first_event_timeout_ms": effective_first_event_timeout_ms,
+        "_stream_idle_timeout_ms": max(1, int(stream_idle_timeout_ms)),
+        "_attempt_timeout_ms": max(1, int(attempt_timeout_ms)),
+        "_client_deadline_ms": client_deadline_ms,
+        "_route_budget_ms": route_budget_ms,
+        "_response_reserve_ms": reserve_ms,
+    }
+    tiers = ("standard", "smart", "expert")
+    primary = deque()
+    repair = deque()
+    priority_retry = deque()
+    retry = deque()
+    retries_scheduled = set()
+    route_scores = {}
+
+    def candidate_score(provider, candidate_tier):
+        key = (provider.fingerprint, canonicalize(provider.models[0]), candidate_tier)
+        if key not in route_scores:
+            route_scores[key] = store.route_score(provider, key[1], body)
+        return route_scores[key]
+
     for candidate_tier in tiers[tiers.index(tier):]:
         for band in price_bands(store.providers(candidate_tier)):
-            if body["_route_attempts_started"] >= body["_route_attempt_budget"] or time.monotonic() >= body["_route_deadline"]:
-                raise UpstreamFailure(attempts)
             available = [provider for provider in band if store.has_capacity(provider)]
-            if not available: continue
-            winner = await _hedged_band(store, available, candidate_tier, body, parallel_cap, hedge_delay_ms, attempts)
-            if winner is None: continue
-            actual_model = winner._actual_model() or winner.model
-            fulfilled = candidate_tier if actual_model == winner.model else fulfilled_intellect(actual_model) or candidate_tier
-            output = {"actual_model": actual_model, "latency_ms": winner.ttft_ms}
-            attempts.append({"provider": winner.provider.name, "status": "completed", "actual_model": actual_model, "fulfilled": True})
-            return {"attempt": winner, "provider": winner.provider.name, "attempts": attempts, "fulfilled_intellect": fulfilled, "fingerprint": winner.provider.fingerprint, "output": output}
-    raise UpstreamFailure(attempts)
+            randomized = random.sample(available, k=len(available))
+            ranked = sorted(
+                randomized,
+                key=lambda provider: candidate_score(provider, candidate_tier),
+                reverse=True,
+            )
+            primary.extend(
+                (provider, candidate_tier, None, candidate_score(provider, candidate_tier))
+                for provider in ranked
+            )
+
+    active = {}
+    next_hedge_at = route_started
+
+    def launch_one():
+        nonlocal attempts_started, next_hedge_at
+        while (repair or priority_retry or primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
+            if repair:
+                provider, candidate_tier, repair_note, route_score = repair.popleft()
+                queue_kind = "repair"
+            elif priority_retry:
+                provider, candidate_tier, repair_note, route_score = priority_retry.popleft()
+                queue_kind = "priority_retry"
+            elif primary:
+                provider, candidate_tier, repair_note, route_score = primary.popleft()
+                queue_kind = "primary"
+            else:
+                provider, candidate_tier, repair_note, route_score = retry.popleft()
+                queue_kind = "retry"
+            if not store.try_acquire(provider):
+                continue
+            sequence = attempts_started
+            attempts_started += 1
+            audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)
+
+            async def run(selected=provider, selected_repair_note=repair_note):
+                try:
+                    selected_body = invocation_body
+                    if selected_repair_note:
+                        selected_body = {**invocation_body, "_structured_repair_note": selected_repair_note}
+                    return await invoker(selected, selected_body)
+                finally:
+                    store.release(selected)
+
+            active[asyncio.create_task(run())] = (sequence, provider, candidate_tier)
+            next_hedge_at = time.monotonic() + max(0, hedge_delay_ms) / 1000
+            return True
+        return False
+
+    async def cancel_active(status: str):
+        tasks = list(active)
+        for task, (sequence, provider, candidate_tier) in active.items():
+            task.cancel()
+            diagnostic = request_shape_diagnostic(body) | {
+                "client_deadline_ms": client_deadline_ms, "route_budget_ms": route_budget_ms,
+                "response_reserve_ms": reserve_ms,
+            }
+            if status == "timed_out":
+                diagnostic["first_event_timeout_ms"] = effective_first_event_timeout_ms
+            audit.finish(sequence, status, diagnostic=diagnostic)
+            observe(
+                store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
+                attempt=audit.row(sequence), route_id=route_id,
+            )
+        active.clear()
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=max(0, cancel_grace_ms) / 1000)
+
+        def consume_result(task):
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        for task in done:
+            consume_result(task)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(consume_result)
+
+    launch_one()
+    try:
+        while active or repair or priority_retry or primary or retry:
+            now = time.monotonic()
+            if now >= route_deadline or attempts_started >= attempt_budget and not active:
+                if active:
+                    await cancel_active("timed_out")
+                break
+            if not active:
+                if not launch_one():
+                    break
+                continue
+            can_hedge = bool(repair or priority_retry or primary or retry) and attempts_started < attempt_budget and len(active) < cap
+            timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
+            done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                launch_one()
+                continue
+
+            winner = None
+            for task in sorted(done, key=lambda item: active[item][0]):
+                sequence, provider, candidate_tier = active.pop(task)
+                requested_model = canonicalize(provider.models[0])
+                try:
+                    output = task.result()
+                except AttemptFailure as exc:
+                    audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
+                    observe(
+                        store, provider, requested_model, candidate_tier, body, exc.status,
+                        attempt=audit.row(sequence), route_id=route_id,
+                    )
+                    retry_kind = "repair" if exc.repair_note else "transient"
+                    retry_key = (provider.fingerprint, requested_model, candidate_tier, retry_kind)
+                    if retryable_attempt(exc) and retry_key not in retries_scheduled:
+                        retries_scheduled.add(retry_key)
+                        route_score = candidate_score(provider, candidate_tier)
+                        target = repair if exc.repair_note else priority_retry if route_score >= 500 else retry
+                        target.append((provider, candidate_tier, exc.repair_note, route_score))
+                    continue
+                if not model_fulfills(requested_model, output["actual_model"]):
+                    store.block_route(provider.fingerprint, requested_model)
+                    audit.finish(sequence, "model_mismatch", output=output, diagnostic=output.get("diagnostic"), fulfilled=False)
+                    observe(
+                        store, provider, requested_model, candidate_tier, body, "model_mismatch", output=output,
+                        attempt=audit.row(sequence), route_id=route_id,
+                    )
+                    continue
+                audit.finish(sequence, "completed", output=output, diagnostic=output.get("diagnostic"), fulfilled=True)
+                observe(
+                    store, provider, requested_model, candidate_tier, body, "completed", output=output,
+                    attempt=audit.row(sequence), route_id=route_id,
+                )
+                if winner is None:
+                    actual_tier = fulfilled_intellect(output["actual_model"])
+                    fulfilled_tier = actual_tier if actual_tier and INTELLECT_RANK[actual_tier] > INTELLECT_RANK[candidate_tier] else candidate_tier
+                    winner = (output, provider, fulfilled_tier)
+
+            if winner is not None:
+                output, provider, candidate_tier = winner
+                await cancel_active("cancelled")
+                return output | {
+                    "provider": provider.name, "attempts": audit.public(),
+                    "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
+                }
+
+            while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or retry):
+                if not launch_one():
+                    break
+                if hedge_delay_ms > 0:
+                    break
+    except asyncio.CancelledError:
+        await cancel_active("cancelled")
+        raise
+    raise UpstreamFailure(audit.public())
 
 
 def price_bands(providers):
+    """Split all Key prices at their median, ordered from lower to higher price."""
     ordered = sorted(providers, key=lambda provider: (provider.price_group, provider.id))
-    if not ordered: return []
-    midpoint = len(ordered) // 2; median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
-    lower = [provider for provider in ordered if provider.price_group <= median]; higher = [provider for provider in ordered if provider.price_group > median]
+    if not ordered:
+        return []
+    midpoint = len(ordered) // 2
+    median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
+    lower = [provider for provider in ordered if provider.price_group <= median]
+    higher = [provider for provider in ordered if provider.price_group > median]
     return [lower] + ([higher] if higher else [])
