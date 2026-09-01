@@ -533,7 +533,8 @@ def retryable_attempt(failure: AttemptFailure) -> bool:
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
                 *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
                 stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
-                route_attempt_budget: int = 32, response_reserve_ms: int = 5000) -> dict:
+                route_attempt_budget: int = 32, response_reserve_ms: int = 5000,
+                cancel_grace_ms: int = 50) -> dict:
     route_started = time.monotonic()
     deadline_ms = body.get("deadline_ms", 60000)
     client_deadline_ms = max(1, int(deadline_ms)) if isinstance(deadline_ms, (int, float)) else 60000
@@ -626,6 +627,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         return False
 
     async def cancel_active(status: str):
+        tasks = list(active)
         for task, (sequence, provider, candidate_tier) in active.items():
             task.cancel()
             diagnostic = request_shape_diagnostic(body) | {
@@ -639,8 +641,23 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
                 attempt=audit.row(sequence), route_id=route_id,
             )
-        await asyncio.gather(*active, return_exceptions=True)
         active.clear()
+        if not tasks:
+            return
+        done, pending = await asyncio.wait(tasks, timeout=max(0, cancel_grace_ms) / 1000)
+
+        def consume_result(task):
+            if not task.cancelled():
+                try:
+                    task.exception()
+                except (asyncio.CancelledError, Exception):
+                    pass
+
+        for task in done:
+            consume_result(task)
+        for task in pending:
+            task.cancel()
+            task.add_done_callback(consume_result)
 
     launch_one()
     try:

@@ -750,6 +750,36 @@ async def test_exact_winner_can_repair_truncation_after_one_transient_retry():
     ]
 
 
+async def test_slow_upstream_cancellation_cannot_delay_winner_response():
+    winner, slow_loser = provider(0, secret="winner"), provider(1, secret="slow-loser")
+    store = FakeStore([winner, slow_loser])
+    loser_started = asyncio.Event()
+
+    async def invoke(item, _body):
+        if item.id == 0:
+            await loser_started.wait()
+            return completed()
+        loser_started.set()
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            await asyncio.sleep(.2)
+            raise
+
+    started = asyncio.get_running_loop().time()
+    result = await route(
+        store, "standard", {"prompt": "winner", "deadline_ms": 500},
+        parallel_cap=2, invoker=invoke, hedge_delay_ms=0,
+        route_attempt_budget=2, response_reserve_ms=0, cancel_grace_ms=10,
+    )
+    elapsed = asyncio.get_running_loop().time() - started
+
+    assert result["text"] == "recovered"
+    assert elapsed < .1
+    assert [row["status"] for row in result["attempts"]] == ["completed", "cancelled"]
+    await asyncio.sleep(.25)
+
+
 def test_truncated_structured_output_requests_a_concise_complete_repair():
     with pytest.raises(AttemptFailure) as failure:
         validate_structured_output(
