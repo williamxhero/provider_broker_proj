@@ -174,7 +174,7 @@ def main():
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--token-count", type=int, default=72_000)
     parser.add_argument("--deadline-ms", type=int, default=260_000)
-    parser.add_argument("--output-token-limit", type=int, default=2_000)
+    parser.add_argument("--output-token-limit", type=int, default=6_000)
     args = parser.parse_args()
     if args.runs < 1 or args.token_count < 1 or args.deadline_ms < 1 or args.output_token_limit < 1:
         parser.error("runs, token-count, deadline-ms, and output-token-limit must be positive")

@@ -131,6 +131,19 @@ def schema_hash(schema: dict | None) -> str | None:
     return hashlib.sha256(encoded).hexdigest()[:16]
 
 
+def strict_schema_prompt(prompt: str, schema: dict | None) -> str:
+    """Reinforce strictness for OpenAI-compatible gateways that only partially honor response_format."""
+    if schema is None:
+        return prompt
+    return prompt + (
+        "\n\n[Provider Broker structured-output contract]\n"
+        "Return only the JSON value required by the supplied JSON Schema. "
+        "Use exactly the declared object properties at every nesting level; do not add metadata, "
+        "explanations, labels, identifiers, or any property absent from the schema. "
+        "The response will be rejected unless it validates without repair."
+    )
+
+
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict):
     try:
         Draft202012Validator.check_schema(schema)
@@ -158,13 +171,14 @@ async def invoke_stream(provider, body: dict) -> dict:
     model = canonicalize(provider.models[0])
     schema = structured_schema(body)
     effort = body.get("effort")
+    provider_prompt = strict_schema_prompt(body["prompt"], schema)
     if provider.provider_type in ("anthropic", "claude"):
-        payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": body["prompt"]}], "stream": True}
+        payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
         if schema is not None:
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": schema}}
         endpoint = "/chat/completions"
     else:
-        payload = {"model": model, "input": body["prompt"], "max_output_tokens": body.get("output_token_limit", 1024), "stream": True}
+        payload = {"model": model, "input": provider_prompt, "max_output_tokens": body.get("output_token_limit", 1024), "stream": True}
         if effort:
             payload["reasoning"] = {"effort": effort}
         if schema is not None:

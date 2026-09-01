@@ -13,6 +13,7 @@ from provider_broker.upstream import (
     AttemptFailure,
     invoke_stream,
     route,
+    strict_schema_prompt,
     structured_schema,
     validate_structured_output,
 )
@@ -146,7 +147,61 @@ def production_like_body():
         "intellect": "standard",
         "effort": "medium",
         "deadline_ms": 500,
-        "output_token_limit": 2_000,
+        "output_token_limit": 6_000,
+    }
+
+
+def test_strict_schema_prompt_only_reinforces_structured_requests():
+    prompt = "private user request"
+    assert strict_schema_prompt(prompt, None) == prompt
+    reinforced = strict_schema_prompt(prompt, production_like_schema())
+    assert reinforced.startswith(prompt)
+    assert "exactly the declared object properties" in reinforced
+    assert "validates without repair" in reinforced
+
+
+async def test_claude_compat_payload_reinforces_and_still_validates_strict_schema():
+    captured = {}
+    valid = '{"answer":"bounded"}'
+
+    async def compatible_chat(request):
+        captured.update(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        event = {
+            "model": captured["model"],
+            "choices": [{"delta": {"content": valid}, "finish_reason": "stop"}],
+        }
+        await response.write(("data: " + json.dumps(event) + "\n\n").encode())
+        await response.write(b"data: [DONE]\n\n")
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/chat/completions", compatible_chat)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="claude-compat-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    item.provider_type = "claude"
+    item.models = ["claude-sonnet-5"]
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["answer"], "properties": {"answer": {"type": "string"}},
+    }
+    try:
+        output = await invoke_stream(item, {
+            "prompt": "original structured request", "deadline_ms": 500,
+            "output_schema": schema, "output_token_limit": 6000,
+        })
+    finally:
+        await server.close()
+
+    assert output["text"] == valid
+    assert captured["messages"][0]["content"].startswith("original structured request")
+    assert "exactly the declared object properties" in captured["messages"][0]["content"]
+    assert captured["response_format"]["json_schema"] == {
+        "name": "broker_output", "strict": True, "schema": schema,
     }
 
 
