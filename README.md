@@ -38,8 +38,19 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 1. 先找 `standard` 下可路由的 Key：已启用、已校准、该 Key 有此分组模型、未被模型履约校验拉黑、且未达到单 Key 并发上限。
 2. 所有这些 Key 不按模型隔离；按“该模型整合价 × Key 倍率”算路由价格，用中位数切成低价组、高价组。
-3. 先从低价组随机抽取全局设定的 N 个 Key 并发竞速。谁先返回、且实际模型与该 Key 要求模型一致，谁获胜；其余请求取消。
-4. 本批全部失败或模型不符，才进入高价组；当前批中未被抽到的低价 Key 不会继续补抽。
-5. `standard` 两个价格组都失败后，依次降级尝试 `smart`、`expert`，每个 stage 同样遵循低价组再高价组。
-6. 全部失败则返回 503。
-7. `effort=medium` 不参与 Key 选择、价格分组或竞速；它仅透传给 OpenAI 兼容上游的 `reasoning.effort`。Anthropic 兼容调用目前不使用它。
+3. 候选仍按低价组、高价组和 intellect 降级顺序启动；全局 `race_parallel_cap` 限制同时运行数。当前组的候选都已启动后，空闲槽位可以继续补入下一组，单个半开流不会阻塞整条路由。
+4. `hedge_delay_ms` 到期仍无合格结果时启动下一个候选；候选失败会立即补位。收到首段文本后若持续一个有效首输出窗口都没有新的文本或 final，则按不完整流失败并释放槽位。
+5. 所有唯一候选首轮结束后，可重试的瞬态失败会轮转重试一次，但总启动数严格受 `BROKER_ROUTE_ATTEMPT_BUDGET` 和请求 `deadline_ms` 约束。
+6. `structured_output_invalid` 不会被当作成功；它可以在剩余预算内重试，最终仍无合格输出时返回 503，并包含按启动顺序稳定排列的完整 `attempts`。
+7. `effort` 不参与价格分组；它会透传给 OpenAI 兼容上游，并调整有效首输出窗口：未指定/low 为 1 倍、medium 为 2 倍、high 为 3 倍。
+
+### 生产形状结构化回放
+
+短 smoke 不能代表长上下文和复杂 JSON Schema。发布验收应额外运行：
+
+```bash
+/data/provider-broker/current/venv/bin/python \
+  /data/provider-broker/current/production_shape_smoke.py --runs 3
+```
+
+该脚本使用约 72k-token 级别的合成文本和复杂 Draft 2020-12 Schema，只输出输入长度、Schema 哈希、模型和 attempt 状态统计，不输出 prompt 或响应正文。

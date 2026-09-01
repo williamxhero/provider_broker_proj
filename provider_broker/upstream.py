@@ -1,4 +1,5 @@
 import asyncio
+from collections import deque
 import hashlib
 import json
 import random
@@ -27,8 +28,14 @@ class UpstreamFailure(Exception):
 DIAGNOSTIC_FIELDS = {
     "endpoint", "http_status", "content_type", "schema_hash", "output_token_limit",
     "event_types", "finish_reason", "stream_completed", "received_bytes", "ttfb_ms",
-    "ttft_ms", "first_event_timeout_ms", "structured_error_kind", "validator",
+    "ttft_ms", "first_event_timeout_ms", "idle_timeout_ms", "structured_error_kind", "validator",
     "validation_path",
+}
+
+RETRYABLE_ATTEMPT_STATUSES = {
+    "first_token_timeout", "stream_incomplete", "transport_failed",
+    "protocol_failed", "timed_out", "structured_output_invalid",
+    "output_truncated",
 }
 
 
@@ -171,6 +178,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     finish_reason = None
     received_bytes = 0
     ttfb_ms = ttft_ms = None
+    last_progress_at = started
     response_status = None
     content_type = None
 
@@ -181,6 +189,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "event_types": event_types, "finish_reason": finish_reason, "stream_completed": completed,
             "received_bytes": received_bytes, "ttfb_ms": ttfb_ms, "ttft_ms": ttft_ms,
             "first_event_timeout_ms": round(first_event_timeout * 1000),
+            "idle_timeout_ms": round(first_event_timeout * 1000),
         })
 
     def consume_event(event):
@@ -258,13 +267,14 @@ async def invoke_stream(provider, body: dict) -> dict:
                         now = time.monotonic()
                         if now >= route_deadline:
                             raise AttemptFailure("timed_out", diagnostic=diagnostic())
-                        read_deadline = route_deadline if chunks else first_event_deadline
+                        read_deadline = min(route_deadline, last_progress_at + first_event_timeout) if chunks else first_event_deadline
                         if now >= read_deadline:
-                            raise AttemptFailure("first_token_timeout", diagnostic=diagnostic())
+                            status = "timed_out" if read_deadline >= route_deadline else "stream_incomplete" if chunks else "first_token_timeout"
+                            raise AttemptFailure(status, diagnostic=diagnostic())
                         try:
                             raw = await asyncio.wait_for(response.content.readline(), read_deadline - now)
                         except (asyncio.TimeoutError, TimeoutError) as exc:
-                            status = "timed_out" if chunks else "first_token_timeout"
+                            status = "timed_out" if read_deadline >= route_deadline else "stream_incomplete" if chunks else "first_token_timeout"
                             raise AttemptFailure(status, diagnostic=diagnostic()) from exc
                         if not raw:
                             break
@@ -275,9 +285,13 @@ async def invoke_stream(provider, body: dict) -> dict:
                         value = line[5:].strip()
                         if value == "[DONE]":
                             completed = True
+                            last_progress_at = time.monotonic()
                             continue
                         try:
+                            previous_chunks, previously_completed = len(chunks), completed
                             consume_event(json.loads(value))
+                            if len(chunks) > previous_chunks or completed and not previously_completed:
+                                last_progress_at = time.monotonic()
                         except json.JSONDecodeError as exc:
                             raise AttemptFailure("protocol_failed", diagnostic=diagnostic()) from exc
     except AttemptFailure:
@@ -347,6 +361,15 @@ class AttemptAudit:
         return [dict(self.rows[index]) for index in sorted(self.rows)]
 
 
+def retryable_attempt(failure: AttemptFailure) -> bool:
+    if failure.status in RETRYABLE_ATTEMPT_STATUSES:
+        return True
+    if failure.status != "unavailable":
+        return False
+    status = failure.diagnostic.get("http_status")
+    return status is None or status in {408, 409, 425, 429} or isinstance(status, int) and status >= 500
+
+
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
                 *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 20000,
                 route_attempt_budget: int = 32) -> dict:
@@ -358,107 +381,114 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     cap = max(1, int(parallel_cap))
     audit = AttemptAudit(route_started)
     attempts_started = 0
-    invocation_body = {**body, "_route_deadline": route_deadline, "_first_event_timeout_ms": max(1, int(first_event_timeout_ms))}
+    effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
+    effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
+    invocation_body = {
+        **body,
+        "_route_deadline": route_deadline,
+        "_first_event_timeout_ms": effective_first_event_timeout_ms,
+    }
     tiers = ("standard", "smart", "expert")
-
-    async def race_band(providers, candidate_tier):
-        nonlocal attempts_started
-        queue = random.sample(providers, k=len(providers))
-        active = {}
-        next_candidate = 0
-        next_hedge_at = time.monotonic()
-
-        def launch_one():
-            nonlocal attempts_started, next_candidate, next_hedge_at
-            while next_candidate < len(queue) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
-                provider = queue[next_candidate]
-                next_candidate += 1
-                if not store.try_acquire(provider):
-                    continue
-                sequence = attempts_started
-                attempts_started += 1
-                audit.start(sequence, provider)
-
-                async def run():
-                    try:
-                        return await invoker(provider, invocation_body)
-                    finally:
-                        store.release(provider)
-
-                active[asyncio.create_task(run())] = (sequence, provider)
-                next_hedge_at = time.monotonic() + max(0, hedge_delay_ms) / 1000
-                return True
-            return False
-
-        launch_one()
-        try:
-            while active:
-                now = time.monotonic()
-                if now >= route_deadline:
-                    for task, (sequence, provider) in active.items():
-                        task.cancel()
-                        observe(store, provider, canonicalize(provider.models[0]), candidate_tier, body, "timed_out")
-                        audit.finish(sequence, "timed_out", diagnostic={"first_event_timeout_ms": first_event_timeout_ms})
-                    await asyncio.gather(*active, return_exceptions=True)
-                    active.clear()
-                    return None
-                can_hedge = next_candidate < len(queue) and attempts_started < attempt_budget and len(active) < cap
-                timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
-                done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
-                if not done:
-                    launch_one()
-                    continue
-                for task in sorted(done, key=lambda item: active[item][0]):
-                    sequence, provider = active.pop(task)
-                    requested_model = canonicalize(provider.models[0])
-                    try:
-                        output = task.result()
-                    except AttemptFailure as exc:
-                        observe(store, provider, requested_model, candidate_tier, body, exc.status)
-                        audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
-                        launch_one()
-                        continue
-                    if output["actual_model"] != requested_model:
-                        observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
-                        store.block_route(provider.fingerprint, requested_model)
-                        audit.finish(sequence, "completed", output=output, fulfilled=False)
-                        launch_one()
-                        continue
-                    observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
-                    audit.finish(sequence, "completed", output=output, fulfilled=True)
-                    for pending, (pending_sequence, pending_provider) in active.items():
-                        pending.cancel()
-                        observe(store, pending_provider, canonicalize(pending_provider.models[0]), candidate_tier, body, "cancelled")
-                        audit.finish(pending_sequence, "cancelled")
-                    await asyncio.gather(*active, return_exceptions=True)
-                    active.clear()
-                    return output | {
-                        "provider": provider.name, "attempts": audit.public(),
-                        "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
-                    }
-                while len(active) < cap and next_candidate < len(queue) and attempts_started < attempt_budget and time.monotonic() >= next_hedge_at:
-                    if not launch_one():
-                        break
-        except asyncio.CancelledError:
-            for task, (sequence, provider) in active.items():
-                task.cancel()
-                observe(store, provider, canonicalize(provider.models[0]), candidate_tier, body, "cancelled")
-                audit.finish(sequence, "cancelled")
-            await asyncio.gather(*active, return_exceptions=True)
-            active.clear()
-            raise
-        return None
-
+    primary = deque()
+    retry = deque()
+    retries_scheduled = set()
     for candidate_tier in tiers[tiers.index(tier):]:
-        for providers in price_bands(store.providers(candidate_tier)):
-            if attempts_started >= attempt_budget or time.monotonic() >= route_deadline:
-                raise UpstreamFailure(audit.public())
-            available = [provider for provider in providers if store.has_capacity(provider)]
-            if not available:
+        for band in price_bands(store.providers(candidate_tier)):
+            available = [provider for provider in band if store.has_capacity(provider)]
+            primary.extend((provider, candidate_tier) for provider in random.sample(available, k=len(available)))
+
+    active = {}
+    next_hedge_at = route_started
+
+    def launch_one():
+        nonlocal attempts_started, next_hedge_at
+        while (primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
+            provider, candidate_tier = primary.popleft() if primary else retry.popleft()
+            if not store.try_acquire(provider):
                 continue
-            result = await race_band(available, candidate_tier)
-            if result is not None:
-                return result
+            sequence = attempts_started
+            attempts_started += 1
+            audit.start(sequence, provider)
+
+            async def run(selected=provider):
+                try:
+                    return await invoker(selected, invocation_body)
+                finally:
+                    store.release(selected)
+
+            active[asyncio.create_task(run())] = (sequence, provider, candidate_tier)
+            next_hedge_at = time.monotonic() + max(0, hedge_delay_ms) / 1000
+            return True
+        return False
+
+    async def cancel_active(status: str):
+        for task, (sequence, provider, candidate_tier) in active.items():
+            task.cancel()
+            observe(store, provider, canonicalize(provider.models[0]), candidate_tier, body, status)
+            diagnostic = {"first_event_timeout_ms": effective_first_event_timeout_ms} if status == "timed_out" else None
+            audit.finish(sequence, status, diagnostic=diagnostic)
+        await asyncio.gather(*active, return_exceptions=True)
+        active.clear()
+
+    launch_one()
+    try:
+        while active or primary or retry:
+            now = time.monotonic()
+            if now >= route_deadline or attempts_started >= attempt_budget and not active:
+                if active:
+                    await cancel_active("timed_out")
+                break
+            if not active:
+                if not launch_one():
+                    break
+                continue
+            can_hedge = bool(primary or retry) and attempts_started < attempt_budget and len(active) < cap
+            timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
+            done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
+            if not done:
+                launch_one()
+                continue
+
+            winner = None
+            for task in sorted(done, key=lambda item: active[item][0]):
+                sequence, provider, candidate_tier = active.pop(task)
+                requested_model = canonicalize(provider.models[0])
+                try:
+                    output = task.result()
+                except AttemptFailure as exc:
+                    observe(store, provider, requested_model, candidate_tier, body, exc.status)
+                    audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
+                    retry_key = (provider.fingerprint, requested_model, candidate_tier)
+                    if retryable_attempt(exc) and retry_key not in retries_scheduled:
+                        retries_scheduled.add(retry_key)
+                        retry.append((provider, candidate_tier))
+                    continue
+                if output["actual_model"] != requested_model:
+                    observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
+                    store.block_route(provider.fingerprint, requested_model)
+                    audit.finish(sequence, "completed", output=output, fulfilled=False)
+                    continue
+                observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
+                audit.finish(sequence, "completed", output=output, fulfilled=True)
+                if winner is None:
+                    winner = (output, provider, candidate_tier)
+
+            if winner is not None:
+                output, provider, candidate_tier = winner
+                await cancel_active("cancelled")
+                return output | {
+                    "provider": provider.name, "attempts": audit.public(),
+                    "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
+                }
+
+            while len(active) < cap and attempts_started < attempt_budget and (primary or retry):
+                if not launch_one():
+                    break
+                if hedge_delay_ms > 0:
+                    break
+    except asyncio.CancelledError:
+        await cancel_active("cancelled")
+        raise
     raise UpstreamFailure(audit.public())
 
 

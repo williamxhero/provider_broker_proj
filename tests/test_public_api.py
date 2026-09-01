@@ -173,7 +173,7 @@ async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     failed=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'fail-secret','intellect':'standard'})
     body=await failed.json()
     assert failed.status == 503
-    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable']
+    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable', 'unavailable']
     assert body['attempts'][0]['provider'] == 'Test OpenAI'
     assert 'provider-secret' not in str(body)
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]

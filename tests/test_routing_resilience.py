@@ -4,6 +4,7 @@ from types import SimpleNamespace
 from unittest.mock import patch
 
 import pytest
+from aiohttp import web
 from aiohttp.test_utils import TestClient, TestServer
 
 from provider_broker.app import create_app
@@ -36,13 +37,14 @@ def provider(index: int, *, secret: str):
 
 
 class FakeStore:
-    def __init__(self, providers):
+    def __init__(self, providers, tier="standard"):
         self.items = providers
+        self.tier = tier
         self.inflight = {}
         self.observations = []
 
     def providers(self, tier):
-        return self.items if tier == "standard" else []
+        return self.items if tier == self.tier else []
 
     def has_capacity(self, item):
         return self.inflight.get(item.fingerprint, 0) < item.max_parallel
@@ -75,6 +77,79 @@ def completed(text="recovered"):
     }
 
 
+def production_like_schema():
+    return {
+        "$schema": "https://json-schema.org/draft/2020-12/schema",
+        "type": "object",
+        "additionalProperties": False,
+        "required": ["reply_markdown", "needs_fresh_search", "propositions", "actions"],
+        "properties": {
+            "reply_markdown": {"type": ["string", "null"]},
+            "needs_fresh_search": {"type": "boolean"},
+            "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}},
+            "actions": {"type": "array", "items": {"oneOf": [
+                {"$ref": "#/$defs/analysis_request"},
+                {"$ref": "#/$defs/workflow_proposal"},
+            ]}},
+        },
+        "$defs": {
+            "source_span": {
+                "type": "object", "additionalProperties": False,
+                "required": ["message_id", "start", "end", "quote"],
+                "properties": {
+                    "message_id": {"type": "string"},
+                    "start": {"type": "integer", "minimum": 0},
+                    "end": {"type": "integer", "minimum": 0},
+                    "quote": {"type": "string", "minLength": 1},
+                },
+            },
+            "proposition": {
+                "type": "object", "additionalProperties": False,
+                "required": ["kind", "subject", "confidence", "source_span"],
+                "properties": {
+                    "kind": {"type": "string", "enum": ["user_fact", "user_view", "external_claim", "ai_inference"]},
+                    "subject": {"type": "string"},
+                    "confidence": {"type": ["number", "null"], "minimum": 0, "maximum": 1},
+                    "source_span": {"$ref": "#/$defs/source_span"},
+                },
+            },
+            "analysis_request": {
+                "type": "object", "additionalProperties": False,
+                "required": ["action_type", "subject", "time_scope", "source_span"],
+                "properties": {
+                    "action_type": {"type": "string", "const": "analysis.request"},
+                    "subject": {"type": "string", "minLength": 1},
+                    "time_scope": {"type": "string", "minLength": 1},
+                    "source_span": {"$ref": "#/$defs/source_span"},
+                },
+            },
+            "workflow_proposal": {
+                "type": "object", "additionalProperties": False,
+                "required": ["action_type", "category", "evidence", "source_span"],
+                "properties": {
+                    "action_type": {"type": "string", "const": "workflow.propose"},
+                    "category": {"type": "string", "enum": ["workflow_efficiency", "search_coverage", "investment_method"]},
+                    "evidence": {"type": "array", "items": {"type": "string"}},
+                    "source_span": {"$ref": "#/$defs/source_span"},
+                },
+            },
+        },
+    }
+
+
+def production_like_body():
+    return {
+        # One compact token per repetition keeps the HTTP body below aiohttp's
+        # default 1 MiB limit while preserving the production input-token class.
+        "prompt": "e " * 72_000,
+        "output_schema": production_like_schema(),
+        "intellect": "standard",
+        "effort": "medium",
+        "deadline_ms": 500,
+        "output_token_limit": 4096,
+    }
+
+
 async def test_multiple_first_token_timeouts_continue_to_later_success():
     items = [provider(index, secret=f"super-secret-{index}") for index in range(3)]
     store = FakeStore(items)
@@ -104,6 +179,153 @@ async def test_multiple_first_token_timeouts_continue_to_later_success():
     assert "secret-host" not in serialized
     assert "private-header" not in serialized
     assert "never-return-this" not in serialized
+
+
+async def test_long_structured_request_uses_remaining_budget_for_bounded_retry():
+    items = [provider(index, secret=f"long-secret-{index}") for index in range(5)]
+    for item in items:
+        item.models = ["gpt-5.6-terra"]
+    store = FakeStore(items, tier="smart")
+    statuses = [
+        "first_token_timeout", "unavailable", "stream_incomplete",
+        "structured_output_invalid", "transport_failed",
+    ]
+    calls = {item.id: 0 for item in items}
+    valid = json.dumps({
+        "reply_markdown": None,
+        "needs_fresh_search": False,
+        "propositions": [],
+        "actions": [],
+    })
+
+    async def invoke(item, request_body):
+        calls[item.id] += 1
+        assert request_body["_first_event_timeout_ms"] == 40
+        if item.id == 0 and calls[item.id] == 2:
+            validate_structured_output(valid, structured_schema(request_body), None, {"endpoint": "/responses"})
+            return completed(valid) | {"actual_model": "gpt-5.6-terra"}
+        raise AttemptFailure(statuses[item.id], diagnostic={"endpoint": "/responses"})
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "smart", production_like_body(), parallel_cap=1, invoker=invoke,
+            hedge_delay_ms=0, first_event_timeout_ms=20, route_attempt_budget=6,
+        )
+
+    assert result["text"] == valid
+    assert [attempt["attempt"] for attempt in result["attempts"]] == list(range(1, 7))
+    assert [attempt["status"] for attempt in result["attempts"]] == statuses + ["completed"]
+    assert calls == {0: 2, 1: 1, 2: 1, 3: 1, 4: 1}
+    serialized = json.dumps(result["attempts"])
+    assert "long-secret" not in serialized
+    assert "e e e" not in serialized
+
+
+async def test_next_price_band_can_fill_idle_capacity_before_stalled_band_finishes():
+    low = provider(0, secret="low-band-secret")
+    high = provider(1, secret="high-band-secret")
+    high.price_group = 500
+    store = FakeStore([low, high])
+    low_started = asyncio.Event()
+
+    async def invoke(item, _body):
+        if item.id == 0:
+            low_started.set()
+            await asyncio.Event().wait()
+        await low_started.wait()
+        return completed()
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "band-spill", "deadline_ms": 100},
+            parallel_cap=2, invoker=invoke, hedge_delay_ms=0, route_attempt_budget=2,
+        )
+
+    assert result["text"] == "recovered"
+    assert [attempt["status"] for attempt in result["attempts"]] == ["cancelled", "completed"]
+    assert store.inflight == {}
+
+
+async def test_all_failed_long_structured_stream_returns_503_with_every_budgeted_attempt(tmp_path, monkeypatch):
+    items = [provider(index, secret=f"all-failed-secret-{index}") for index in range(3)]
+    for item in items:
+        item.models = ["gpt-5.6-terra"]
+    store = FakeStore(items, tier="smart")
+    statuses = ["first_token_timeout", "stream_incomplete", "structured_output_invalid"]
+
+    async def invoke(item, _body):
+        raise AttemptFailure(statuses[item.id], diagnostic={"endpoint": "/responses"})
+
+    async def routed(_store, tier, body, _parallel_cap, **_kwargs):
+        with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+            return await route(
+                store, tier, body, parallel_cap=1, invoker=invoke,
+                hedge_delay_ms=0, first_event_timeout_ms=20, route_attempt_budget=5,
+            )
+
+    settings = Settings(
+        database_path=tmp_path / "broker.sqlite3",
+        admin_token="admin-secret",
+        session_secret="session-secret",
+        encryption_key="MDEyMzQ1Njc4OWFiY2RlZg==",
+    )
+    app = create_app(settings)
+    client = TestClient(TestServer(app))
+    monkeypatch.setattr("provider_broker.app.route", routed)
+    await client.start_server()
+    try:
+        response = await client.post("/v1/generate/stream", json=production_like_body())
+        response_body = await response.json()
+    finally:
+        await client.close()
+
+    assert response.status == 503
+    attempts = response_body["attempts"]
+    assert [attempt["attempt"] for attempt in attempts] == [1, 2, 3, 4, 5]
+    assert [attempt["status"] for attempt in attempts] == [
+        "first_token_timeout", "stream_incomplete", "structured_output_invalid",
+        "first_token_timeout", "stream_incomplete",
+    ]
+    assert store.inflight == {}
+    serialized = json.dumps(attempts)
+    assert "all-failed-secret" not in serialized
+    assert "e e e" not in serialized
+
+
+async def test_partial_sse_has_a_bounded_idle_lease_after_first_text():
+    async def partial_stream(request):
+        payload = await request.json()
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"type":"response.output_text.delta","delta":"{"}\n\n')
+        await asyncio.sleep(.08)
+        try:
+            await response.write((
+                'data: {"type":"response.completed","response":{"id":"late","model":"'
+                + payload["model"] + '","usage":{}}}\n\n'
+            ).encode())
+            await response.write_eof()
+        except ConnectionResetError:
+            pass
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", partial_stream)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="idle-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    try:
+        with pytest.raises(AttemptFailure) as failure:
+            await invoke_stream(item, {
+                "prompt": "idle", "deadline_ms": 500,
+                "_first_event_timeout_ms": 20,
+            })
+    finally:
+        await server.close()
+
+    assert failure.value.status == "stream_incomplete"
+    assert failure.value.diagnostic["idle_timeout_ms"] == 20
 
 
 async def test_invalid_structured_output_continues_to_later_valid_candidate():
