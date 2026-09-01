@@ -10,7 +10,7 @@ if (Test-Path -LiteralPath $BuildDir) {
     if ((Split-Path -Parent $ResolvedBuild) -ne (Resolve-Path -LiteralPath $Project).Path -or (Split-Path -Leaf $ResolvedBuild) -ne "build") {
         throw "Refusing to clean unexpected build directory: $ResolvedBuild"
     }
-    Remove-Item -LiteralPath $ResolvedBuild -Recurse -Force
+    Microsoft.PowerShell.Management\Remove-Item -LiteralPath $ResolvedBuild -Recurse -Force
 }
 
 python -m build --wheel
