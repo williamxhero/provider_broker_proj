@@ -144,6 +144,9 @@ def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | No
         "explanations, labels, identifiers, or any property absent from the schema. "
         "The response will be rejected unless it validates without repair."
     )
+    reinforced += "\nExact JSON Schema (authoritative):\n" + json.dumps(
+        schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
+    )
     if repair_note:
         reinforced += "\nA prior attempt was rejected. " + repair_note + " Generate the entire JSON again from scratch."
     return reinforced
@@ -190,6 +193,7 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
         raise AttemptFailure("structured_output_invalid", diagnostic=diagnostic | {
             "structured_error_kind": "schema_validation", "validator": str(exc.validator),
             "validation_path": path, "unexpected_properties": unexpected,
+            "normalized_properties": normalized,
         }, repair_note=repair_note) from exc
 
 

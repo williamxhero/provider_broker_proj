@@ -158,6 +158,8 @@ def test_strict_schema_prompt_only_reinforces_structured_requests():
     assert reinforced.startswith(prompt)
     assert "exactly the declared object properties" in reinforced
     assert "validates without repair" in reinforced
+    assert '"additionalProperties":false' in reinforced
+    assert '"reply_markdown"' in reinforced
     repaired = strict_schema_prompt(prompt, production_like_schema(), "At propositions.0, omit undeclared properties: rationale.")
     assert "Generate the entire JSON again from scratch" in repaired
 
