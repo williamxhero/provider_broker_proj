@@ -142,6 +142,18 @@ def structured_schema(body: dict) -> dict | None:
     return schema if isinstance(schema, dict) else None
 
 
+def replace_one_of_with_any_of(value):
+    """Copy a schema while replacing unsupported ``oneOf`` unions for Codex routes."""
+    if isinstance(value, dict):
+        return {
+            ("anyOf" if key == "oneOf" else key): replace_one_of_with_any_of(item)
+            for key, item in value.items()
+        }
+    if isinstance(value, list):
+        return [replace_one_of_with_any_of(item) for item in value]
+    return value
+
+
 def schema_hash(schema: dict | None) -> str | None:
     if schema is None:
         return None
@@ -250,20 +262,21 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
 async def invoke_stream(provider, body: dict) -> dict:
     model = canonicalize(provider.models[0])
     schema = structured_schema(body)
+    outbound_schema = schema if provider.provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
     effort = body.get("effort")
     repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
     if provider.provider_type in ("anthropic", "claude"):
         payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
-        if schema is not None:
-            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": schema}}
+        if outbound_schema is not None:
+            payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": outbound_schema}}
         endpoint = "/chat/completions"
     else:
         payload = {"model": model, "input": provider_prompt, "max_output_tokens": body.get("output_token_limit", 1024), "stream": True}
         if effort:
             payload["reasoning"] = {"effort": effort}
-        if schema is not None:
-            payload["text"] = {"format": {"type": "json_schema", "name": "broker_output", "strict": True, "schema": schema}}
+        if outbound_schema is not None:
+            payload["text"] = {"format": {"type": "json_schema", "name": "broker_output", "strict": True, "schema": outbound_schema}}
         endpoint = "/responses"
     started = time.monotonic()
     route_deadline = float(body.get("_route_deadline", started + max(.001, body.get("deadline_ms", 60000) / 1000)))
