@@ -17,6 +17,7 @@ from provider_broker.upstream import (
     invoke_stream,
     route,
     strict_schema_prompt,
+    provider_native_schema,
     structured_schema,
     validate_structured_output,
 )
@@ -169,6 +170,67 @@ def test_strict_schema_prompt_only_reinforces_structured_requests():
     assert '"reply_markdown"' in reinforced
     repaired = strict_schema_prompt(prompt, production_like_schema(), "At propositions.0, omit undeclared properties: rationale.")
     assert "Generate the entire JSON again from scratch" in repaired
+
+
+def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["operation", "source_reference"],
+        "properties": {
+            "operation": {"enum": ["search", "complete"]},
+            "source_reference": {"type": ["object", "null"]},
+        },
+    }
+    original = json.loads(json.dumps(schema))
+    assert provider_native_schema(schema, "openai") is None
+    assert provider_native_schema(schema, "claude") is None
+    assert schema == original
+
+
+async def test_memory_research_open_object_avoids_rejected_native_schema_and_stays_strict():
+    captured = {}
+    valid = '{"operation":"complete","query":null,"episode_id":null,"url":null,"source_reference":null}'
+
+    async def compatible_responses(request):
+        captured.update(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        completed = {"type": "response.completed", "response": {
+            "id": "memory-schema-compatible", "model": captured["model"],
+            "output_text": valid, "usage": {},
+        }}
+        await response.write(("data: " + json.dumps(completed) + "\n\n").encode())
+        await response.write_eof()
+        return response
+
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["operation", "query", "episode_id", "url", "source_reference"],
+        "properties": {
+            "operation": {"enum": ["search", "complete"]},
+            "query": {"type": ["string", "null"]},
+            "episode_id": {"type": ["string", "null"]},
+            "url": {"type": ["string", "null"]},
+            "source_reference": {"type": ["object", "null"]},
+        },
+    }
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", compatible_responses)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="open-object-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    try:
+        output = await invoke_stream(item, {
+            "prompt": "synthetic frozen memory is sufficient; choose complete",
+            "deadline_ms": 500, "output_schema": schema, "output_token_limit": 2000,
+        })
+    finally:
+        await server.close()
+
+    assert "text" not in captured
+    assert "authoritative" in captured["input"]
+    assert output["text"] == valid
 
 
 async def test_claude_compat_payload_reinforces_and_still_validates_strict_schema():

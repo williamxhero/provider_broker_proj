@@ -154,6 +154,31 @@ def replace_one_of_with_any_of(value):
     return value
 
 
+def provider_native_schema(schema: dict | None, provider_type: str) -> dict | None:
+    """Return a provider-safe native schema, or fall back to prompt enforcement.
+
+    OpenAI-compatible strict schema implementations reject object nodes without
+    an explicit closed property set.  Sending such a schema causes a transport
+    400 before the model can answer.  The Broker still embeds the authoritative
+    schema in the prompt and validates the returned JSON against it locally.
+    """
+    if schema is None or _contains_open_object(schema):
+        return None
+    return schema if provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
+
+
+def _contains_open_object(value) -> bool:
+    if isinstance(value, dict):
+        node_types = value.get("type")
+        is_object = node_types == "object" or isinstance(node_types, list) and "object" in node_types
+        if is_object and not isinstance(value.get("properties"), dict):
+            return True
+        return any(_contains_open_object(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_open_object(item) for item in value)
+    return False
+
+
 def schema_hash(schema: dict | None) -> str | None:
     if schema is None:
         return None
@@ -262,7 +287,7 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
 async def invoke_stream(provider, body: dict) -> dict:
     model = canonicalize(provider.models[0])
     schema = structured_schema(body)
-    outbound_schema = schema if provider.provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
+    outbound_schema = provider_native_schema(schema, provider.provider_type)
     effort = body.get("effort")
     repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)

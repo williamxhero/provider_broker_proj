@@ -81,6 +81,19 @@ SCHEMA = {
     },
 }
 
+MEMORY_RESEARCH_SCHEMA = {
+    "$schema": "https://json-schema.org/draft/2020-12/schema",
+    "type": "object", "additionalProperties": False,
+    "required": ["operation", "query", "episode_id", "url", "source_reference"],
+    "properties": {
+        "operation": {"enum": ["search", "expand", "related", "web_search", "web_read", "markethub_quote", "archive_article", "complete"]},
+        "query": {"type": ["string", "null"]},
+        "episode_id": {"type": ["string", "null"]},
+        "url": {"type": ["string", "null"]},
+        "source_reference": {"type": ["object", "null"]},
+    },
+}
+
 
 def schema_hash(schema):
     encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
@@ -113,13 +126,20 @@ def default_prompt(token_count):
     )
 
 
-def sized_prompt(char_count, byte_count):
+def sized_prompt(char_count, byte_count, contract="cognition"):
     instruction = (
         "\nReturn exactly one JSON object matching the authoritative schema. Write a substantial "
         "reply_markdown, multiple meaningful propositions, and one concrete action. Every source_span "
         "must refer to message_id synthetic-message with a non-empty exact quote. Do not emit prose "
         "outside JSON, wrappers, placeholders, empty arrays, or undeclared properties."
     )
+    if contract == "memory-research":
+        instruction = (
+            "\nChoose the next private-memory operation needed before replying. The synthetic frozen "
+            "snapshot already contains sufficient evidence, so choose operation complete. Set query, "
+            "episode_id, url, and source_reference to null. Return only the JSON object required by the "
+            "authoritative schema, with every required property and no prose or undeclared property."
+        )
     extra_bytes = byte_count - char_count
     if char_count < len(instruction) or extra_bytes < 0:
         raise ValueError("requested prompt shape is smaller than its instruction")
@@ -200,6 +220,7 @@ def main():
     parser.add_argument("--output-token-limit", type=int, default=6_000)
     parser.add_argument("--intellect", choices=("smart", "expert"), default="smart")
     parser.add_argument("--schema-file")
+    parser.add_argument("--contract", choices=("cognition", "memory-research"), default="cognition")
     parser.add_argument("--prompt-chars", type=int)
     parser.add_argument("--prompt-bytes", type=int)
     args = parser.parse_args()
@@ -207,12 +228,12 @@ def main():
         parser.error("runs, token-count, deadline-ms, and output-token-limit must be positive")
     if (args.prompt_chars is None) != (args.prompt_bytes is None):
         parser.error("prompt-chars and prompt-bytes must be provided together")
-    schema = SCHEMA
+    schema = MEMORY_RESEARCH_SCHEMA if args.contract == "memory-research" else SCHEMA
     if args.schema_file:
         with open(args.schema_file, "r", encoding="utf-8") as handle:
             schema = json.load(handle)
     Draft202012Validator.check_schema(schema)
-    prompt = sized_prompt(args.prompt_chars, args.prompt_bytes) if args.prompt_chars is not None else default_prompt(args.token_count)
+    prompt = sized_prompt(args.prompt_chars, args.prompt_bytes, args.contract) if args.prompt_chars is not None else default_prompt(args.token_count)
     failures = 0
     for run in range(1, args.runs + 1):
         passed, summary = run_once(args.url, prompt, schema, args.deadline_ms, args.output_token_limit, args.intellect)
