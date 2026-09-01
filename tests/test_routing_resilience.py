@@ -216,6 +216,62 @@ async def test_claude_compat_payload_reinforces_and_still_validates_strict_schem
     }
 
 
+async def test_codex_payload_uses_supported_union_without_mutating_caller_schema():
+    captured = {}
+    span = {"message_id": "message-1", "start": 0, "end": 8, "quote": "evidence"}
+    valid = json.dumps({
+        "reply_markdown": "x" * 600,
+        "needs_fresh_search": False,
+        "propositions": [
+            {"kind": "user_fact", "subject": "fact", "confidence": 1, "source_span": span},
+            {"kind": "ai_inference", "subject": "inference", "confidence": .5, "source_span": span},
+        ],
+        "actions": [{
+            "action_type": "analysis.request", "subject": "market",
+            "time_scope": "next session", "source_span": span,
+        }],
+    })
+
+    async def compatible_responses(request):
+        captured.update(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "schema-compatible", "model": captured["model"],
+                "output_text": valid, "usage": {},
+            },
+        }
+        await response.write(("data: " + json.dumps(completed) + "\n\n").encode())
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", compatible_responses)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="codex-compatible-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    schema = production_like_schema()
+    try:
+        output = await invoke_stream(item, {
+            "prompt": "structured request", "deadline_ms": 500,
+            "output_schema": schema, "output_token_limit": 6000,
+        })
+    finally:
+        await server.close()
+
+    outbound_items = captured["text"]["format"]["schema"]["properties"]["actions"]["items"]
+    assert "oneOf" not in outbound_items
+    assert outbound_items["anyOf"] == [
+        {"$ref": "#/$defs/analysis_request"},
+        {"$ref": "#/$defs/workflow_proposal"},
+    ]
+    assert "oneOf" in schema["properties"]["actions"]["items"]
+    assert output["text"] == valid
+
+
 async def test_multiple_first_token_timeouts_continue_to_later_success():
     items = [provider(index, secret=f"super-secret-{index}") for index in range(3)]
     store = FakeStore(items)
