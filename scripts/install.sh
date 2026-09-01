@@ -102,13 +102,14 @@ if [[ "$healthy" != true ]]; then
   exit 1
 fi
 
-if ! "$RELEASE/venv/bin/python" "$RELEASE/transport_matrix.py" --gate --broker-only --structured-only; then
+if ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect smart --token-count 2000 --deadline-ms 180000 --output-token-limit 2000 \
+  || ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect expert --token-count 2000 --deadline-ms 180000 --output-token-limit 6000; then
   if [[ -n "$previous_target" ]]; then
     ln -sfn "$previous_target" "$APP_ROOT/current.rollback"
     mv -Tf "$APP_ROOT/current.rollback" "$APP_ROOT/current"
     systemctl restart provider-broker.service
   fi
-  echo "New release failed structured Broker canary and was rolled back" >&2
+  echo "New release failed smart/expert structured Broker route canary and was rolled back" >&2
   exit 1
 fi
 

@@ -133,9 +133,9 @@ def sized_prompt(char_count, byte_count):
     return prompt
 
 
-def run_once(base_url, prompt, schema, deadline_ms, output_token_limit):
+def run_once(base_url, prompt, schema, deadline_ms, output_token_limit, intellect="smart"):
     payload = {
-        "prompt": prompt, "intellect": "smart", "effort": "medium",
+        "prompt": prompt, "intellect": intellect, "effort": "medium",
         "deadline_ms": deadline_ms, "output_token_limit": output_token_limit, "output_schema": schema,
     }
     request = urllib.request.Request(
@@ -198,6 +198,7 @@ def main():
     parser.add_argument("--token-count", type=int, default=72_000)
     parser.add_argument("--deadline-ms", type=int, default=260_000)
     parser.add_argument("--output-token-limit", type=int, default=6_000)
+    parser.add_argument("--intellect", choices=("smart", "expert"), default="smart")
     parser.add_argument("--schema-file")
     parser.add_argument("--prompt-chars", type=int)
     parser.add_argument("--prompt-bytes", type=int)
@@ -214,7 +215,7 @@ def main():
     prompt = sized_prompt(args.prompt_chars, args.prompt_bytes) if args.prompt_chars is not None else default_prompt(args.token_count)
     failures = 0
     for run in range(1, args.runs + 1):
-        passed, summary = run_once(args.url, prompt, schema, args.deadline_ms, args.output_token_limit)
+        passed, summary = run_once(args.url, prompt, schema, args.deadline_ms, args.output_token_limit, args.intellect)
         failures += not passed
         print(json.dumps({"run": run, "passed": passed, **summary}, ensure_ascii=False), flush=True)
     return 1 if failures else 0

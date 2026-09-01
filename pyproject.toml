@@ -1,6 +1,6 @@
 [project]
 name = "provider-broker"
-version = "0.1.60"
+version = "0.1.61"
 description = "Private provider routing broker"
 requires-python = ">=3.12"
 dependencies = ["aiohttp>=3.10", "cryptography>=43", "jsonschema>=4.23"]
