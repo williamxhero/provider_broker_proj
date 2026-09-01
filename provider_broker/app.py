@@ -27,6 +27,8 @@ async def generate(request):
             request.app["store"], tier, body, request.app["store"].race_parallel_cap(),
             hedge_delay_ms=settings.hedge_delay_ms,
             first_event_timeout_ms=settings.first_event_timeout_ms,
+            stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
+            attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
         )
     except UpstreamFailure as exc:
@@ -51,6 +53,8 @@ async def stream(request):
             request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
             hedge_delay_ms=settings.hedge_delay_ms,
             first_event_timeout_ms=settings.first_event_timeout_ms,
+            stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
+            attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
         )
     except UpstreamFailure as exc:

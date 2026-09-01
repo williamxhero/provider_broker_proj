@@ -29,7 +29,8 @@ DIAGNOSTIC_FIELDS = {
     "endpoint", "http_status", "content_type", "schema_hash", "output_token_limit",
     "event_types", "finish_reason", "stream_completed", "received_bytes", "ttfb_ms",
     "ttft_ms", "first_event_timeout_ms", "idle_timeout_ms", "structured_error_kind", "validator",
-    "validation_path",
+    "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
+    "output_chars",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -172,13 +173,19 @@ async def invoke_stream(provider, body: dict) -> dict:
     started = time.monotonic()
     route_deadline = float(body.get("_route_deadline", started + max(.001, body.get("deadline_ms", 60000) / 1000)))
     first_event_timeout = max(.001, float(body.get("_first_event_timeout_ms", 20000)) / 1000)
-    first_event_deadline = min(route_deadline, started + first_event_timeout)
+    stream_idle_timeout = max(.001, float(body.get("_stream_idle_timeout_ms", 60000)) / 1000)
+    attempt_timeout = max(.001, float(body.get("_attempt_timeout_ms", 120000)) / 1000)
+    attempt_deadline = min(route_deadline, started + attempt_timeout)
+    first_event_deadline = min(attempt_deadline, started + first_event_timeout)
     metadata, chunks, event_types = {}, [], []
     completed = False
     finish_reason = None
     received_bytes = 0
     ttfb_ms = ttft_ms = None
     last_progress_at = started
+    progress_event_count = 0
+    max_event_gap_ms = 0.0
+    saw_progress = False
     response_status = None
     content_type = None
 
@@ -189,16 +196,33 @@ async def invoke_stream(provider, body: dict) -> dict:
             "event_types": event_types, "finish_reason": finish_reason, "stream_completed": completed,
             "received_bytes": received_bytes, "ttfb_ms": ttfb_ms, "ttft_ms": ttft_ms,
             "first_event_timeout_ms": round(first_event_timeout * 1000),
-            "idle_timeout_ms": round(first_event_timeout * 1000),
+            "idle_timeout_ms": round(stream_idle_timeout * 1000),
+            "attempt_timeout_ms": round(attempt_timeout * 1000),
+            "progress_event_count": progress_event_count,
+            "max_event_gap_ms": round(max_event_gap_ms, 2),
+            "output_chars": sum(len(chunk) for chunk in chunks),
         })
+
+    def record_progress():
+        nonlocal last_progress_at, progress_event_count, max_event_gap_ms, saw_progress
+        now = time.monotonic()
+        max_event_gap_ms = max(max_event_gap_ms, (now - last_progress_at) * 1000)
+        last_progress_at = now
+        progress_event_count += 1
+        saw_progress = True
 
     def consume_event(event):
         nonlocal completed, finish_reason, ttft_ms
         if not isinstance(event, dict):
-            return
+            return False
         event_type = event.get("type") if isinstance(event.get("type"), str) else "chat.chunk"
         if event_type not in event_types and len(event_types) < 12:
             event_types.append(event_type)
+        recognized = event_type.startswith("response.") or event_type in {
+            "chat.chunk", "message_start", "content_block_start", "content_block_delta",
+            "message_delta", "message_stop",
+        }
+        output_delta = None
         if event_type in ("response.completed", "response.incomplete") and isinstance(event.get("response"), dict):
             metadata.update(event["response"])
             completed = True
@@ -206,20 +230,41 @@ async def invoke_stream(provider, body: dict) -> dict:
             finish_reason = details.get("reason") if isinstance(details, dict) else event_type
         else:
             metadata.update({key: event[key] for key in ("id", "model", "usage") if key in event})
-        delta = event.get("delta") if isinstance(event.get("delta"), str) else None
+        if event_type == "response.output_text.delta" and isinstance(event.get("delta"), str):
+            output_delta = event["delta"]
+        elif event_type == "response.output_text.done" and not chunks and isinstance(event.get("text"), str):
+            output_delta = event["text"]
+        elif event_type == "content_block_start":
+            block = event.get("content_block")
+            if isinstance(block, dict) and isinstance(block.get("text"), str):
+                output_delta = block["text"]
+        elif event_type == "content_block_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict) and isinstance(delta.get("text"), str):
+                output_delta = delta["text"]
+        elif event_type == "message_delta":
+            delta = event.get("delta")
+            if isinstance(delta, dict) and delta.get("stop_reason") is not None:
+                finish_reason = str(delta["stop_reason"])
+        elif event_type == "message_stop":
+            completed = True
         choices = event.get("choices")
         if isinstance(choices, list) and choices and isinstance(choices[0], dict):
+            recognized = True
             choice = choices[0]
             choice_delta = choice.get("delta") if isinstance(choice.get("delta"), dict) else {}
             if isinstance(choice_delta.get("content"), str):
-                delta = choice_delta["content"]
+                output_delta = choice_delta["content"]
             if choice.get("finish_reason") is not None:
                 finish_reason = str(choice["finish_reason"])
                 completed = True
-        if delta:
+        elif event_type == "chat.chunk" and isinstance(event.get("delta"), str):
+            output_delta = event["delta"]
+        if output_delta:
             if not chunks:
                 ttft_ms = round((time.monotonic() - started) * 1000, 2)
-            chunks.append(delta)
+            chunks.append(output_delta)
+        return recognized
 
     if schema is not None:
         try:
@@ -230,7 +275,7 @@ async def invoke_stream(provider, body: dict) -> dict:
                 "validation_path": [str(part) for part in list(exc.absolute_path)[:8]],
             }) from exc
 
-    timeout = ClientTimeout(total=max(.001, route_deadline - time.monotonic()))
+    timeout = ClientTimeout(total=max(.001, attempt_deadline - time.monotonic()))
     try:
         async with ClientSession(timeout=timeout) as session:
             try:
@@ -245,12 +290,12 @@ async def invoke_stream(provider, body: dict) -> dict:
                     raise AttemptFailure("unavailable", diagnostic=diagnostic())
                 if response.content_type == "application/json":
                     try:
-                        remaining = first_event_deadline - time.monotonic()
+                        remaining = attempt_deadline - time.monotonic()
                         if remaining <= 0:
-                            raise AttemptFailure("first_token_timeout", diagnostic=diagnostic())
+                            raise AttemptFailure("timed_out", diagnostic=diagnostic())
                         data = await asyncio.wait_for(response.json(content_type=None), remaining)
                     except (asyncio.TimeoutError, TimeoutError) as exc:
-                        raise AttemptFailure("first_token_timeout", diagnostic=diagnostic()) from exc
+                        raise AttemptFailure("timed_out", diagnostic=diagnostic()) from exc
                     except AttemptFailure:
                         raise
                     except Exception as exc:
@@ -262,36 +307,43 @@ async def invoke_stream(provider, body: dict) -> dict:
                     chunks = [text]
                     completed = True
                     ttft_ms = round((time.monotonic() - started) * 1000, 2)
+                    record_progress()
                 else:
+                    sse_event_type = None
                     while not completed:
                         now = time.monotonic()
-                        if now >= route_deadline:
+                        if now >= attempt_deadline:
                             raise AttemptFailure("timed_out", diagnostic=diagnostic())
-                        read_deadline = min(route_deadline, last_progress_at + first_event_timeout) if chunks else first_event_deadline
+                        read_deadline = min(attempt_deadline, last_progress_at + stream_idle_timeout) if saw_progress else first_event_deadline
                         if now >= read_deadline:
-                            status = "timed_out" if read_deadline >= route_deadline else "stream_incomplete" if chunks else "first_token_timeout"
+                            status = "timed_out" if read_deadline >= attempt_deadline else "stream_incomplete" if saw_progress else "first_token_timeout"
                             raise AttemptFailure(status, diagnostic=diagnostic())
                         try:
                             raw = await asyncio.wait_for(response.content.readline(), read_deadline - now)
                         except (asyncio.TimeoutError, TimeoutError) as exc:
-                            status = "timed_out" if read_deadline >= route_deadline else "stream_incomplete" if chunks else "first_token_timeout"
+                            status = "timed_out" if read_deadline >= attempt_deadline else "stream_incomplete" if saw_progress else "first_token_timeout"
                             raise AttemptFailure(status, diagnostic=diagnostic()) from exc
                         if not raw:
                             break
                         received_bytes += len(raw)
                         line = raw.decode("utf-8", errors="replace").strip()
+                        if line.startswith("event:"):
+                            sse_event_type = line[6:].strip() or None
+                            continue
                         if not line.startswith("data:"):
                             continue
                         value = line[5:].strip()
                         if value == "[DONE]":
                             completed = True
-                            last_progress_at = time.monotonic()
+                            record_progress()
                             continue
                         try:
-                            previous_chunks, previously_completed = len(chunks), completed
-                            consume_event(json.loads(value))
-                            if len(chunks) > previous_chunks or completed and not previously_completed:
-                                last_progress_at = time.monotonic()
+                            event = json.loads(value)
+                            if isinstance(event, dict) and sse_event_type and not isinstance(event.get("type"), str):
+                                event = {**event, "type": sse_event_type}
+                            sse_event_type = None
+                            if consume_event(event):
+                                record_progress()
                         except json.JSONDecodeError as exc:
                             raise AttemptFailure("protocol_failed", diagnostic=diagnostic()) from exc
     except AttemptFailure:
@@ -300,6 +352,11 @@ async def invoke_stream(provider, body: dict) -> dict:
         raise AttemptFailure("timed_out", diagnostic=diagnostic()) from exc
     except (ClientConnectionError, ClientError, OSError, ValueError) as exc:
         raise AttemptFailure("transport_failed", diagnostic=diagnostic()) from exc
+    if completed and not chunks:
+        buffered = extract_text(metadata)
+        if buffered.strip():
+            chunks.append(buffered)
+            ttft_ms = ttft_ms or round((time.monotonic() - started) * 1000, 2)
     text = "".join(chunks)
     if not completed or not text.strip():
         raise AttemptFailure("stream_incomplete", diagnostic=diagnostic())
@@ -312,6 +369,7 @@ async def invoke_stream(provider, body: dict) -> dict:
         "latency_ms": ttft_ms, "usage": usage,
         "request_id": str(metadata.get("id") or uuid.uuid4()),
         "cost": estimate_cost(actual_model, usage, provider.multiplier, provider.pricing if actual_model == model else None),
+        "diagnostic": diagnostic(),
     }
 
 
@@ -320,8 +378,9 @@ async def invoke(provider, body: dict) -> dict:
     return await invoke_stream(provider, body)
 
 
-def observe(store, provider, requested_model, tier, body, status, *, output=None):
+def observe(store, provider, requested_model, tier, body, status, *, output=None, attempt=None, route_id=None):
     output = output or {}
+    attempt = attempt or {}
     usage = output.get("usage") or {}
     store.observe(
         fingerprint=provider.fingerprint, requested_model=requested_model,
@@ -329,6 +388,9 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
         success=int(status == "completed"), latency_ms=output.get("latency_ms"), error=None,
         status=status, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
         cost=output.get("cost"), request_id=output.get("request_id") or str(uuid.uuid4()),
+        diagnostic_json=json.dumps(sanitize_diagnostic(attempt.get("diagnostic") or output.get("diagnostic") or {}), sort_keys=True),
+        route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
+        elapsed_ms=attempt.get("elapsed_ms"),
     )
 
 
@@ -360,6 +422,9 @@ class AttemptAudit:
     def public(self):
         return [dict(self.rows[index]) for index in sorted(self.rows)]
 
+    def row(self, sequence: int):
+        return dict(self.rows[sequence])
+
 
 def retryable_attempt(failure: AttemptFailure) -> bool:
     if failure.status in RETRYABLE_ATTEMPT_STATUSES:
@@ -371,7 +436,8 @@ def retryable_attempt(failure: AttemptFailure) -> bool:
 
 
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
-                *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 20000,
+                *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
+                stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
                 route_attempt_budget: int = 32) -> dict:
     route_started = time.monotonic()
     deadline_ms = body.get("deadline_ms", 60000)
@@ -380,6 +446,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     attempt_budget = max(1, int(route_attempt_budget))
     cap = max(1, int(parallel_cap))
     audit = AttemptAudit(route_started)
+    route_id = str(uuid.uuid4())
     attempts_started = 0
     effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
     effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
@@ -387,6 +454,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         **body,
         "_route_deadline": route_deadline,
         "_first_event_timeout_ms": effective_first_event_timeout_ms,
+        "_stream_idle_timeout_ms": max(1, int(stream_idle_timeout_ms)),
+        "_attempt_timeout_ms": max(1, int(attempt_timeout_ms)),
     }
     tiers = ("standard", "smart", "expert")
     primary = deque()
@@ -424,9 +493,12 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     async def cancel_active(status: str):
         for task, (sequence, provider, candidate_tier) in active.items():
             task.cancel()
-            observe(store, provider, canonicalize(provider.models[0]), candidate_tier, body, status)
             diagnostic = {"first_event_timeout_ms": effective_first_event_timeout_ms} if status == "timed_out" else None
             audit.finish(sequence, status, diagnostic=diagnostic)
+            observe(
+                store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
+                attempt=audit.row(sequence), route_id=route_id,
+            )
         await asyncio.gather(*active, return_exceptions=True)
         active.clear()
 
@@ -456,20 +528,29 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 try:
                     output = task.result()
                 except AttemptFailure as exc:
-                    observe(store, provider, requested_model, candidate_tier, body, exc.status)
                     audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
+                    observe(
+                        store, provider, requested_model, candidate_tier, body, exc.status,
+                        attempt=audit.row(sequence), route_id=route_id,
+                    )
                     retry_key = (provider.fingerprint, requested_model, candidate_tier)
                     if retryable_attempt(exc) and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
                         retry.append((provider, candidate_tier))
                     continue
                 if output["actual_model"] != requested_model:
-                    observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
                     store.block_route(provider.fingerprint, requested_model)
-                    audit.finish(sequence, "completed", output=output, fulfilled=False)
+                    audit.finish(sequence, "completed", output=output, diagnostic=output.get("diagnostic"), fulfilled=False)
+                    observe(
+                        store, provider, requested_model, candidate_tier, body, "completed", output=output,
+                        attempt=audit.row(sequence), route_id=route_id,
+                    )
                     continue
-                observe(store, provider, requested_model, candidate_tier, body, "completed", output=output)
-                audit.finish(sequence, "completed", output=output, fulfilled=True)
+                audit.finish(sequence, "completed", output=output, diagnostic=output.get("diagnostic"), fulfilled=True)
+                observe(
+                    store, provider, requested_model, candidate_tier, body, "completed", output=output,
+                    attempt=audit.row(sequence), route_id=route_id,
+                )
                 if winner is None:
                     winner = (output, provider, candidate_tier)
 

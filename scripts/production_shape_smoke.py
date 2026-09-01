@@ -18,11 +18,11 @@ SCHEMA = {
     "additionalProperties": False,
     "required": ["reply_markdown", "needs_fresh_search", "public_search_request", "propositions", "actions"],
     "properties": {
-        "reply_markdown": {"type": ["string", "null"]},
+        "reply_markdown": {"type": "string", "minLength": 800},
         "needs_fresh_search": {"type": "boolean"},
-        "public_search_request": {"anyOf": [{"type": "null"}, {"$ref": "#/$defs/search_request"}]},
-        "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}},
-        "actions": {"type": "array", "items": {"oneOf": [
+        "public_search_request": {"type": "null"},
+        "propositions": {"type": "array", "minItems": 3, "maxItems": 5, "items": {"$ref": "#/$defs/proposition"}},
+        "actions": {"type": "array", "minItems": 1, "maxItems": 1, "items": {"oneOf": [
             {"$ref": "#/$defs/analysis_request"},
             {"$ref": "#/$defs/workflow_proposal"},
         ]}},
@@ -40,8 +40,10 @@ SCHEMA = {
             "type": "object", "additionalProperties": False,
             "required": ["message_id", "start", "end", "quote"],
             "properties": {
-                "message_id": {"type": "string"}, "start": {"type": "integer", "minimum": 0},
-                "end": {"type": "integer", "minimum": 0}, "quote": {"type": "string", "minLength": 1},
+                "message_id": {"type": "string", "const": "synthetic-message"},
+                "start": {"type": "integer", "const": 0},
+                "end": {"type": "integer", "const": 18},
+                "quote": {"type": "string", "const": "synthetic evidence"},
             },
         },
         "proposition": {
@@ -88,18 +90,30 @@ def schema_hash():
 def safe_attempts(value):
     attempts = value if isinstance(value, list) else []
     statuses = Counter(item.get("status", "unknown") for item in attempts if isinstance(item, dict))
-    return {"count": len(attempts), "statuses": dict(sorted(statuses.items()))}
+    diagnostics = [item.get("diagnostic") for item in attempts if isinstance(item, dict) and isinstance(item.get("diagnostic"), dict)]
+    return {
+        "count": len(attempts),
+        "statuses": dict(sorted(statuses.items())),
+        "max_event_gap_ms": max((item.get("max_event_gap_ms") or 0 for item in diagnostics), default=0),
+        "max_output_chars": max((item.get("output_chars") or 0 for item in diagnostics), default=0),
+        "max_progress_events": max((item.get("progress_event_count") or 0 for item in diagnostics), default=0),
+    }
 
 
-def run_once(base_url, token_count, deadline_ms):
+def run_once(base_url, token_count, deadline_ms, output_token_limit):
     prompt = (
-        "Synthetic evidence follows. " + "e " * token_count
-        + " Return exactly one JSON object. Use null for reply_markdown and public_search_request, "
-        "false for needs_fresh_search, and empty arrays for propositions and actions."
+        "synthetic evidence\n" + "e " * token_count
+        + "\nReturn exactly one JSON object. Write a coherent reply_markdown of at least 800 characters "
+        "with a summary, three independently reasoned findings, counterevidence, and next-session implications. "
+        "Set needs_fresh_search=false and public_search_request=null. Produce 3 to 5 distinct propositions "
+        "using external_claim or ai_inference, meaningful subject/predicate/object_json and calibrated confidence. "
+        "Produce exactly one analysis.request action with a concrete subject, time_scope and goal. Every "
+        "proposition and action must use source_span message_id=synthetic-message, start=0, end=18, "
+        "quote=synthetic evidence. Do not use empty arrays or placeholder prose."
     )
     payload = {
         "prompt": prompt, "intellect": "smart", "effort": "medium",
-        "deadline_ms": deadline_ms, "output_token_limit": 4096, "output_schema": SCHEMA,
+        "deadline_ms": deadline_ms, "output_token_limit": output_token_limit, "output_schema": SCHEMA,
     }
     request = urllib.request.Request(
         base_url.rstrip("/") + "/v1/generate/stream",
@@ -146,6 +160,10 @@ def run_once(base_url, token_count, deadline_ms):
         "actual_model": final.get("actual_model"),
         "fulfilled_intellect": final.get("fulfilled_intellect"), "ttft_ms": final.get("ttft_ms"),
         "attempts": safe_attempts(final.get("attempts")),
+        "output_chars": len(final["output_text"]),
+        "reply_chars": len(output["reply_markdown"]),
+        "propositions": len(output["propositions"]),
+        "actions": len(output["actions"]),
         "prompt_chars": len(prompt), "schema_hash": schema_hash(),
     }
 
@@ -155,13 +173,14 @@ def main():
     parser.add_argument("--url", default=os.getenv("BROKER_URL", "http://192.168.50.2:8817"))
     parser.add_argument("--runs", type=int, default=3)
     parser.add_argument("--token-count", type=int, default=72_000)
-    parser.add_argument("--deadline-ms", type=int, default=300_000)
+    parser.add_argument("--deadline-ms", type=int, default=260_000)
+    parser.add_argument("--output-token-limit", type=int, default=2_000)
     args = parser.parse_args()
-    if args.runs < 1 or args.token_count < 1 or args.deadline_ms < 1:
-        parser.error("runs, token-count, and deadline-ms must be positive")
+    if args.runs < 1 or args.token_count < 1 or args.deadline_ms < 1 or args.output_token_limit < 1:
+        parser.error("runs, token-count, deadline-ms, and output-token-limit must be positive")
     failures = 0
     for run in range(1, args.runs + 1):
-        passed, summary = run_once(args.url, args.token_count, args.deadline_ms)
+        passed, summary = run_once(args.url, args.token_count, args.deadline_ms, args.output_token_limit)
         failures += not passed
         print(json.dumps({"run": run, "passed": passed, **summary}, ensure_ascii=False), flush=True)
     return 1 if failures else 0

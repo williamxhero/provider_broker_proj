@@ -84,10 +84,10 @@ def production_like_schema():
         "additionalProperties": False,
         "required": ["reply_markdown", "needs_fresh_search", "propositions", "actions"],
         "properties": {
-            "reply_markdown": {"type": ["string", "null"]},
+            "reply_markdown": {"type": "string", "minLength": 600},
             "needs_fresh_search": {"type": "boolean"},
-            "propositions": {"type": "array", "items": {"$ref": "#/$defs/proposition"}},
-            "actions": {"type": "array", "items": {"oneOf": [
+            "propositions": {"type": "array", "minItems": 2, "items": {"$ref": "#/$defs/proposition"}},
+            "actions": {"type": "array", "minItems": 1, "items": {"oneOf": [
                 {"$ref": "#/$defs/analysis_request"},
                 {"$ref": "#/$defs/workflow_proposal"},
             ]}},
@@ -146,7 +146,7 @@ def production_like_body():
         "intellect": "standard",
         "effort": "medium",
         "deadline_ms": 500,
-        "output_token_limit": 4096,
+        "output_token_limit": 2_000,
     }
 
 
@@ -191,11 +191,18 @@ async def test_long_structured_request_uses_remaining_budget_for_bounded_retry()
         "structured_output_invalid", "transport_failed",
     ]
     calls = {item.id: 0 for item in items}
+    span = {"message_id": "synthetic", "start": 0, "end": 18, "quote": "synthetic evidence"}
     valid = json.dumps({
-        "reply_markdown": None,
+        "reply_markdown": "Detailed synthetic assessment. " * 30,
         "needs_fresh_search": False,
-        "propositions": [],
-        "actions": [],
+        "propositions": [
+            {"kind": "external_claim", "subject": "event-a", "confidence": .8, "source_span": span},
+            {"kind": "ai_inference", "subject": "impact-b", "confidence": .6, "source_span": span},
+        ],
+        "actions": [{
+            "action_type": "analysis.request", "subject": "synthetic market",
+            "time_scope": "next session", "source_span": span,
+        }],
     })
 
     async def invoke(item, request_body):
@@ -320,12 +327,101 @@ async def test_partial_sse_has_a_bounded_idle_lease_after_first_text():
             await invoke_stream(item, {
                 "prompt": "idle", "deadline_ms": 500,
                 "_first_event_timeout_ms": 20,
+                "_stream_idle_timeout_ms": 20,
+                "_attempt_timeout_ms": 200,
             })
     finally:
         await server.close()
 
     assert failure.value.status == "stream_incomplete"
     assert failure.value.diagnostic["idle_timeout_ms"] == 20
+
+
+async def test_reasoning_events_keep_a_valid_long_generation_alive_without_becoming_output():
+    valid = '{"answer":"qualified"}'
+
+    async def reasoning_then_output(request):
+        payload = await request.json()
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'event: response.reasoning_summary_text.delta\ndata: {"delta":"private reasoning"}\n\n')
+        await asyncio.sleep(.04)
+        await response.write((
+            'event: response.output_text.delta\ndata: {"delta":'
+            + json.dumps(valid) + '}\n\n'
+        ).encode())
+        await asyncio.sleep(.04)
+        await response.write((
+            'event: response.completed\ndata: {"response":{"id":"reasoning","model":"'
+            + payload["model"] + '","usage":{}}}\n\n'
+        ).encode())
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", reasoning_then_output)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="reasoning-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    try:
+        output = await invoke_stream(item, {
+            "prompt": "reasoning", "deadline_ms": 500,
+            "output_schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["answer"], "properties": {"answer": {"type": "string"}},
+            },
+            "_first_event_timeout_ms": 20,
+            "_stream_idle_timeout_ms": 80,
+            "_attempt_timeout_ms": 200,
+        })
+    finally:
+        await server.close()
+
+    assert output["text"] == valid
+    assert "private reasoning" not in output["text"]
+
+
+async def test_buffered_text_in_completed_event_is_a_valid_complete_stream():
+    valid = '{"answer":"buffered"}'
+
+    async def completed_only(request):
+        payload = await request.json()
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        completed = {
+            "type": "response.completed",
+            "response": {
+                "id": "buffered", "model": payload["model"], "output_text": valid,
+                "usage": {"input_tokens": 10, "output_tokens": 5},
+            },
+        }
+        await response.write(("data: " + json.dumps(completed) + "\n\n").encode())
+        await response.write_eof()
+        return response
+
+    upstream = web.Application()
+    upstream.router.add_post("/v1/responses", completed_only)
+    server = TestServer(upstream)
+    await server.start_server()
+    item = provider(0, secret="buffered-secret")
+    item.base_url = str(server.make_url("/")).rstrip("/")
+    try:
+        output = await invoke_stream(item, {
+            "prompt": "buffered", "deadline_ms": 500,
+            "output_schema": {
+                "type": "object", "additionalProperties": False,
+                "required": ["answer"], "properties": {"answer": {"type": "string"}},
+            },
+            "_first_event_timeout_ms": 20,
+            "_stream_idle_timeout_ms": 80,
+            "_attempt_timeout_ms": 200,
+        })
+    finally:
+        await server.close()
+
+    assert output["text"] == valid
+    assert output["request_id"] == "buffered"
 
 
 async def test_invalid_structured_output_continues_to_later_valid_candidate():

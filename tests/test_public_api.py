@@ -178,6 +178,11 @@ async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     assert 'provider-secret' not in str(body)
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status'] == 'unavailable'
+    assert audit['route_id'] and audit['attempt_number'] == 2
+    assert audit['started_ms'] >= 0 and audit['elapsed_ms'] >= 0
+    assert audit['diagnostic']['endpoint'] == '/responses'
+    assert audit['diagnostic']['http_status'] == 500
+    assert 'provider-secret' not in str(audit['diagnostic'])
     empty=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'empty','intellect':'standard'})
     assert empty.status == 503
     empty_audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]

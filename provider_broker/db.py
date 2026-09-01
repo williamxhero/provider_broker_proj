@@ -74,6 +74,12 @@ class Store:
         for name, definition in [('input_tokens','INTEGER'),('output_tokens','INTEGER'),('cost','REAL'),('request_id','TEXT')]:
             try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
             except sqlite3.OperationalError: pass
+        for name, definition in [
+            ('diagnostic_json', 'TEXT'), ('route_id', 'TEXT'), ('attempt_number', 'INTEGER'),
+            ('started_ms', 'REAL'), ('elapsed_ms', 'REAL'),
+        ]:
+            try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
+            except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
         if not catalog_exists:
@@ -232,8 +238,18 @@ class Store:
         return True
 
     def observe(self, **data):
+        payload = {
+            'diagnostic_json': None, 'route_id': None, 'attempt_number': None,
+            'started_ms': None, 'elapsed_ms': None,
+        } | data
         with self.conn:
-            self.conn.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,input_tokens,output_tokens,cost,request_id) VALUES(:fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,:input_tokens,:output_tokens,:cost,:request_id)", data)
+            self.conn.execute("""INSERT INTO observation(
+                fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status,
+                input_tokens,output_tokens,cost,request_id,diagnostic_json,route_id,attempt_number,started_ms,elapsed_ms
+            ) VALUES(
+                :fingerprint,:requested_model,:actual_model,:tier,:effort,:success,:latency_ms,:error,:status,
+                :input_tokens,:output_tokens,:cost,:request_id,:diagnostic_json,:route_id,:attempt_number,:started_ms,:elapsed_ms
+            )""", payload)
 
     def quality(self, window='24h'):
         modifier={'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]
@@ -254,4 +270,12 @@ class Store:
         values=[*params,limit]
         if offset is not None: query += ' OFFSET ?'; values.append(offset)
         rows=self.conn.execute(query,values).fetchall()
-        return [{'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],'request_id':r['request_id']} for r in rows]
+        return [{
+            'id':r['id'],'time':r['created_at'],'provider':r['provider_name'] or r['fingerprint'],
+            'note':r['note'],'requested_model':r['requested_model'],'actual_model':r['actual_model'],
+            'intellect':r['tier'],'effort':r['effort'],'ttft_ms':r['latency_ms'],'status':r['status'],
+            'input_tokens':r['input_tokens'],'output_tokens':r['output_tokens'],'cost':r['cost'],
+            'request_id':r['request_id'],'route_id':r['route_id'],'attempt_number':r['attempt_number'],
+            'started_ms':r['started_ms'],'elapsed_ms':r['elapsed_ms'],
+            'diagnostic': json.loads(r['diagnostic_json']) if r['diagnostic_json'] else {},
+        } for r in rows]
