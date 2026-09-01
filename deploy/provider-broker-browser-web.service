@@ -1,0 +1,19 @@
+[Unit]
+Description=Provider Broker interactive browser viewer
+After=network-online.target provider-broker-browser.service provider-broker-firewall.service
+Requires=provider-broker-browser.service provider-broker-firewall.service
+
+[Service]
+Type=simple
+User=yosef
+Group=yosef
+ExecStart=/usr/bin/websockify --web /usr/share/novnc 192.168.50.2:8818 127.0.0.1:5900
+Restart=on-failure
+RestartSec=3
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=true
+
+[Install]
+WantedBy=multi-user.target

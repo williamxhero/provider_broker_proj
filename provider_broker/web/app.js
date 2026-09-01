@@ -104,10 +104,20 @@ function renderBalances(payload) {
     thresholdCell.append(threshold, document.createTextNode(` ${site.currency}`));
     const status = site.last_error ? `更新失败：${site.last_error}` : !site.configured ? "尚未登录" : site.low ? "余额不足" : "正常";
     const actions = document.createElement("td");
+    const browserLogin = document.createElement("button");
+    browserLogin.type = "button";
+    browserLogin.className = "text-button";
+    browserLogin.textContent = site.configured ? "网页重新登录" : "网页登录";
+    browserLogin.addEventListener("click", () => openBalanceBrowserLogin(site));
+    const confirmLogin = document.createElement("button");
+    confirmLogin.type = "button";
+    confirmLogin.className = "text-button";
+    confirmLogin.textContent = "验证完成";
+    confirmLogin.addEventListener("click", () => confirmBalanceBrowserLogin(site));
     const login = document.createElement("button");
     login.type = "button";
     login.className = "text-button";
-    login.textContent = site.configured ? "重新登录" : "登录";
+    login.textContent = "账号登录";
     login.addEventListener("click", () => openBalanceLogin(site));
     const sync = document.createElement("button");
     sync.type = "button";
@@ -130,7 +140,7 @@ function renderBalances(payload) {
         await loadBalances();
       } catch (error) { byId("balance-result").textContent = `${site.name} 阈值保存失败：${error.message}`; }
     });
-    actions.append(login, document.createTextNode(" · "), sync, document.createTextNode(" · "), save);
+    actions.append(browserLogin, document.createTextNode(" · "), confirmLogin, document.createTextNode(" · "), login, document.createTextNode(" · "), sync, document.createTextNode(" · "), save);
     [site.name, formatBalance(site.last_balance, site.currency), thresholdCell, status, formatShanghaiTime(site.last_checked_at), actions].forEach((value) => row.append(value instanceof HTMLElement ? value : cell(value)));
     body.append(row);
   });
@@ -154,6 +164,33 @@ function openBalanceLogin(site) {
 function closeBalanceLogin() {
   byId("balance-login-editor").hidden = true;
   state.balanceSite = null;
+}
+
+async function openBalanceBrowserLogin(site) {
+  const output = byId("balance-result");
+  const popup = window.open("about:blank", "provider-browser", "popup,width=1440,height=920");
+  output.textContent = `正在打开 ${site.name} 的小电脑浏览器…`;
+  try {
+    const result = await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/browser-login`, { method: "POST" });
+    if (!popup) throw new Error("浏览器拦截了登录窗口，请允许弹出窗口后重试");
+    popup.location.assign(result.login_url);
+    output.textContent = `请在打开的远程 Chrome 中登录 ${site.name} 并完成验证码，然后回到这里点击“验证完成”。`;
+  } catch (error) {
+    if (popup) popup.close();
+    output.textContent = `${site.name} 网页登录未打开：${error.message}`;
+  }
+}
+
+async function confirmBalanceBrowserLogin(site) {
+  const output = byId("balance-result");
+  output.textContent = `正在验证 ${site.name} 的登录状态…`;
+  try {
+    await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/browser-confirm`, { method: "POST" });
+    output.textContent = `${site.name} 已登录，余额已更新。`;
+    await loadBalances();
+  } catch (error) {
+    output.textContent = `${site.name} 尚未完成网页登录：${error.message}`;
+  }
 }
 
 function sortFor(list) {

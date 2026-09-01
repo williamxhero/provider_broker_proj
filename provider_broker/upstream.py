@@ -154,6 +154,31 @@ def replace_one_of_with_any_of(value):
     return value
 
 
+def provider_native_schema(schema: dict | None, provider_type: str) -> dict | None:
+    """Return a provider-safe native schema, or fall back to prompt enforcement.
+
+    OpenAI-compatible strict schema implementations reject object nodes without
+    an explicit closed property set.  Sending such a schema causes a transport
+    400 before the model can answer.  The Broker still embeds the authoritative
+    schema in the prompt and validates the returned JSON against it locally.
+    """
+    if schema is None or _contains_open_object(schema):
+        return None
+    return schema if provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
+
+
+def _contains_open_object(value) -> bool:
+    if isinstance(value, dict):
+        node_types = value.get("type")
+        is_object = node_types == "object" or isinstance(node_types, list) and "object" in node_types
+        if is_object and not isinstance(value.get("properties"), dict):
+            return True
+        return any(_contains_open_object(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_open_object(item) for item in value)
+    return False
+
+
 def schema_hash(schema: dict | None) -> str | None:
     if schema is None:
         return None
@@ -196,9 +221,26 @@ def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | No
     reinforced += "\nExact JSON Schema (authoritative):\n" + json.dumps(
         schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
+    task_instruction = _enveloped_task_instruction(prompt)
+    if task_instruction:
+        reinforced += (
+            "\nAuthoritative task-specific instruction from the request envelope (apply in addition to the schema):\n"
+            + task_instruction
+        )
     if repair_note:
         reinforced += "\nA prior attempt was rejected. " + repair_note + " Generate the entire JSON again from scratch."
     return reinforced
+
+
+def _enveloped_task_instruction(prompt: str) -> str | None:
+    """Surface a deeply nested task instruction after large structured packets."""
+    try:
+        envelope = json.loads(prompt)
+    except json.JSONDecodeError:
+        return None
+    packet = envelope.get("input") if isinstance(envelope, dict) else None
+    instruction = packet.get("instruction") if isinstance(packet, dict) else None
+    return instruction if isinstance(instruction, str) and instruction.strip() else None
 
 
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,
@@ -262,7 +304,7 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
 async def invoke_stream(provider, body: dict) -> dict:
     model = canonicalize(provider.models[0])
     schema = structured_schema(body)
-    outbound_schema = schema if provider.provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
+    outbound_schema = provider_native_schema(schema, provider.provider_type)
     effort = body.get("effort")
     repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
