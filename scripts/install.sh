@@ -104,7 +104,8 @@ fi
 
 if ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect smart --token-count 2000 --deadline-ms 180000 --output-token-limit 2000 \
   || ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect expert --token-count 2000 --deadline-ms 180000 --output-token-limit 6000 \
-  || ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect smart --contract memory-research --prompt-chars 1530 --prompt-bytes 1530 --deadline-ms 300000 --output-token-limit 2000; then
+  || ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect smart --contract memory-research --prompt-chars 1530 --prompt-bytes 1530 --deadline-ms 300000 --output-token-limit 2000 \
+  || ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --intellect smart --contract research-plan --prompt-chars 111327 --prompt-bytes 148265 --deadline-ms 300000 --output-token-limit 2000; then
   if [[ -n "$previous_target" ]]; then
     ln -sfn "$previous_target" "$APP_ROOT/current.rollback"
     mv -Tf "$APP_ROOT/current.rollback" "$APP_ROOT/current"

@@ -94,6 +94,33 @@ MEMORY_RESEARCH_SCHEMA = {
     },
 }
 
+RESEARCH_PLAN_SCHEMA = {
+    "type": "object", "additionalProperties": False, "required": ["version", "operations"],
+    "properties": {"version": {"type": "integer", "const": 1}, "operations": {
+        "type": "array", "maxItems": 24, "items": {
+            "type": "object", "additionalProperties": False,
+            "required": ["requirement_key", "backend", "operation", "arguments", "fallback_backends"],
+            "properties": {
+                "requirement_key": {"type": "string", "minLength": 1},
+                "backend": {"type": "string", "enum": ["market", "gateway"]},
+                "operation": {"type": "string", "enum": ["market_snapshot", "market_breadth", "sector_snapshot", "holding_snapshot", "web_search", "web_read", "web_browser"]},
+                "arguments": {"type": "object", "additionalProperties": False,
+                    "required": ["query", "categories", "url", "symbol", "render", "session_id", "actions"],
+                    "properties": {
+                        "query": {"type": ["string", "null"]}, "categories": {"type": ["string", "null"]},
+                        "url": {"type": ["string", "null"]}, "symbol": {"type": ["string", "null"]},
+                        "render": {"type": ["string", "null"]}, "session_id": {"type": ["string", "null"]},
+                        "actions": {"type": ["array", "null"], "items": {"type": "object", "additionalProperties": False,
+                            "required": ["type", "url", "ref", "element", "ms", "pixels"],
+                            "properties": {"type": {"type": "string", "enum": ["navigate", "click", "wait", "scroll", "snapshot", "screenshot", "close"]},
+                                "url": {"type": ["string", "null"]}, "ref": {"type": ["string", "null"]},
+                                "element": {"type": ["string", "null"]}, "ms": {"type": ["integer", "null"]}, "pixels": {"type": ["integer", "null"]}}}},
+                    }},
+                "fallback_backends": {"type": "array", "items": {"type": "string", "enum": ["market", "gateway"]}},
+            }}},
+    },
+}
+
 
 def schema_hash(schema):
     encoded = json.dumps(schema, sort_keys=True, separators=(",", ":")).encode()
@@ -153,6 +180,39 @@ def sized_prompt(char_count, byte_count, contract="cognition"):
     return prompt
 
 
+def research_plan_prompt(char_count, byte_count):
+    urls = {
+        "current_market_state": "https://public.example.test/market-close",
+        "events": "https://public.example.test/events",
+    }
+    packet = {
+        "task_key": "daily.review.1520", "stage": "research_plan", "as_of": "2026-09-01T07:20:00Z",
+        "evidence_contract": {"version": 3, "requirements": [
+            {"key": key, "blocking": True, "window": {"mode": "exact", "start": "2026-09-01T07:00:00Z", "end": "2026-09-01T07:00:00Z"}}
+            for key in urls
+        ]},
+        "market_time_context": {"requirements": [{"requirement_key": "current_market_state", "start_utc": "2026-09-01T07:00:00Z", "start_local": "2026-09-01T15:00:00+08:00", "is_local_market_close": True}]},
+        "research_scope": {"standing_questions": ["synthetic public market close and event evidence"]},
+        "coverage_gaps": list(urls), "repair_round": 0, "available_backends": ["gateway"],
+        "research_discoveries": [{"requirement_key": key, "url": url, "source_kind": "public", "snippet": ""} for key, url in urls.items()],
+        "instruction": "Return a version 1 plan that covers every blocking requirement. For each supplied discovery, use gateway web_read with its exact URL. Do not use market or web_search. Use null for unused arguments and an empty fallback_backends array.",
+    }
+    envelope = {"instruction": "Return only one JSON object matching output_schema. Do not add prose or Markdown fences.", "output_schema": RESEARCH_PLAN_SCHEMA, "input": packet}
+    base = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    extra_bytes = byte_count - char_count
+    cjk_chars = extra_bytes // 2
+    if extra_bytes % 2 or cjk_chars < 0:
+        raise ValueError("research-plan prompt byte difference must be even and non-negative")
+    ascii_chars = char_count - len(base) - cjk_chars
+    if ascii_chars < 0:
+        raise ValueError("research-plan prompt target is too small")
+    packet["research_discoveries"][0]["snippet"] = "证" * cjk_chars + "e" * ascii_chars
+    prompt = json.dumps(envelope, ensure_ascii=False, sort_keys=True, separators=(",", ":"))
+    if len(prompt) != char_count or len(prompt.encode("utf-8")) != byte_count:
+        raise AssertionError("constructed research-plan prompt shape does not match requested size")
+    return prompt
+
+
 def run_once(base_url, prompt, schema, deadline_ms, output_token_limit, intellect="smart"):
     payload = {
         "prompt": prompt, "intellect": intellect, "effort": "medium",
@@ -198,15 +258,19 @@ def run_once(base_url, prompt, schema, deadline_ms, output_token_limit, intellec
             "attempts": safe_attempts(final.get("attempts") if isinstance(final, dict) else None),
             "prompt_chars": len(prompt), "prompt_bytes": len(prompt.encode("utf-8")), "schema_hash": schema_hash(schema),
         }
-    contract_summary = (
-        {"operation": output.get("operation"), "source_reference_kind": type(output.get("source_reference")).__name__}
-        if schema_hash(schema) == schema_hash(MEMORY_RESEARCH_SCHEMA)
-        else {
-            "reply_chars": len(output["reply_markdown"]),
-            "propositions": len(output["propositions"]),
-            "actions": len(output["actions"]),
+    if schema_hash(schema) == schema_hash(RESEARCH_PLAN_SCHEMA):
+        operations = output.get("operations") if isinstance(output, dict) else []
+        required = {"current_market_state", "events"}
+        reads = {row.get("requirement_key") for row in operations if isinstance(row, dict) and row.get("backend") == "gateway" and row.get("operation") == "web_read" and str((row.get("arguments") or {}).get("url") or "").startswith("https://public.example.test/")}
+        if not isinstance(operations, list) or not required.issubset(reads):
+            return False, {"http_status": 200, "error_type": "BusinessValidationError", "schema_hash": schema_hash(schema), "planned_requirements": sorted(reads)}
+        contract_summary = {"operations": len(operations), "planned_requirements": sorted(reads)}
+    elif schema_hash(schema) == schema_hash(MEMORY_RESEARCH_SCHEMA):
+        contract_summary = {"operation": output.get("operation"), "source_reference_kind": type(output.get("source_reference")).__name__}
+    else:
+        contract_summary = {
+            "reply_chars": len(output["reply_markdown"]), "propositions": len(output["propositions"]), "actions": len(output["actions"]),
         }
-    )
     return True, {
         "http_status": 200, "status": final.get("status"),
         "actual_model": final.get("actual_model"),
@@ -227,7 +291,7 @@ def main():
     parser.add_argument("--output-token-limit", type=int, default=6_000)
     parser.add_argument("--intellect", choices=("smart", "expert"), default="smart")
     parser.add_argument("--schema-file")
-    parser.add_argument("--contract", choices=("cognition", "memory-research"), default="cognition")
+    parser.add_argument("--contract", choices=("cognition", "memory-research", "research-plan"), default="cognition")
     parser.add_argument("--prompt-chars", type=int)
     parser.add_argument("--prompt-bytes", type=int)
     args = parser.parse_args()
@@ -235,12 +299,12 @@ def main():
         parser.error("runs, token-count, deadline-ms, and output-token-limit must be positive")
     if (args.prompt_chars is None) != (args.prompt_bytes is None):
         parser.error("prompt-chars and prompt-bytes must be provided together")
-    schema = MEMORY_RESEARCH_SCHEMA if args.contract == "memory-research" else SCHEMA
+    schema = {"memory-research": MEMORY_RESEARCH_SCHEMA, "research-plan": RESEARCH_PLAN_SCHEMA}.get(args.contract, SCHEMA)
     if args.schema_file:
         with open(args.schema_file, "r", encoding="utf-8") as handle:
             schema = json.load(handle)
     Draft202012Validator.check_schema(schema)
-    prompt = sized_prompt(args.prompt_chars, args.prompt_bytes, args.contract) if args.prompt_chars is not None else default_prompt(args.token_count)
+    prompt = (research_plan_prompt(args.prompt_chars, args.prompt_bytes) if args.contract == "research-plan" else sized_prompt(args.prompt_chars, args.prompt_bytes, args.contract)) if args.prompt_chars is not None else default_prompt(args.token_count)
     failures = 0
     for run in range(1, args.runs + 1):
         passed, summary = run_once(args.url, prompt, schema, args.deadline_ms, args.output_token_limit, args.intellect)

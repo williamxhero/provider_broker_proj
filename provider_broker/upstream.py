@@ -221,9 +221,26 @@ def strict_schema_prompt(prompt: str, schema: dict | None, repair_note: str | No
     reinforced += "\nExact JSON Schema (authoritative):\n" + json.dumps(
         schema, ensure_ascii=False, sort_keys=True, separators=(",", ":"),
     )
+    task_instruction = _enveloped_task_instruction(prompt)
+    if task_instruction:
+        reinforced += (
+            "\nAuthoritative task-specific instruction from the request envelope (apply in addition to the schema):\n"
+            + task_instruction
+        )
     if repair_note:
         reinforced += "\nA prior attempt was rejected. " + repair_note + " Generate the entire JSON again from scratch."
     return reinforced
+
+
+def _enveloped_task_instruction(prompt: str) -> str | None:
+    """Surface a deeply nested task instruction after large structured packets."""
+    try:
+        envelope = json.loads(prompt)
+    except json.JSONDecodeError:
+        return None
+    packet = envelope.get("input") if isinstance(envelope, dict) else None
+    instruction = packet.get("instruction") if isinstance(packet, dict) else None
+    return instruction if isinstance(instruction, str) and instruction.strip() else None
 
 
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,

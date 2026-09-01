@@ -172,6 +172,19 @@ def test_strict_schema_prompt_only_reinforces_structured_requests():
     assert "Generate the entire JSON again from scratch" in repaired
 
 
+def test_strict_prompt_resurfaces_instruction_buried_in_large_request_envelope():
+    schema = {"type": "object"}
+    instruction = "Cover every blocking requirement and web_read every supplied discovery."
+    prompt = json.dumps({
+        "instruction": "Return only one JSON object matching output_schema.",
+        "output_schema": schema,
+        "input": {"instruction": instruction, "research_discoveries": [{"snippet": "x" * 100_000}]},
+    })
+    reinforced = strict_schema_prompt(prompt, schema)
+    assert reinforced.endswith(instruction)
+    assert reinforced.rfind(instruction) > reinforced.rfind("Exact JSON Schema")
+
+
 def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():
     schema = {
         "type": "object", "additionalProperties": False,
