@@ -489,6 +489,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     }
     tiers = ("standard", "smart", "expert")
     primary = deque()
+    repair = deque()
     retry = deque()
     retries_scheduled = set()
     for candidate_tier in tiers[tiers.index(tier):]:
@@ -501,8 +502,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     def launch_one():
         nonlocal attempts_started, next_hedge_at
-        while (primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
-            provider, candidate_tier, repair_note = primary.popleft() if primary else retry.popleft()
+        while (repair or primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
+            provider, candidate_tier, repair_note = repair.popleft() if repair else primary.popleft() if primary else retry.popleft()
             if not store.try_acquire(provider):
                 continue
             sequence = attempts_started
@@ -537,7 +538,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     launch_one()
     try:
-        while active or primary or retry:
+        while active or repair or primary or retry:
             now = time.monotonic()
             if now >= route_deadline or attempts_started >= attempt_budget and not active:
                 if active:
@@ -547,7 +548,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if not launch_one():
                     break
                 continue
-            can_hedge = bool(primary or retry) and attempts_started < attempt_budget and len(active) < cap
+            can_hedge = bool(repair or primary or retry) and attempts_started < attempt_budget and len(active) < cap
             timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
             done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if not done:
@@ -569,7 +570,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     retry_key = (provider.fingerprint, requested_model, candidate_tier)
                     if retryable_attempt(exc) and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
-                        retry.append((provider, candidate_tier, exc.repair_note))
+                        target = repair if exc.repair_note else retry
+                        target.append((provider, candidate_tier, exc.repair_note))
                     continue
                 if output["actual_model"] != requested_model:
                     store.block_route(provider.fingerprint, requested_model)
@@ -595,7 +597,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
                 }
 
-            while len(active) < cap and attempts_started < attempt_budget and (primary or retry):
+            while len(active) < cap and attempts_started < attempt_budget and (repair or primary or retry):
                 if not launch_one():
                     break
                 if hedge_delay_ms > 0:

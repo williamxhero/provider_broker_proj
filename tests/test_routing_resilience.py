@@ -575,6 +575,37 @@ async def test_schema_repair_retry_is_a_separate_audited_attempt():
     assert bodies[1]["_structured_repair_note"] == "At the root object, omit undeclared properties: rationale."
 
 
+async def test_schema_repair_retry_precedes_untried_unhealthy_candidates():
+    items = [provider(index, secret=f"repair-priority-{index}") for index in range(3)]
+    store = FakeStore(items)
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["answer"], "properties": {"answer": {"type": "string"}},
+    }
+    order = []
+
+    async def invoke(item, request_body):
+        order.append(item.id)
+        if item.id == 0 and "_structured_repair_note" not in request_body:
+            validate_structured_output(
+                '{"answer":"meaning","type":"undeclared"}', schema, "stop",
+                {"endpoint": "/chat/completions"},
+            )
+        if item.id == 0:
+            return completed('{"answer":"meaning"}')
+        raise AttemptFailure("unavailable", diagnostic={"http_status": 503})
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "repair", "output_schema": schema, "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0, route_attempt_budget=4,
+        )
+
+    assert result["text"] == '{"answer":"meaning"}'
+    assert order == [0, 0]
+    assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+
+
 async def test_invalid_schema_is_rejected_by_broker_before_contacting_provider():
     item = provider(0, secret="must-not-be-used")
     with patch("provider_broker.upstream.ClientSession") as session:
