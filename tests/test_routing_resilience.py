@@ -17,6 +17,7 @@ from provider_broker.upstream import (
     invoke_stream,
     route,
     research_plan_output_audit,
+    research_plan_context_audit,
     sanitize_diagnostic,
     strict_schema_prompt,
     provider_native_schema,
@@ -26,7 +27,20 @@ from provider_broker.upstream import (
 
 
 def test_research_plan_audit_keeps_only_verifier_fields_and_redacts_secret_urls():
-    prompt = json.dumps({"input": {"stage": "research_plan"}})
+    prompt = json.dumps({"input": {
+        "stage": "research_plan", "available_backends": ["gateway"],
+        "coverage_gaps": ["current_market_state"],
+        "market_time_context": {"timezone": "Asia/Shanghai", "requirements": [{
+            "requirement_key": "current_market_state", "window_mode": "exact",
+            "start_utc": "2026-09-01T07:00:00Z", "end_utc": "2026-09-01T07:00:00Z",
+            "start_local": "2026-09-01T15:00:00+08:00", "end_local": "2026-09-01T15:00:00+08:00",
+            "is_local_market_close": True, "ignored": "private",
+        }]},
+        "research_discoveries": [{
+            "requirement_key": "current_market_state", "source_kind": "deterministic_public_market",
+            "url": "https://example.test/close?token=secret", "title": "not-recorded",
+        }],
+    }})
     output = json.dumps({
         "version": 1,
         "operations": [{
@@ -49,7 +63,10 @@ def test_research_plan_audit_keeps_only_verifier_fields_and_redacts_secret_urls(
     })
 
     audit = research_plan_output_audit({"prompt": prompt}, output)
-    diagnostic = sanitize_diagnostic({"research_plan_output": audit, "prompt": "secret prompt"})
+    context = research_plan_context_audit({"prompt": prompt})
+    diagnostic = sanitize_diagnostic({
+        "research_plan_output": audit, "research_plan_context": context, "prompt": "secret prompt",
+    })
 
     assert diagnostic["research_plan_output"]["operations"][0] == {
         "requirement_key": "current_market_state",
@@ -68,6 +85,12 @@ def test_research_plan_audit_keeps_only_verifier_fields_and_redacts_secret_urls(
     }
     assert "must-not-be-recorded" not in json.dumps(diagnostic)
     assert "secret prompt" not in json.dumps(diagnostic)
+    assert diagnostic["research_plan_context"]["available_backends"] == ["gateway"]
+    assert diagnostic["research_plan_context"]["research_discoveries"] == [{
+        "requirement_key": "current_market_state", "source_kind": "deterministic_public_market",
+        "url": "https://example.test/close?token=%3CREDACTED%3E",
+    }]
+    assert "not-recorded" not in json.dumps(diagnostic)
 
 
 def provider(index: int, *, secret: str):
@@ -247,6 +270,34 @@ def test_research_plan_prompt_repeats_exact_requirement_keys_and_gaps():
     assert "turnover_compare, portfolio_close" in reinforced
     assert "research_plan_missing_requirement:turnover_compare" in reinforced
     assert "never split, suffix, prefix, or invent" in reinforced
+
+
+def test_research_plan_missing_read_repair_forbids_more_search_and_repeats_candidate_urls():
+    schema = {"type": "object"}
+    prompt = json.dumps({
+        "output_schema": schema,
+        "input": {
+            "stage": "research_plan", "instruction": "Return a valid plan.",
+            "evidence_contract": {"requirements": [
+                {"key": "current_market_state"}, {"key": "material_events_and_counterevidence"},
+            ]},
+            "coverage_gaps": [
+                "research_plan_missing_verification_read:material_events_and_counterevidence",
+            ],
+            "research_discoveries": [
+                {"requirement_key": "material_events_and_counterevidence", "url": "https://news.test/a"},
+                {"requirement_key": "material_events_and_counterevidence", "url": "https://news.test/b"},
+                {"requirement_key": "current_market_state", "url": "https://market.test/close"},
+            ],
+        },
+    })
+
+    reinforced = strict_schema_prompt(prompt, schema)
+
+    assert "Do not use web_search for material_events_and_counterevidence" in reinforced
+    assert "https://news.test/a" in reinforced
+    assert "https://news.test/b" in reinforced
+    assert "https://market.test/close" not in reinforced.rsplit("missing verification-read repair", 1)[-1]
 
 
 def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():

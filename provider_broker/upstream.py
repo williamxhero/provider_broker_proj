@@ -51,6 +51,7 @@ DIAGNOSTIC_FIELDS = {
     "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
     "route_score", "queue_kind",
     "research_plan_output",
+    "research_plan_context",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -71,7 +72,7 @@ def sanitize_diagnostic(value: dict) -> dict:
             result[key] = item
         elif isinstance(item, list):
             result[key] = [str(part)[:80] for part in item[:12]]
-        elif key == "research_plan_output" and isinstance(item, dict):
+        elif key in {"research_plan_output", "research_plan_context"} and isinstance(item, dict):
             result[key] = item
     return result
 
@@ -134,6 +135,42 @@ def research_plan_output_audit(body: dict, text: str) -> dict | None:
             "fallback_backends": [str(item)[:80] for item in (row.get("fallback_backends") or [])[:8]],
         })
     return {"version": output.get("version"), "operations": operations}
+
+
+def research_plan_context_audit(body: dict) -> dict | None:
+    """Keep only the dynamic planner fields required to replay its business verifier."""
+    try:
+        envelope = json.loads(body.get("prompt"))
+        packet = envelope.get("input") if isinstance(envelope, dict) else None
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(packet, dict) or packet.get("stage") != "research_plan":
+        return None
+    discoveries = []
+    for row in (packet.get("research_discoveries") or [])[:64]:
+        if isinstance(row, dict):
+            discoveries.append({
+                "requirement_key": str(row.get("requirement_key") or "")[:160],
+                "url": _safe_audit_url(row.get("url")),
+                "source_kind": str(row.get("source_kind") or "")[:160],
+            })
+    time_context = packet.get("market_time_context") if isinstance(packet.get("market_time_context"), dict) else {}
+    time_rows = []
+    for row in (time_context.get("requirements") or [])[:24]:
+        if isinstance(row, dict):
+            time_rows.append({key: row.get(key) for key in (
+                "requirement_key", "window_mode", "start_utc", "end_utc",
+                "start_local", "end_local", "is_local_market_close",
+            )})
+    return {
+        "available_backends": [str(item)[:80] for item in (packet.get("available_backends") or [])[:8]],
+        "coverage_gaps": [str(item)[:240] for item in (packet.get("coverage_gaps") or [])[:24]],
+        "market_time_context": {
+            "timezone": str(time_context.get("timezone") or "")[:80],
+            "requirements": time_rows,
+        },
+        "research_discoveries": discoveries,
+    }
 
 
 def api_url(base_url: str, suffix: str) -> str:
@@ -321,6 +358,22 @@ def _enveloped_task_instruction(prompt: str) -> str | None:
         )
         if gaps:
             instruction += " Current coverage gaps: " + " | ".join(gaps) + "."
+        discoveries = packet.get("research_discoveries") if isinstance(packet.get("research_discoveries"), list) else []
+        for gap in gaps:
+            prefix = "research_plan_missing_verification_read:"
+            if not gap.startswith(prefix):
+                continue
+            key = gap.removeprefix(prefix).strip()
+            urls = [
+                str(row.get("url")) for row in discoveries
+                if isinstance(row, dict) and str(row.get("requirement_key") or "") == key and row.get("url")
+            ][:4]
+            if urls:
+                instruction += (
+                    f" For missing verification-read repair of {key}: create web_read operations for at least one "
+                    f"and up to four of these exact existing candidate URLs: {' | '.join(urls)}. "
+                    f"Do not use web_search for {key}; discovery is already complete."
+                )
     return instruction
 
 
@@ -421,6 +474,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     content_type = None
     normalized_properties = []
     plan_audit = None
+    plan_context = research_plan_context_audit(body)
     request_shape = request_shape_diagnostic(body)
 
     def diagnostic():
@@ -441,6 +495,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "route_budget_ms": body.get("_route_budget_ms"),
             "response_reserve_ms": body.get("_response_reserve_ms"),
             "research_plan_output": plan_audit,
+            "research_plan_context": plan_context,
         })
 
     def record_progress():
