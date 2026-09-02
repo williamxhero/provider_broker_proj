@@ -18,6 +18,7 @@ from provider_broker.upstream import (
     route,
     research_plan_output_audit,
     research_plan_context_audit,
+    repair_research_plan_verification_reads,
     sanitize_diagnostic,
     strict_schema_prompt,
     provider_native_schema,
@@ -298,6 +299,29 @@ def test_research_plan_missing_read_repair_forbids_more_search_and_repeats_candi
     assert "https://news.test/a" in reinforced
     assert "https://news.test/b" in reinforced
     assert "https://market.test/close" not in reinforced.rsplit("missing verification-read repair", 1)[-1]
+
+
+def test_missing_verification_read_deterministically_fills_the_matching_discovery_url():
+    body = {"prompt": json.dumps({"input": {
+        "stage": "research_plan",
+        "coverage_gaps": ["research_plan_missing_verification_read:prior_judgment_changes"],
+        "research_discoveries": [
+            {"requirement_key": "prior_judgment_changes", "url": "https://news.test/prior"},
+            {"requirement_key": "portfolio_close", "url": "https://market.test/close"},
+        ],
+    }})}
+    output = json.dumps({"version": 1, "operations": [{
+        "requirement_key": "prior_judgment_changes", "backend": "gateway", "operation": "web_read",
+        "arguments": {"query": None, "categories": None, "url": None, "symbol": None,
+                      "render": None, "session_id": None, "actions": None},
+        "fallback_backends": [],
+    }]})
+
+    repaired, fields = repair_research_plan_verification_reads(body, output)
+    operation = json.loads(repaired)["operations"][0]
+
+    assert operation["arguments"]["url"] == "https://news.test/prior"
+    assert fields == ["operations[0].arguments.url"]
 
 
 def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():

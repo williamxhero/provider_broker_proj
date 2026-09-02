@@ -380,6 +380,64 @@ def _enveloped_task_instruction(prompt: str) -> str | None:
     return instruction
 
 
+def repair_research_plan_verification_reads(body: dict, text: str) -> tuple[str, list[str]]:
+    """Deterministically turn missing-read coverage gaps into auditable candidate reads."""
+    try:
+        envelope = json.loads(body.get("prompt"))
+        packet = envelope.get("input") if isinstance(envelope, dict) else None
+        output = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return text, []
+    if not isinstance(packet, dict) or packet.get("stage") != "research_plan" or not isinstance(output, dict):
+        return text, []
+    operations = output.get("operations")
+    if not isinstance(operations, list):
+        return text, []
+    gaps = [str(item) for item in packet.get("coverage_gaps") or []]
+    discoveries = packet.get("research_discoveries") if isinstance(packet.get("research_discoveries"), list) else []
+    changed = []
+    prefix = "research_plan_missing_verification_read:"
+    for gap in gaps:
+        if not gap.startswith(prefix):
+            continue
+        key = gap.removeprefix(prefix).strip()
+        urls = list(dict.fromkeys(
+            str(row.get("url")) for row in discoveries
+            if isinstance(row, dict) and str(row.get("requirement_key") or "") == key and row.get("url")
+        ))[:4]
+        if not urls:
+            continue
+        matching = [
+            (index, row) for index, row in enumerate(operations)
+            if isinstance(row, dict) and str(row.get("requirement_key") or "") == key
+            and row.get("operation") in {"web_search", "web_read"}
+        ]
+        if not matching:
+            operations.append({
+                "requirement_key": key, "backend": "gateway", "operation": "web_read",
+                "arguments": {"query": None, "categories": None, "url": urls[0], "symbol": None,
+                              "render": None, "session_id": None, "actions": None},
+                "fallback_backends": [],
+            })
+            changed.append(f"operations[{len(operations) - 1}]")
+            continue
+        for ordinal, (index, row) in enumerate(matching):
+            arguments = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+            if row.get("operation") == "web_read" and arguments.get("url") in urls:
+                continue
+            row["backend"] = "gateway"
+            row["operation"] = "web_read"
+            row["arguments"] = {
+                "query": None, "categories": None, "url": urls[min(ordinal, len(urls) - 1)], "symbol": None,
+                "render": None, "session_id": None, "actions": None,
+            }
+            row["fallback_backends"] = []
+            changed.append(f"operations[{index}].arguments.url")
+    if not changed:
+        return text, []
+    return json.dumps(output, ensure_ascii=False, separators=(",", ":")), changed
+
+
 def validate_structured_output(text: str, schema: dict, finish_reason: str | None, diagnostic: dict,
                                *, normalize_additional: bool = False) -> tuple[str, list[str]]:
     try:
@@ -658,6 +716,9 @@ async def invoke_stream(provider, body: dict) -> dict:
     text = "".join(chunks)
     if not completed or not text.strip():
         raise AttemptFailure("stream_incomplete", diagnostic=diagnostic())
+    text, repaired_plan_fields = repair_research_plan_verification_reads(body, text)
+    if repaired_plan_fields:
+        chunks = [text]
     if schema is not None:
         text, normalized_properties = validate_structured_output(
             text, schema, finish_reason, diagnostic(), normalize_additional=bool(repair_note),
