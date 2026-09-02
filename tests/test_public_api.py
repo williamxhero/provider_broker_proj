@@ -96,6 +96,21 @@ async def test_browser_balance_login_keeps_the_session_inside_interactive_browse
     assert (await failed.json())["error"] == "browser session expired"
 
 
+async def test_manual_cookie_import_is_encrypted_and_retained_after_failure(client):
+    body = {"cookie": "session=manual-cookie; cf_clearance=manual-clearance", "user_agent": "Browser Test/1"}
+    with patch("provider_broker.app.balance_cookie_login", new=AsyncMock(return_value=(21.85, {"cookie_header": body["cookie"], "user_agent": body["user_agent"]}))):
+        response = await client.post("/admin/v1/balances/liangrekui/cookie", json=body)
+    assert await response.json() == {"logged_in": True, "balance": 21.85, "currency": "CNY", "low": False}
+    raw = client.app["store"].conn.execute("SELECT credential FROM balance_site WHERE id='liangrekui'").fetchone()[0]
+    assert raw is not None and b"manual-cookie" not in raw and b"manual-clearance" not in raw
+
+    with patch("provider_broker.app.balance_cookie_login", new=AsyncMock(side_effect=BalanceFailure("provider rejected session"))):
+        failed = await client.post("/admin/v1/balances/liangrekui/cookie", json=body)
+    assert failed.status == 502
+    site = next(item for item in (await (await client.get("/admin/v1/balances")).json())["sites"] if item["id"] == "liangrekui")
+    assert site["configured"] and site["last_error"] == "provider rejected session"
+
+
 async def test_generate_rejects_utf8_bom_with_structured_json_error(client):
     response = await client.post(
         "/v1/generate",

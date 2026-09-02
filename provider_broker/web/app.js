@@ -119,6 +119,11 @@ function renderBalances(payload) {
     login.className = "text-button";
     login.textContent = "账号登录";
     login.addEventListener("click", () => openBalanceLogin(site));
+    const cookie = document.createElement("button");
+    cookie.type = "button";
+    cookie.className = "text-button";
+    cookie.textContent = "导入 Cookie";
+    cookie.addEventListener("click", () => openBalanceCookieImport(site));
     const sync = document.createElement("button");
     sync.type = "button";
     sync.className = "text-button";
@@ -140,7 +145,7 @@ function renderBalances(payload) {
         await loadBalances();
       } catch (error) { byId("balance-result").textContent = `${site.name} 阈值保存失败：${error.message}`; }
     });
-    actions.append(browserLogin, document.createTextNode(" · "), confirmLogin, document.createTextNode(" · "), login, document.createTextNode(" · "), sync, document.createTextNode(" · "), save);
+    actions.append(browserLogin, document.createTextNode(" · "), confirmLogin, document.createTextNode(" · "), login, document.createTextNode(" · "), cookie, document.createTextNode(" · "), sync, document.createTextNode(" · "), save);
     [site.name, formatBalance(site.last_balance, site.currency), thresholdCell, status, formatShanghaiTime(site.last_checked_at), actions].forEach((value) => row.append(value instanceof HTMLElement ? value : cell(value)));
     body.append(row);
   });
@@ -163,6 +168,20 @@ function openBalanceLogin(site) {
 
 function closeBalanceLogin() {
   byId("balance-login-editor").hidden = true;
+  state.balanceSite = null;
+}
+
+function openBalanceCookieImport(site) {
+  state.balanceSite = site;
+  const form = byId("balance-cookie-form");
+  form.reset();
+  byId("balance-cookie-site").textContent = `${site.name} · 请从你本地 Chrome 的同一站点请求中手动复制 Cookie 和 User-Agent；它们仅加密保存于小电脑，永不回显。`;
+  byId("balance-cookie-editor").hidden = false;
+  form.elements.cookie.focus();
+}
+
+function closeBalanceCookieImport() {
+  byId("balance-cookie-editor").hidden = true;
   state.balanceSite = null;
 }
 
@@ -671,6 +690,20 @@ byId("balance-login-form").addEventListener("submit", async (event) => {
   } catch (error) { byId("balance-result").textContent = `${site.name} 登录失败：${error.message}`; }
 });
 
+byId("balance-cookie-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const site = state.balanceSite;
+  if (!site) return;
+  byId("balance-result").textContent = `正在导入 ${site.name} 的浏览器会话…`;
+  try {
+    await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/cookie`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cookie: form.elements.cookie.value.trim(), user_agent: form.elements.user_agent.value.trim() }) });
+    closeBalanceCookieImport();
+    byId("balance-result").textContent = `${site.name} 会话已导入，余额已更新。`;
+    await loadBalances();
+  } catch (error) { byId("balance-result").textContent = `${site.name} 会话导入失败：${error.message}`; }
+});
+
 byId("windows").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-window]");
   if (!button) return;
@@ -706,6 +739,8 @@ byId("close-editor").addEventListener("click", closeEditor);
 byId("cancel-editor").addEventListener("click", closeEditor);
 byId("close-balance-login").addEventListener("click", closeBalanceLogin);
 byId("cancel-balance-login").addEventListener("click", closeBalanceLogin);
+byId("close-balance-cookie").addEventListener("click", closeBalanceCookieImport);
+byId("cancel-balance-cookie").addEventListener("click", closeBalanceCookieImport);
 restoreControls();
 load().catch(() => { byId("syncresult").textContent = "管理数据加载失败"; });
 window.addEventListener("resize", () => requestAnimationFrame(fitMetricValues));

@@ -13,7 +13,7 @@ from .settings import Settings
 from .source import sync_cpa
 from .upstream import UpstreamFailure, invoke_stream, route
 from .health import run_probe, scheduler
-from .balances import BalanceFailure, login as balance_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
+from .balances import BalanceFailure, login as balance_login, login_with_cookie as balance_cookie_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
 from .browser import BalanceBrowser, BrowserFailure
 
 WEB_ROOT = Path(__file__).with_name("web")
@@ -296,6 +296,31 @@ async def login_balance_site(request):
     return web.json_response({"logged_in": True, "balance": balance, "currency": site["currency"], "low": event["low"]})
 
 
+async def import_balance_cookie(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    valid = isinstance(body, dict) and set(body) == {"cookie", "user_agent"} and all(isinstance(body.get(name), str) and body[name] for name in ("cookie", "user_agent"))
+    valid = valid and len(body["cookie"]) <= 16_384 and len(body["user_agent"]) <= 1_024 and "\r" not in body["cookie"] and "\n" not in body["cookie"] and "\r" not in body["user_agent"] and "\n" not in body["user_agent"]
+    if not valid:
+        return web.json_response({"error": "cookie and user_agent are required"}, status=400)
+    site = request.app["store"].balance_site_secret(request.match_info["site"])
+    if site is None:
+        return web.json_response({"error": "balance site not found"}, status=404)
+    credential = {"cookie_header": body["cookie"], "user_agent": body["user_agent"]}
+    request.app["store"].save_balance_login(site["id"], credential)
+    try:
+        balance, credential = await balance_cookie_login(site, body["cookie"], body["user_agent"])
+    except BalanceFailure as exc:
+        request.app["store"].record_balance_error(site["id"], str(exc))
+        return web.json_response({"error": "site session import failed", "detail": str(exc)}, status=502)
+    event = request.app["store"].record_balance(site["id"], balance, credential)
+    if event["entered_low"]:
+        await notify_low_balance(request.app["store"], event)
+    return web.json_response({"logged_in": True, "balance": balance, "currency": site["currency"], "low": event["low"]})
+
+
 async def open_balance_browser_login(request):
     site = request.app["store"].balance_site_secret(request.match_info["site"])
     if site is None:
@@ -414,7 +439,7 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/", home), web.get("/healthz", health),
         web.get("/admin/v1/balances", balance_sites), web.post("/admin/v1/balances/sync", sync_balance_sites),
         web.patch("/admin/v1/balances/configuration", balance_configuration), web.get("/admin/v1/balances/configuration", balance_configuration),
-        web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
+        web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
