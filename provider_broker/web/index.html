@@ -117,6 +117,16 @@
     </form>
   </aside>
 
+  <aside id="balance-cookie-editor" class="editor" aria-labelledby="balance-cookie-title" hidden>
+    <form id="balance-cookie-form">
+      <div class="editor-heading"><div><p class="index">MANUAL SESSION</p><h2 id="balance-cookie-title">导入浏览器会话</h2></div><button id="close-balance-cookie" type="button" aria-label="关闭">×</button></div>
+      <p id="balance-cookie-site" class="source-note"></p>
+      <label>Cookie 请求头<textarea name="cookie" rows="5" autocomplete="off" required></textarea></label>
+      <label>User-Agent 请求头<textarea name="user_agent" rows="3" autocomplete="off" required></textarea></label>
+      <div class="editor-actions"><button id="cancel-balance-cookie" type="button" class="secondary">取消</button><button type="submit" class="primary">导入并验证</button></div>
+    </form>
+  </aside>
+
   <script src="/static/app.js" defer></script>
 </body>
 </html>

@@ -61,6 +61,8 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 若站点要求 Turnstile 等人机验证，使用“网页登录”：管理页会打开小电脑上的远程 Chrome（仅直连网线可访问）。在该浏览器中完成网站自身的登录和验证码后，回到管理页点击“验证完成”。会话留在小电脑的浏览器配置中；Broker 只在浏览器内请求余额，不导出 Cookie 或令牌。网页查看器为 `http://yosef-server:8818/vnc.html`，并仅允许直连客户端 `192.168.50.1` 访问。
 
+如果 Cloudflare 拒绝小电脑浏览器，可点击“导入 Cookie”，由操作者手动粘贴本地 Chrome 同一站点请求的 `Cookie` 与 `User-Agent` 请求头。该会话只会加密写入小电脑，导入页不会回显它；适用于 New API 站点。Cloudflare 会话可能绑定浏览器和网络，失效后需要重新导入。
+
 已登录站点每 15 分钟刷新一次（可用 `BROKER_BALANCE_SCHEDULER_SECONDS` 调整），也可在管理台立即更新。默认低余额阈值为凉热葵 ¥20、其余站点 $5，均可逐站修改。首次低于阈值时会向配置的 HTTPS Webhook 发送 JSON 告警；余额恢复到阈值以上后自动重新布防。
 
 ### 管理接口

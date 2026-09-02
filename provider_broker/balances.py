@@ -112,9 +112,23 @@ async def login(site: dict, account: str, password: str) -> tuple[float, dict]:
     return extract_balance(payload), credential
 
 
+async def login_with_cookie(site: dict, cookie: str, user_agent: str) -> tuple[float, dict]:
+    """Verify a user-supplied browser session without ever returning it."""
+    if site["adapter"] != "newapi":
+        raise BalanceFailure("manual cookie import is not supported for this site")
+    headers = {"Cookie": cookie, "User-Agent": user_agent}
+    async with ClientSession(timeout=ClientTimeout(total=25)) as session:
+        async with session.get(f"{site['base_url']}/api/user/self", headers=headers) as response:
+            payload = await _json(response)
+    return extract_balance(payload), {"cookie_header": cookie, "user_agent": user_agent}
+
+
 async def refresh(site: dict, credential: dict) -> tuple[float, dict]:
     """Use the saved session first, then deliberately re-authenticate once."""
     timeout = ClientTimeout(total=25)
+    cookie_header, user_agent = credential.get("cookie_header"), credential.get("user_agent")
+    if isinstance(cookie_header, str) and isinstance(user_agent, str):
+        return await login_with_cookie(site, cookie_header, user_agent)
     account, password = credential.get("account"), credential.get("password")
     if not isinstance(account, str) or not isinstance(password, str):
         raise BalanceFailure("login needs to be completed again")
