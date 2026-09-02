@@ -16,11 +16,58 @@ from provider_broker.upstream import (
     UpstreamFailure,
     invoke_stream,
     route,
+    research_plan_output_audit,
+    sanitize_diagnostic,
     strict_schema_prompt,
     provider_native_schema,
     structured_schema,
     validate_structured_output,
 )
+
+
+def test_research_plan_audit_keeps_only_verifier_fields_and_redacts_secret_urls():
+    prompt = json.dumps({"input": {"stage": "research_plan"}})
+    output = json.dumps({
+        "version": 1,
+        "operations": [{
+            "requirement_key": "current_market_state",
+            "backend": "gateway",
+            "operation": "web_read",
+            "arguments": {
+                "query": "2026-09-01 market close",
+                "categories": None,
+                "url": "https://example.test/close?token=secret&date=2026-09-01",
+                "symbol": None,
+                "render": None,
+                "session_id": None,
+                "actions": None,
+            },
+            "fallback_backends": ["market"],
+            "ignored": "must-not-be-recorded",
+        }],
+        "private": "must-not-be-recorded",
+    })
+
+    audit = research_plan_output_audit({"prompt": prompt}, output)
+    diagnostic = sanitize_diagnostic({"research_plan_output": audit, "prompt": "secret prompt"})
+
+    assert diagnostic["research_plan_output"]["operations"][0] == {
+        "requirement_key": "current_market_state",
+        "backend": "gateway",
+        "operation": "web_read",
+        "arguments": {
+            "query": "2026-09-01 market close",
+            "categories": None,
+            "url": "https://example.test/close?token=%3CREDACTED%3E&date=2026-09-01",
+            "symbol": None,
+            "render": None,
+            "session_id": None,
+            "actions": None,
+        },
+        "fallback_backends": ["market"],
+    }
+    assert "must-not-be-recorded" not in json.dumps(diagnostic)
+    assert "secret prompt" not in json.dumps(diagnostic)
 
 
 def provider(index: int, *, secret: str):

@@ -5,6 +5,7 @@ import json
 import random
 import time
 import uuid
+from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientConnectionError, ClientError, ClientSession, ClientTimeout
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
@@ -49,6 +50,7 @@ DIAGNOSTIC_FIELDS = {
     "client_deadline_ms", "route_budget_ms", "response_reserve_ms",
     "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
     "route_score", "queue_kind",
+    "research_plan_output",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -69,7 +71,69 @@ def sanitize_diagnostic(value: dict) -> dict:
             result[key] = item
         elif isinstance(item, list):
             result[key] = [str(part)[:80] for part in item[:12]]
+        elif key == "research_plan_output" and isinstance(item, dict):
+            result[key] = item
     return result
+
+
+_SECRET_URL_KEYS = {"access_token", "api_key", "apikey", "auth", "authorization", "key", "secret", "signature", "token"}
+
+
+def _safe_audit_url(value):
+    if not isinstance(value, str):
+        return None
+    try:
+        parts = urlsplit(value[:2048])
+        query = urlencode([
+            (key, "<REDACTED>" if key.casefold() in _SECRET_URL_KEYS else item)
+            for key, item in parse_qsl(parts.query, keep_blank_values=True)
+        ])
+        return urlunsplit((parts.scheme, parts.netloc, parts.path, query, ""))[:2048]
+    except ValueError:
+        return "<INVALID_URL>"
+
+
+def research_plan_output_audit(body: dict, text: str) -> dict | None:
+    """Project a research plan to the exact bounded fields used by its business verifier."""
+    prompt = body.get("prompt")
+    try:
+        envelope = json.loads(prompt) if isinstance(prompt, str) else None
+        packet = envelope.get("input") if isinstance(envelope, dict) else None
+        output = json.loads(text)
+    except (json.JSONDecodeError, TypeError):
+        return None
+    if not isinstance(packet, dict) or packet.get("stage") != "research_plan" or not isinstance(output, dict):
+        return None
+    operations = []
+    for row in output.get("operations") or []:
+        if not isinstance(row, dict) or len(operations) >= 24:
+            continue
+        arguments = row.get("arguments") if isinstance(row.get("arguments"), dict) else {}
+        actions = arguments.get("actions")
+        safe_actions = None if actions is None else [
+            {
+                "type": action.get("type"), "url": _safe_audit_url(action.get("url")),
+                "ref": action.get("ref"), "element": action.get("element"),
+                "ms": action.get("ms"), "pixels": action.get("pixels"),
+            }
+            for action in actions[:24] if isinstance(action, dict)
+        ] if isinstance(actions, list) else None
+        operations.append({
+            "requirement_key": str(row.get("requirement_key") or "")[:160],
+            "backend": str(row.get("backend") or "")[:80],
+            "operation": str(row.get("operation") or "")[:80],
+            "arguments": {
+                "query": arguments.get("query")[:2048] if isinstance(arguments.get("query"), str) else None,
+                "categories": arguments.get("categories")[:160] if isinstance(arguments.get("categories"), str) else None,
+                "url": _safe_audit_url(arguments.get("url")),
+                "symbol": arguments.get("symbol")[:80] if isinstance(arguments.get("symbol"), str) else None,
+                "render": arguments.get("render")[:80] if isinstance(arguments.get("render"), str) else None,
+                "session_id": arguments.get("session_id")[:160] if isinstance(arguments.get("session_id"), str) else None,
+                "actions": safe_actions,
+            },
+            "fallback_backends": [str(item)[:80] for item in (row.get("fallback_backends") or [])[:8]],
+        })
+    return {"version": output.get("version"), "operations": operations}
 
 
 def api_url(base_url: str, suffix: str) -> str:
@@ -356,6 +420,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     response_status = None
     content_type = None
     normalized_properties = []
+    plan_audit = None
     request_shape = request_shape_diagnostic(body)
 
     def diagnostic():
@@ -375,6 +440,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "client_deadline_ms": body.get("_client_deadline_ms"),
             "route_budget_ms": body.get("_route_budget_ms"),
             "response_reserve_ms": body.get("_response_reserve_ms"),
+            "research_plan_output": plan_audit,
         })
 
     def record_progress():
@@ -540,6 +606,7 @@ async def invoke_stream(provider, body: dict) -> dict:
         )
         if normalized_properties:
             chunks = [text]
+    plan_audit = research_plan_output_audit(body, text)
     usage = normalize_usage(metadata)
     actual_model = canonicalize(str(metadata.get("model") or model))
     return {
