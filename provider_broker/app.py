@@ -38,13 +38,17 @@ async def generate(request):
             response_reserve_ms=settings.response_reserve_ms,
         )
     except UpstreamFailure as exc:
-        return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
+        return web.json_response({
+            "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
+            "request_id": exc.request_id, "route_id": exc.route_id,
+        }, status=503)
     return web.json_response({
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
         "effort": body.get("effort"), "deadline_ms": body.get("deadline_ms"), "output_token_limit": body.get("output_token_limit"),
         "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
         "request_id": result["request_id"], "usage": result["usage"],
         "ttft_ms": result["latency_ms"], "attempts": result["attempts"], "cost_estimate": result["cost"],
+        "route_id": result["route_id"],
     })
 
 
@@ -65,7 +69,10 @@ async def stream(request):
             response_reserve_ms=settings.response_reserve_ms,
         )
     except UpstreamFailure as exc:
-        return web.json_response({"error": "all eligible providers failed", "attempts": exc.attempts}, status=503)
+        return web.json_response({
+            "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
+            "request_id": exc.request_id, "route_id": exc.route_id,
+        }, status=503)
     sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
     await sse.prepare(request)
     for chunk in result["chunks"]:
@@ -75,6 +82,7 @@ async def stream(request):
         "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
         "attempts": result["attempts"], "request_id": result["request_id"], "usage": result["usage"],
         "cost_estimate": result["cost"], "ttft_ms": result["latency_ms"],
+        "route_id": result["route_id"],
     }
     await sse.write(f"event: final\ndata: {json.dumps(final)}\n\n".encode())
     await sse.write_eof()

@@ -35,9 +35,11 @@ class AttemptFailure(Exception):
 
 
 class UpstreamFailure(Exception):
-    def __init__(self, attempts: list[dict]):
+    def __init__(self, attempts: list[dict], *, route_id: str, request_id: str):
         super().__init__("all eligible providers failed")
         self.attempts = attempts
+        self.route_id = route_id
+        self.request_id = request_id
 
 
 DIAGNOSTIC_FIELDS = {
@@ -52,6 +54,7 @@ DIAGNOSTIC_FIELDS = {
     "route_score", "queue_kind",
     "research_plan_output",
     "research_plan_context",
+    "terminal_reason",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -760,6 +763,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     cap = max(1, int(parallel_cap))
     audit = AttemptAudit(route_started)
     route_id = str(uuid.uuid4())
+    terminal_request_id = str(uuid.uuid4())
     attempts_started = 0
     effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
     effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
@@ -780,6 +784,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     retry = deque()
     retries_scheduled = set()
     route_scores = {}
+    eligible_candidates = 0
 
     def candidate_score(provider, candidate_tier):
         key = (provider.fingerprint, canonicalize(provider.models[0]), candidate_tier)
@@ -789,6 +794,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     for candidate_tier in tiers[tiers.index(tier):]:
         for band in price_bands(store.providers(candidate_tier)):
+            eligible_candidates += len(band)
             available = [provider for provider in band if store.has_capacity(provider)]
             randomized = random.sample(available, k=len(available))
             ranked = sorted(
@@ -935,6 +941,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 return output | {
                     "provider": provider.name, "attempts": audit.public(),
                     "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
+                    "route_id": route_id,
                 }
 
             while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or retry):
@@ -945,7 +952,24 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     except asyncio.CancelledError:
         await cancel_active("cancelled")
         raise
-    raise UpstreamFailure(audit.public())
+    attempts = audit.public()
+    if not attempts:
+        elapsed_ms = round((time.monotonic() - route_started) * 1000, 2)
+        reason = "no_eligible_providers" if eligible_candidates == 0 else "capacity_unavailable"
+        terminal = {
+            "attempt": 0, "provider": "provider-broker", "model": None,
+            "status": "route_unavailable", "started_ms": 0, "elapsed_ms": elapsed_ms,
+            "diagnostic": {"queue_kind": "route_terminal", "terminal_reason": reason},
+        }
+        attempts = [terminal]
+        store.observe(
+            fingerprint="provider-broker", requested_model=tier, actual_model=None,
+            tier=tier, effort=body.get("effort"), success=0, latency_ms=None, error=reason,
+            status="route_unavailable", input_tokens=None, output_tokens=None, cost=None,
+            request_id=terminal_request_id, diagnostic_json=json.dumps(terminal["diagnostic"], sort_keys=True),
+            route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
+        )
+    raise UpstreamFailure(attempts, route_id=route_id, request_id=terminal_request_id)
 
 
 def price_bands(providers):

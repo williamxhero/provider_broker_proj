@@ -796,7 +796,21 @@ async def test_max_parallel_skips_a_busy_key_until_its_request_finishes(client, 
     completed = await first
 
     assert skipped.status == 503
-    assert (await skipped.json()) == {'error': 'all eligible providers failed', 'attempts': []}
+    failure = await skipped.json()
+    assert failure['error'] == 'all eligible providers failed'
+    assert failure['status'] == 'failed'
+    assert failure['request_id']
+    assert failure['route_id']
+    assert failure['attempts'] == [{
+        'attempt': 0, 'provider': 'provider-broker', 'model': None,
+        'status': 'route_unavailable', 'started_ms': 0,
+        'elapsed_ms': failure['attempts'][0]['elapsed_ms'],
+        'diagnostic': {'queue_kind': 'route_terminal', 'terminal_reason': 'capacity_unavailable'},
+    }]
+    recorded = next(call for call in client.app['store'].calls(limit=20) if call['request_id'] == failure['request_id'])
+    assert recorded['route_id'] == failure['route_id']
+    assert recorded['status'] == 'route_unavailable'
+    assert recorded['diagnostic']['terminal_reason'] == 'capacity_unavailable'
     assert completed.status == 200
 
 
