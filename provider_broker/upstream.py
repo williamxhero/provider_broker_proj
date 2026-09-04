@@ -2,6 +2,7 @@ import asyncio
 from collections import deque
 import hashlib
 import json
+import logging
 import random
 import time
 import uuid
@@ -11,6 +12,9 @@ from aiohttp import ClientConnectionError, ClientError, ClientSession, ClientTim
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from .catalog import CATALOG, canonicalize
+
+
+logger = logging.getLogger("provider_broker.route")
 
 INTELLECT_RANK = {"standard": 0, "smart": 1, "expert": 2}
 
@@ -42,6 +46,10 @@ class UpstreamFailure(Exception):
         self.request_id = request_id
 
 
+class ClientDeadlineExceeded(UpstreamFailure):
+    pass
+
+
 DIAGNOSTIC_FIELDS = {
     "endpoint", "http_status", "content_type", "schema_hash", "output_token_limit",
     "event_types", "finish_reason", "stream_completed", "received_bytes", "ttfb_ms",
@@ -49,7 +57,7 @@ DIAGNOSTIC_FIELDS = {
     "validation_path", "attempt_timeout_ms", "progress_event_count", "max_event_gap_ms",
     "output_chars", "repair_retry", "unexpected_properties",
     "normalized_properties",
-    "client_deadline_ms", "route_budget_ms", "response_reserve_ms",
+    "client_deadline_ms", "route_budget_ms", "response_reserve_ms", "cancel_grace_ms",
     "prompt_sha256", "prompt_chars", "prompt_bytes", "request_bytes", "schema_sha256",
     "route_score", "queue_kind",
     "research_plan_output",
@@ -817,7 +825,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     client_deadline_ms = max(1, int(deadline_ms)) if isinstance(deadline_ms, (int, float)) else 60000
     reserve_cap_ms = max(0, client_deadline_ms // 10)
     reserve_ms = min(max(0, int(response_reserve_ms)), reserve_cap_ms, max(0, client_deadline_ms - 1))
-    route_budget_ms = max(1, client_deadline_ms - reserve_ms)
+    cancellation_ms = min(max(0, int(cancel_grace_ms)), max(0, client_deadline_ms - reserve_ms - 1))
+    route_budget_ms = max(1, client_deadline_ms - reserve_ms - cancellation_ms)
     deadline_seconds = route_budget_ms / 1000
     route_deadline = route_started + deadline_seconds
     attempt_budget = max(1, int(route_attempt_budget))
@@ -825,6 +834,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     audit = AttemptAudit(route_started)
     route_id = str(uuid.uuid4())
     terminal_request_id = str(uuid.uuid4())
+    deadline_exceeded = False
     attempts_started = 0
     effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
     effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
@@ -837,6 +847,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         "_client_deadline_ms": client_deadline_ms,
         "_route_budget_ms": route_budget_ms,
         "_response_reserve_ms": reserve_ms,
+        "_cancel_grace_ms": cancellation_ms,
     }
     tiers = ("standard", "smart", "expert")
     primary = deque()
@@ -867,6 +878,13 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 (provider, candidate_tier, None, candidate_score(provider, candidate_tier))
                 for provider in ranked
             )
+
+    logger.info(
+        "route_started route_id=%s tier=%s client_deadline_ms=%d route_budget_ms=%d "
+        "response_reserve_ms=%d cancel_grace_ms=%d eligible_candidates=%d",
+        route_id, tier, client_deadline_ms, route_budget_ms, reserve_ms, cancellation_ms,
+        eligible_candidates,
+    )
 
     active = {}
     next_hedge_at = route_started
@@ -912,7 +930,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             task.cancel()
             diagnostic = request_shape_diagnostic(body) | {
                 "client_deadline_ms": client_deadline_ms, "route_budget_ms": route_budget_ms,
-                "response_reserve_ms": reserve_ms,
+                "response_reserve_ms": reserve_ms, "cancel_grace_ms": cancellation_ms,
             }
             if status == "timed_out":
                 diagnostic["first_event_timeout_ms"] = effective_first_event_timeout_ms
@@ -924,7 +942,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         active.clear()
         if not tasks:
             return
-        done, pending = await asyncio.wait(tasks, timeout=max(0, cancel_grace_ms) / 1000)
+        done, pending = await asyncio.wait(tasks, timeout=cancellation_ms / 1000)
 
         def consume_result(task):
             if not task.cancelled():
@@ -944,6 +962,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         while active or repair or priority_retry or primary or retry:
             now = time.monotonic()
             if now >= route_deadline or attempts_started >= attempt_budget and not active:
+                deadline_exceeded = now >= route_deadline
                 if active:
                     await cancel_active("timed_out")
                 break
@@ -957,6 +976,10 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             if not done:
                 launch_one()
                 continue
+            if time.monotonic() >= route_deadline:
+                deadline_exceeded = True
+                await cancel_active("timed_out")
+                break
 
             winner = None
             for task in sorted(done, key=lambda item: active[item][0]):
@@ -999,6 +1022,10 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             if winner is not None:
                 output, provider, candidate_tier = winner
                 await cancel_active("cancelled")
+                logger.info(
+                    "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
+                    route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
+                )
                 return output | {
                     "provider": provider.name, "attempts": audit.public(),
                     "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
@@ -1012,25 +1039,43 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     break
     except asyncio.CancelledError:
         await cancel_active("cancelled")
+        logger.info(
+            "route_cancelled route_id=%s elapsed_ms=%.2f attempts=%d",
+            route_id, (time.monotonic() - route_started) * 1000, len(audit.rows),
+        )
         raise
     attempts = audit.public()
     if not attempts:
         elapsed_ms = round((time.monotonic() - route_started) * 1000, 2)
-        reason = "no_eligible_providers" if eligible_candidates == 0 else "capacity_unavailable"
+        reason = "client_deadline_exceeded" if deadline_exceeded else "no_eligible_providers" if eligible_candidates == 0 else "capacity_unavailable"
+        terminal_diagnostic = {"queue_kind": "route_terminal", "terminal_reason": reason}
+        if deadline_exceeded:
+            terminal_diagnostic |= {
+                "client_deadline_ms": client_deadline_ms, "route_budget_ms": route_budget_ms,
+                "response_reserve_ms": reserve_ms, "cancel_grace_ms": cancellation_ms,
+            }
         terminal = {
             "attempt": 0, "provider": "provider-broker", "model": None,
-            "status": "route_unavailable", "started_ms": 0, "elapsed_ms": elapsed_ms,
-            "diagnostic": {"queue_kind": "route_terminal", "terminal_reason": reason},
+            "status": "route_timed_out" if deadline_exceeded else "route_unavailable",
+            "started_ms": 0, "elapsed_ms": elapsed_ms,
+            "diagnostic": terminal_diagnostic,
         }
         attempts = [terminal]
         store.observe(
             fingerprint="provider-broker", requested_model=tier, actual_model=None,
             tier=tier, effort=body.get("effort"), success=0, latency_ms=None, error=reason,
-            status="route_unavailable", input_tokens=None, output_tokens=None, cost=None,
+            status=terminal["status"], input_tokens=None, output_tokens=None, cost=None,
             request_id=terminal_request_id, diagnostic_json=json.dumps(terminal["diagnostic"], sort_keys=True),
             route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
         )
-    raise UpstreamFailure(attempts, route_id=route_id, request_id=terminal_request_id)
+    failure_type = ClientDeadlineExceeded if deadline_exceeded else UpstreamFailure
+    log = logger.warning if deadline_exceeded else logger.info
+    log(
+        "route_%s route_id=%s elapsed_ms=%.2f attempts=%d client_deadline_ms=%d",
+        "timed_out" if deadline_exceeded else "failed",
+        route_id, (time.monotonic() - route_started) * 1000, len(attempts), client_deadline_ms,
+    )
+    raise failure_type(attempts, route_id=route_id, request_id=terminal_request_id)
 
 
 def price_bands(providers):

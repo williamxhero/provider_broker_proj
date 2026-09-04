@@ -1103,11 +1103,12 @@ async def test_route_reserves_time_to_serialize_and_transmit_before_client_deadl
         )
     elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
 
-    assert 240 <= elapsed_ms < 300
+    assert 190 <= elapsed_ms < 270
     assert failure.value.attempts[0]["status"] == "timed_out"
     assert failure.value.attempts[0]["diagnostic"]["client_deadline_ms"] == 300
     assert failure.value.attempts[0]["diagnostic"]["response_reserve_ms"] == 30
-    assert failure.value.attempts[0]["diagnostic"]["route_budget_ms"] == 270
+    assert failure.value.attempts[0]["diagnostic"]["route_budget_ms"] == 220
+    assert failure.value.attempts[0]["diagnostic"]["cancel_grace_ms"] == 50
     assert store.inflight == {}
 
 
@@ -1150,7 +1151,7 @@ async def test_cancelling_route_cancels_active_upstreams_and_releases_capacity()
     assert [row["status"] for row in store.observations] == ["cancelled", "cancelled"]
 
 
-async def test_budget_and_deadline_exhaustion_returns_503_with_complete_attempts(tmp_path, monkeypatch):
+async def test_budget_and_deadline_exhaustion_returns_504_with_complete_attempts(tmp_path, monkeypatch):
     settings = Settings(
         database_path=tmp_path / "broker.sqlite3",
         admin_token="admin-secret",
@@ -1184,10 +1185,65 @@ async def test_budget_and_deadline_exhaustion_returns_503_with_complete_attempts
     finally:
         await client.close()
 
-    assert response.status == 503
+    assert response.status == 504
+    assert body["status"] == "timed_out"
+    assert body["error"] == "client deadline exceeded"
     assert [attempt["attempt"] for attempt in body["attempts"]] == [1, 2]
     assert [attempt["status"] for attempt in body["attempts"]] == ["timed_out", "timed_out"]
     serialized = json.dumps(body["attempts"])
     assert "deadline-secret" not in serialized
     assert "deadline-prompt-secret" not in serialized
+    assert store.inflight == {}
+
+
+async def test_http_deadline_cancels_active_candidates_and_returns_explicit_timeout_within_tolerance(tmp_path, monkeypatch):
+    settings = Settings(
+        database_path=tmp_path / "broker.sqlite3",
+        admin_token="admin-secret",
+        session_secret="session-secret",
+        encryption_key="MDEyMzQ1Njc4OWFiY2RlZg==",
+    )
+    app = create_app(settings)
+    client = TestClient(TestServer(app))
+    await client.start_server()
+    items = [provider(index, secret=f"bounded-deadline-secret-{index}") for index in range(4)]
+    store = FakeStore(items)
+    started_candidates = []
+    cancelled_candidates = []
+
+    async def slow(item, _body):
+        started_candidates.append(item.id)
+        try:
+            await asyncio.Event().wait()
+        except asyncio.CancelledError:
+            cancelled_candidates.append(item.id)
+            await asyncio.sleep(.150)
+            raise
+
+    async def routed(_store, tier, body, _parallel_cap, **_kwargs):
+        with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+            return await route(
+                store, tier, body, parallel_cap=2, invoker=slow,
+                hedge_delay_ms=0, route_attempt_budget=4,
+                response_reserve_ms=50, cancel_grace_ms=200,
+            )
+
+    monkeypatch.setattr("provider_broker.app.route", routed)
+    started = asyncio.get_running_loop().time()
+    try:
+        response = await client.post("/v1/generate", json={
+            "prompt": "bounded deadline", "intellect": "standard", "deadline_ms": 500,
+        })
+        elapsed_ms = (asyncio.get_running_loop().time() - started) * 1000
+        body = await response.json()
+    finally:
+        await client.close()
+
+    assert elapsed_ms < 550
+    assert response.status == 504
+    assert body["status"] == "timed_out"
+    assert body["error"] == "client deadline exceeded"
+    assert started_candidates == [0, 1]
+    assert cancelled_candidates == [0, 1]
+    assert [attempt["status"] for attempt in body["attempts"]] == ["timed_out", "timed_out"]
     assert store.inflight == {}

@@ -28,7 +28,7 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
   -d '{"prompt":"解释这个概念", "intellect":"smart", "effort":"medium"}'
 ```
 
-请求参数不合法返回 `400`；没有可用上游或所有竞速 Key 都失败时返回 `503`，响应中的 `attempts` 可用于排查。
+请求参数不合法返回 `400`；没有可用上游或所有竞速 Key 都失败时返回 `503`；客户端 `deadline_ms` 耗尽返回 `504`、`status=timed_out` 和 `error=client deadline exceeded`。响应中的 `attempts` 可用于排查。
 
 
 
@@ -83,7 +83,7 @@ curl -X POST http://yosef-server:8817/admin/v1/probes \
 
 `mode: "all"` 会逐个检查指定 Stage 的所有可探测 Provider/model；两个模式都可附加 `fingerprint`、`model`、`timeout_ms` 和 `concurrency` 以缩小范围或控制执行上限。管理台的 Stage 视角提供相同的竞速探针、全量探针和最新结果表，并保存选定 Stage 与表格排序。
 
-可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（默认 30000）、`BROKER_STREAM_IDLE_TIMEOUT_MS`（默认 90000）、`BROKER_ATTEMPT_TIMEOUT_MS`（默认 180000）、`BROKER_RESPONSE_RESERVE_MS`（默认 5000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（默认 32）。首事件窗口按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；reasoning 事件只表示活性，不会拼入输出。
+可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（默认 30000）、`BROKER_STREAM_IDLE_TIMEOUT_MS`（默认 90000）、`BROKER_ATTEMPT_TIMEOUT_MS`（默认 180000）、`BROKER_RESPONSE_RESERVE_MS`（默认 5000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（默认 32）。首事件窗口按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；reasoning 事件只表示活性，不会拼入输出。路由预算会同时扣除响应预留和有界取消窗口，二者不会叠加到客户端 deadline 之后；journal 会记录不含 prompt 或密钥的 route start、complete、timeout/cancel 事件。
 
 长结构化输出可用 `/data/provider-broker/current/venv/bin/python /data/provider-broker/current/production_shape_smoke.py --runs 3` 做生产形态验证。该脚本使用长输入、复杂 Draft 2020-12 Schema 和精确 source span，只输出长度、结构计数、Schema 哈希、模型和安全状态统计，不输出正文。
 

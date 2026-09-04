@@ -1,4 +1,5 @@
 import json
+import logging
 import math
 import re
 import asyncio
@@ -11,7 +12,7 @@ from .db import Store
 from .catalog import blended_price
 from .settings import Settings
 from .source import sync_cpa
-from .upstream import UpstreamFailure, invoke_stream, route
+from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route
 from .health import run_probe, scheduler
 from .balances import BalanceFailure, login as balance_login, login_with_cookie as balance_cookie_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
 from .browser import BalanceBrowser, BrowserFailure
@@ -37,6 +38,11 @@ async def generate(request):
             route_attempt_budget=settings.route_attempt_budget,
             response_reserve_ms=settings.response_reserve_ms,
         )
+    except ClientDeadlineExceeded as exc:
+        return web.json_response({
+            "status": "timed_out", "error": "client deadline exceeded", "attempts": exc.attempts,
+            "request_id": exc.request_id, "route_id": exc.route_id,
+        }, status=504)
     except UpstreamFailure as exc:
         return web.json_response({
             "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
@@ -68,6 +74,11 @@ async def stream(request):
             route_attempt_budget=settings.route_attempt_budget,
             response_reserve_ms=settings.response_reserve_ms,
         )
+    except ClientDeadlineExceeded as exc:
+        return web.json_response({
+            "status": "timed_out", "error": "client deadline exceeded", "attempts": exc.attempts,
+            "request_id": exc.request_id, "route_id": exc.route_id,
+        }, status=504)
     except UpstreamFailure as exc:
         return web.json_response({
             "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
@@ -460,6 +471,10 @@ def create_app(settings: Settings, *, clock=None):
 
 
 def main():
+    logging.basicConfig(
+        level=logging.INFO,
+        format="%(asctime)s %(levelname)s %(name)s %(message)s",
+    )
     settings = Settings.from_env()
     # Let an in-flight client deadline finish during a release restart.  The
     # systemd stop timeout is deliberately longer than this drain window.
