@@ -924,7 +924,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             return True
         return False
 
-    async def cancel_active(status: str):
+    async def cancel_active(status: str, *, persist: bool = True):
         tasks = list(active)
         for task, (sequence, provider, candidate_tier) in active.items():
             task.cancel()
@@ -935,10 +935,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             if status == "timed_out":
                 diagnostic["first_event_timeout_ms"] = effective_first_event_timeout_ms
             audit.finish(sequence, status, diagnostic=diagnostic)
-            observe(
-                store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
-                attempt=audit.row(sequence), route_id=route_id,
-            )
+            if persist:
+                observe(
+                    store, provider, canonicalize(provider.models[0]), candidate_tier, body, status,
+                    attempt=audit.row(sequence), route_id=route_id,
+                )
         active.clear()
         if not tasks:
             return
@@ -964,7 +965,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             if now >= route_deadline or attempts_started >= attempt_budget and not active:
                 deadline_exceeded = now >= route_deadline
                 if active:
-                    await cancel_active("timed_out")
+                    await cancel_active("timed_out", persist=False)
                 break
             if not active:
                 if not launch_one():
@@ -978,7 +979,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 continue
             if time.monotonic() >= route_deadline:
                 deadline_exceeded = True
-                await cancel_active("timed_out")
+                await cancel_active("timed_out", persist=False)
                 break
 
             winner = None
@@ -1061,13 +1062,14 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             "diagnostic": terminal_diagnostic,
         }
         attempts = [terminal]
-        store.observe(
-            fingerprint="provider-broker", requested_model=tier, actual_model=None,
-            tier=tier, effort=body.get("effort"), success=0, latency_ms=None, error=reason,
-            status=terminal["status"], input_tokens=None, output_tokens=None, cost=None,
-            request_id=terminal_request_id, diagnostic_json=json.dumps(terminal["diagnostic"], sort_keys=True),
-            route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
-        )
+        if not deadline_exceeded:
+            store.observe(
+                fingerprint="provider-broker", requested_model=tier, actual_model=None,
+                tier=tier, effort=body.get("effort"), success=0, latency_ms=None, error=reason,
+                status=terminal["status"], input_tokens=None, output_tokens=None, cost=None,
+                request_id=terminal_request_id, diagnostic_json=json.dumps(terminal["diagnostic"], sort_keys=True),
+                route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
+            )
     failure_type = ClientDeadlineExceeded if deadline_exceeded else UpstreamFailure
     log = logger.warning if deadline_exceeded else logger.info
     log(

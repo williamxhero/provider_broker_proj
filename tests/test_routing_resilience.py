@@ -1,6 +1,7 @@
 import asyncio
 import hashlib
 import json
+import time
 from types import SimpleNamespace
 from unittest.mock import patch
 
@@ -1208,8 +1209,15 @@ async def test_http_deadline_cancels_active_candidates_and_returns_explicit_time
     await client.start_server()
     items = [provider(index, secret=f"bounded-deadline-secret-{index}") for index in range(4)]
     store = FakeStore(items)
+    original_observe = store.observe
     started_candidates = []
     cancelled_candidates = []
+
+    def contended_observe(**data):
+        time.sleep(.250)
+        original_observe(**data)
+
+    store.observe = contended_observe
 
     async def slow(item, _body):
         started_candidates.append(item.id)
@@ -1246,4 +1254,5 @@ async def test_http_deadline_cancels_active_candidates_and_returns_explicit_time
     assert started_candidates == [0, 1]
     assert cancelled_candidates == [0, 1]
     assert [attempt["status"] for attempt in body["attempts"]] == ["timed_out", "timed_out"]
+    assert store.observations == []
     assert store.inflight == {}
