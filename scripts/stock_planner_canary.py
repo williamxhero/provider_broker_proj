@@ -64,6 +64,14 @@ def _safe_attempts(items):
     ]
 
 
+def _requirement_rows(packet: dict) -> list[dict]:
+    """Accept both legacy m0_research and current chat_research packet contracts."""
+    legacy = (packet.get("evidence_contract") or {}).get("requirements") or []
+    current = packet.get("evidence_requirements") or []
+    rows = legacy or current
+    return [row for row in rows if isinstance(row, dict)]
+
+
 def main() -> int:
     local = Path(os.environ.get("LOCALAPPDATA", "")) / "AITradingCompanion"
     parser = argparse.ArgumentParser()
@@ -83,10 +91,7 @@ def main() -> int:
 
     database = args.home / "data" / "trading-companion.sqlite3"
     packet, prior_problems = _cycle_packet(database, args.cycle) if args.cycle else _latest_failed_packet(database)
-    requirement_keys = [
-        str(row.get("key")) for row in (packet.get("evidence_contract") or {}).get("requirements") or []
-        if isinstance(row, dict) and row.get("key")
-    ]
+    requirement_keys = [str(row["key"]) for row in _requirement_rows(packet) if row.get("key")]
     if not requirement_keys:
         raise RuntimeError("production packet has no evidence requirements")
     gaps = requirement_keys
