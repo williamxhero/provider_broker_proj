@@ -183,13 +183,20 @@ async def cpa(client):
             request.app.setdefault('hedge_requests', []).append(request.headers['Authorization'])
             return web.json_response({'error': 'synthetic upstream failure'}, status=behavior['status'])
         native_schema = ((payload.get('text') or {}).get('format') or {})
-        if (isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict)) or native_schema.get('type') == 'json_schema':
+        native_contract = native_schema.get('schema') if isinstance(native_schema.get('schema'), dict) else {}
+        native_properties = native_contract.get('properties') if isinstance(native_contract.get('properties'), dict) else {}
+        native_required = native_contract.get('required') if isinstance(native_contract.get('required'), list) else []
+        if request.app.get('reject_optional_native_schema') and native_schema.get('type') == 'json_schema' and set(native_properties) - set(native_required):
+            return web.json_response({'error': {'code': 'invalid_json_schema', 'type': 'invalid_request_error'}}, status=400)
+        prompt_enforced = '[Provider Broker structured-output contract]' in payload.get('input', '')
+        if (isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict)) or native_schema.get('type') == 'json_schema' or prompt_enforced:
             if behavior and 'long frozen research checkpoint' in payload.get('input', ''):
                 request.app.setdefault('long_schema_requests', []).append(request.headers['Authorization'])
                 await asyncio.sleep(behavior.get('delay', 0))
             stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
             await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
-            await stream.write(b'data: {"type":"response.output_text.delta","delta":"{\\"healthy\\":true}"}\n\n')
+            output = '{"answer":"bounded"}' if 'answer' in native_properties or '"answer"' in payload.get('input', '') else '{"healthy":true}'
+            await stream.write((f'data: {{"type":"response.output_text.delta","delta":{json.dumps(output)}}}\n\n').encode())
             await stream.write((f'data: {{"type":"response.completed","response":{{"id":"req-structured-probe","model":"{payload["model"]}","usage":{{"input_tokens":1,"output_tokens":1}}}}}}\n\n').encode())
             await stream.write_eof()
             return stream
@@ -387,6 +394,27 @@ async def test_generate_audits_safe_codes_from_http_and_sse_upstream_errors(clie
         assert body['attempts'][0]['diagnostic']['upstream_error_code'] == 'invalid_json_schema'
         assert body['attempts'][0]['diagnostic']['upstream_error_type'] == 'invalid_request_error'
         assert 'provider-secret' not in str(body)
+
+
+async def test_generate_falls_back_from_strict_optional_schema_to_prompt_enforcement(client, cpa):
+    cpa.app['upstream_app']['reject_optional_native_schema'] = True
+    await client.post('/admin/v1/sync')
+    schema = {
+        'type': 'object', 'additionalProperties': False,
+        'required': ['answer'],
+        'properties': {'answer': {'type': 'string'}, 'optional_note': {'type': 'string'}},
+    }
+
+    response = await client.post('/v1/generate', json={
+        'prompt': '最小合法中文数据', 'intellect': 'standard', 'output_schema': schema,
+    })
+
+    body = await response.json()
+    assert response.status == 200
+    assert json.loads(body['output_text']) == {'answer': 'bounded'}
+    payload = cpa.app['upstream_app']['last_response_payload']
+    assert 'text' not in payload
+    assert '[Provider Broker structured-output contract]' in payload['input']
 
 
 async def test_model_upgrade_is_accepted_and_recorded_as_fulfilled_intellect(client, cpa):

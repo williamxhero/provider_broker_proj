@@ -341,6 +341,18 @@ def test_open_object_schema_uses_prompt_enforcement_without_mutating_contract():
     assert schema == original
 
 
+def test_optional_object_property_uses_prompt_enforcement_for_openai_only():
+    schema = {
+        "type": "object", "additionalProperties": False,
+        "required": ["answer"],
+        "properties": {"answer": {"type": "string"}, "optional_note": {"type": "string"}},
+    }
+
+    assert provider_native_schema(schema, "openai") is None
+    assert provider_native_schema(schema, "codex") is None
+    assert provider_native_schema(schema, "claude") == schema
+
+
 async def test_memory_research_open_object_avoids_rejected_native_schema_and_stays_strict():
     captured = {}
     valid = '{"operation":"complete","query":null,"episode_id":null,"url":null,"source_reference":null}'

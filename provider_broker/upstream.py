@@ -291,11 +291,14 @@ def provider_native_schema(schema: dict | None, provider_type: str) -> dict | No
     """Return a provider-safe native schema, or fall back to prompt enforcement.
 
     OpenAI-compatible strict schema implementations reject object nodes without
-    an explicit closed property set.  Sending such a schema causes a transport
-    400 before the model can answer.  The Broker still embeds the authoritative
-    schema in the prompt and validates the returned JSON against it locally.
+    an explicit closed property set or a required entry for every property.
+    Sending such a schema causes a transport 400 before the model can answer.
+    The Broker still embeds the authoritative schema in the prompt and validates
+    the returned JSON against it locally.
     """
     if schema is None or _contains_open_object(schema):
+        return None
+    if provider_type not in ("anthropic", "claude") and _contains_optional_object_property(schema):
         return None
     return schema if provider_type in ("anthropic", "claude") else replace_one_of_with_any_of(schema)
 
@@ -309,6 +312,22 @@ def _contains_open_object(value) -> bool:
         return any(_contains_open_object(item) for item in value.values())
     if isinstance(value, list):
         return any(_contains_open_object(item) for item in value)
+    return False
+
+
+def _contains_optional_object_property(value) -> bool:
+    if isinstance(value, dict):
+        node_types = value.get("type")
+        is_object = node_types == "object" or isinstance(node_types, list) and "object" in node_types
+        properties = value.get("properties")
+        required = value.get("required")
+        if is_object and isinstance(properties, dict):
+            required_names = {item for item in required if isinstance(item, str)} if isinstance(required, list) else set()
+            if set(properties) - required_names:
+                return True
+        return any(_contains_optional_object_property(item) for item in value.values())
+    if isinstance(value, list):
+        return any(_contains_optional_object_property(item) for item in value)
     return False
 
 
