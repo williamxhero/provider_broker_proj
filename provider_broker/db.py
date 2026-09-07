@@ -66,6 +66,7 @@ class Store:
           fingerprint TEXT NOT NULL, model TEXT NOT NULL, state TEXT NOT NULL DEFAULT 'unknown',
           consecutive_failures INTEGER NOT NULL DEFAULT 0, backoff_level INTEGER NOT NULL DEFAULT 0,
           last_real_attempt TEXT, last_real_success TEXT, last_probe_at TEXT, next_probe_at TEXT,
+          last_route_recovery_at TEXT,
           smoothed_success REAL, smoothed_ttft_ms REAL, updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
           PRIMARY KEY(fingerprint, model)
         );
@@ -107,6 +108,8 @@ class Store:
             try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
+        except sqlite3.OperationalError: pass
+        try: self.conn.execute('ALTER TABLE provider_health ADD COLUMN last_route_recovery_at TEXT')
         except sqlite3.OperationalError: pass
         if not catalog_exists:
             from .catalog import CATALOG
@@ -429,6 +432,44 @@ class Store:
                         continue
                     pricing = catalog[model]
                     result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
+        return result
+
+    def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
+                           cooldown_seconds: int = 30, now: datetime | None = None) -> list[Provider]:
+        if limit <= 0:
+            return []
+        current_time = now or datetime.now(UTC)
+        stamp = self._timestamp(current_time)
+        cooldown_before = self._timestamp(current_time - timedelta(seconds=max(1, cooldown_seconds)))
+        rows = self.conn.execute("""SELECT h.fingerprint,h.model FROM provider_health h
+            JOIN source_provider s USING(fingerprint) JOIN policy p USING(fingerprint)
+            JOIN model_catalog c ON c.model=h.model
+            WHERE h.state='open' AND p.enabled=1 AND p.calibrated=1 AND c.intellect=?
+              AND h.next_probe_at IS NOT NULL AND h.next_probe_at<=?
+              AND (h.last_route_recovery_at IS NULL OR h.last_route_recovery_at<=?)
+              AND NOT EXISTS(SELECT 1 FROM route_block b WHERE b.fingerprint=h.fingerprint AND b.model=h.model)
+            ORDER BY h.last_real_success IS NULL,h.last_real_success DESC,h.updated_at DESC""", (tier, stamp, cooldown_before)).fetchall()
+        result = []
+        endpoints = set(excluded_endpoints)
+        with self.conn:
+            for row in rows:
+                provider = self.probe_provider(row["fingerprint"], row["model"])
+                if provider is None:
+                    continue
+                endpoint = (provider.provider_type, provider.base_url.rstrip("/"))
+                if endpoint in endpoints:
+                    continue
+                claimed = self.conn.execute("""UPDATE provider_health SET last_route_recovery_at=?,updated_at=?
+                    WHERE fingerprint=? AND model=? AND state='open' AND next_probe_at IS NOT NULL AND next_probe_at<=?
+                      AND (last_route_recovery_at IS NULL OR last_route_recovery_at<=?)""",
+                    (stamp, stamp, provider.fingerprint, provider.models[0], stamp, cooldown_before),
+                ).rowcount
+                if not claimed:
+                    continue
+                endpoints.add(endpoint)
+                result.append(provider)
+                if len(result) >= limit:
+                    break
         return result
 
     def probe_provider(self, fingerprint: str, model: str) -> Provider | None:

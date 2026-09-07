@@ -36,6 +36,8 @@ async def generate(request):
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
             attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
+            open_recovery_candidate_limit=settings.open_recovery_candidate_limit,
+            open_recovery_cooldown_seconds=settings.open_recovery_cooldown_seconds,
             response_reserve_ms=settings.response_reserve_ms,
         )
     except ClientDeadlineExceeded as exc:
@@ -72,6 +74,8 @@ async def stream(request):
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
             attempt_timeout_ms=settings.attempt_timeout_ms,
             route_attempt_budget=settings.route_attempt_budget,
+            open_recovery_candidate_limit=settings.open_recovery_candidate_limit,
+            open_recovery_cooldown_seconds=settings.open_recovery_cooldown_seconds,
             response_reserve_ms=settings.response_reserve_ms,
         )
     except ClientDeadlineExceeded as exc:

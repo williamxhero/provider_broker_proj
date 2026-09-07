@@ -819,7 +819,9 @@ def retryable_attempt(failure: AttemptFailure) -> bool:
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
                 *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
                 stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
-                route_attempt_budget: int = 32, response_reserve_ms: int = 5000,
+                route_attempt_budget: int = 32, open_recovery_candidate_limit: int = 2,
+                open_recovery_cooldown_seconds: int = 30,
+                response_reserve_ms: int = 5000,
                 cancel_grace_ms: int = 50) -> dict:
     route_started = time.monotonic()
     deadline_ms = body.get("deadline_ms", 60000)
@@ -854,10 +856,13 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     primary = deque()
     repair = deque()
     priority_retry = deque()
+    recovery = deque()
     retry = deque()
     retries_scheduled = set()
+    recovery_queued_tiers = set()
     route_scores = {}
     eligible_candidates = 0
+    normal_endpoints = set()
 
     def candidate_score(provider, candidate_tier):
         key = (provider.fingerprint, canonicalize(provider.models[0]), candidate_tier)
@@ -879,6 +884,20 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 (provider, candidate_tier, None, candidate_score(provider, candidate_tier))
                 for provider in ranked
             )
+            normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
+
+    def queue_open_recovery(candidate_tier):
+        if candidate_tier in recovery_queued_tiers or open_recovery_candidate_limit <= 0:
+            return
+        recovery_queued_tiers.add(candidate_tier)
+        selector = getattr(store, "recovery_providers", None)
+        if not callable(selector):
+            return
+        for provider in selector(
+            candidate_tier, excluded_endpoints=normal_endpoints, limit=open_recovery_candidate_limit,
+            cooldown_seconds=open_recovery_cooldown_seconds,
+        ):
+            recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
     logger.info(
         "route_started route_id=%s tier=%s client_deadline_ms=%d route_budget_ms=%d "
@@ -892,7 +911,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     def launch_one():
         nonlocal attempts_started, next_hedge_at
-        while (repair or priority_retry or primary or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
+        while (repair or priority_retry or primary or recovery or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
             if repair:
                 provider, candidate_tier, repair_note, route_score = repair.popleft()
                 queue_kind = "repair"
@@ -902,6 +921,9 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             elif primary:
                 provider, candidate_tier, repair_note, route_score = primary.popleft()
                 queue_kind = "primary"
+            elif recovery:
+                provider, candidate_tier, repair_note, route_score = recovery.popleft()
+                queue_kind = "open_recovery"
             else:
                 provider, candidate_tier, repair_note, route_score = retry.popleft()
                 queue_kind = "retry"
@@ -961,7 +983,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
     launch_one()
     try:
-        while active or repair or priority_retry or primary or retry:
+        while active or repair or priority_retry or primary or recovery or retry:
             now = time.monotonic()
             if now >= route_deadline or attempts_started >= attempt_budget and not active:
                 deadline_exceeded = now >= route_deadline
@@ -972,7 +994,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if not launch_one():
                     break
                 continue
-            can_hedge = bool(repair or priority_retry or primary or retry) and attempts_started < attempt_budget and len(active) < cap
+            can_hedge = bool(repair or priority_retry or primary or recovery or retry) and attempts_started < attempt_budget and len(active) < cap
             timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
             done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if not done:
@@ -995,6 +1017,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                         store, provider, requested_model, candidate_tier, body, exc.status,
                         attempt=audit.row(sequence), route_id=route_id,
                     )
+                    queue_open_recovery(candidate_tier)
                     retry_kind = "repair" if exc.repair_note else "transient"
                     retry_key = (provider.fingerprint, requested_model, candidate_tier, retry_kind)
                     if retryable_attempt(exc) and (health is None or health.get("state") != "open") and retry_key not in retries_scheduled:
@@ -1034,7 +1057,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     "route_id": route_id,
                 }
 
-            while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or retry):
+            while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or recovery or retry):
                 if not launch_one():
                     break
                 if hedge_delay_ms > 0:

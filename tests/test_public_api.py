@@ -1,5 +1,6 @@
 import asyncio
 import json
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -170,7 +171,13 @@ async def cpa(client):
             structured_envelope = json.loads(payload.get('input', ''))
         except (TypeError, json.JSONDecodeError):
             structured_envelope = None
-        if isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict):
+        behavior = request.app.get('hedge_behaviors', {}).get(request.headers.get('Authorization'))
+        is_health_probe = isinstance(structured_envelope, dict) and structured_envelope.get('input') == {'probe': 'provider-broker-contract'}
+        if behavior and behavior.get('status') and not is_health_probe:
+            request.app.setdefault('hedge_requests', []).append(request.headers['Authorization'])
+            return web.json_response({'error': 'synthetic upstream failure'}, status=behavior['status'])
+        native_schema = ((payload.get('text') or {}).get('format') or {})
+        if (isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict)) or native_schema.get('type') == 'json_schema':
             stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
             await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
             await stream.write(b'data: {"type":"response.output_text.delta","delta":"{\\"healthy\\":true}"}\n\n')
@@ -180,8 +187,6 @@ async def cpa(client):
         behavior = request.app.get('hedge_behaviors', {}).get(request.headers.get('Authorization'))
         if behavior:
             request.app.setdefault('hedge_requests', []).append(request.headers['Authorization'])
-            if behavior.get('status'):
-                return web.json_response({'error': 'synthetic upstream failure'}, status=behavior['status'])
             stream = web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
             if behavior.get('heartbeat'):
                 await stream.write(b': keepalive\n\n')
@@ -206,7 +211,7 @@ async def cpa(client):
             await stream.write((f'data: {{"type":"response.completed","response":{{"id":"req-stream","model":"{payload.get("model", "gpt-5.6-luna")}","usage":{{"input_tokens":3,"output_tokens":2}}}}}}\n\n').encode())
             await stream.write_eof(); return stream
         return web.json_response({'id':'req-test','model':payload.get('model','gpt-5.6-luna'),'output':[{'type':'message','content':[{'type':'output_text','text':'hello broker'}]}],'usage':{'output_tokens':2}})
-    upstream=web.Application(); app['upstream_app']=upstream; upstream.router.add_post('/v1/responses',response)
+    upstream=web.Application(); app['upstream_app']=upstream; upstream.router.add_post('/v1/responses',response); upstream.router.add_post('/alt/v1/responses',response)
     async def chat(request):
         payload=await request.json(); assert 'tools' not in payload
         request.app['last_chat_payload'] = payload
@@ -215,6 +220,8 @@ async def cpa(client):
     async def models(request): return web.json_response({'data':[{'id': model} for model in request.app.get('models', ['gpt-5.6-luna'])]})
     upstream.router.add_get('/models',models)
     upstream.router.add_get('/v1/models',models)
+    upstream.router.add_get('/alt/models',models)
+    upstream.router.add_get('/alt/v1/models',models)
     upstream_server=TestServer(upstream); await upstream_server.start_server(); app['upstream']=str(upstream_server.make_url('')).rstrip('/'); app['config']['providers'][0]['base_url']=app['upstream']
     server=TestServer(app); await server.start_server()
     client.app['settings'] = client.app['settings'].__class__(**(client.app['settings'].__dict__ | {'cpa_url':str(server.make_url('')).rstrip('/'),'cpa_token':'cpa-secret'}))
@@ -419,6 +426,38 @@ async def test_half_open_failure_reopens_without_retrying_the_same_provider(clie
     health = client.app['store'].health(provider.fingerprint, provider.models[0])
     assert health['state'] == 'open' and health['consecutive_failures'] == 1
     assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer recovery-key']
+
+
+async def test_six_smart_schema_calls_recover_an_open_independent_provider(client, cpa):
+    cpa.app['config'] = {'providers': [
+        {'name': 'Primary route', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+            {'key': 'primary-key', 'models': ['gpt-5.6-terra']},
+        ]},
+        {'name': 'Open recovery route', 'base_url': cpa.app['upstream'] + '/alt', 'type': 'openai', 'keys': [
+            {'key': 'recovery-key', 'models': ['gpt-5.6-terra']},
+        ]},
+    ]}
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
+    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer primary-key': {'status': 503}}
+    await client.post('/admin/v1/sync')
+    recovery = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'recovery-key')
+    client.app['store'].record_health(
+        recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
+        now=datetime.now(UTC) - timedelta(minutes=6),
+    )
+    schema = {'type': 'object', 'additionalProperties': False, 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}}}
+
+    responses = [await client.post('/v1/generate', json={
+        'prompt': 'long structured research shape ' + 'e' * 4_000,
+        'intellect': 'smart', 'deadline_ms': 10_000, 'output_schema': schema,
+    }) for _ in range(6)]
+
+    bodies = [await response.json() for response in responses]
+    assert [response.status for response in responses] == [200] * 6
+    assert all(body['fulfilled_intellect'] == 'smart' and json.loads(body['output_text']) == {'healthy': True} for body in bodies)
+    assert [attempt['diagnostic']['queue_kind'] for attempt in bodies[0]['attempts']] == ['primary', 'open_recovery']
+    assert client.app['store'].health(recovery.fingerprint, recovery.models[0])['state'] == 'healthy'
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer primary-key']
 
 
 async def test_plain_diagnostic_probe_does_not_mutate_health(client, cpa):
