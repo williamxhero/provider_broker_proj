@@ -766,10 +766,11 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
     )
     neutral = {"cancelled", "client_cancelled"}
     if status not in neutral and hasattr(store, "record_health"):
-        store.record_health(
+        return store.record_health(
             provider.fingerprint, requested_model, success=status == "completed", real=True,
             ttft_ms=output.get("latency_ms"), immediate_open=status == "model_mismatch",
         )
+    return None
 
 
 class AttemptAudit:
@@ -990,13 +991,13 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     output = task.result()
                 except AttemptFailure as exc:
                     audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
-                    observe(
+                    health = observe(
                         store, provider, requested_model, candidate_tier, body, exc.status,
                         attempt=audit.row(sequence), route_id=route_id,
                     )
                     retry_kind = "repair" if exc.repair_note else "transient"
                     retry_key = (provider.fingerprint, requested_model, candidate_tier, retry_kind)
-                    if retryable_attempt(exc) and retry_key not in retries_scheduled:
+                    if retryable_attempt(exc) and (health is None or health.get("state") != "open") and retry_key not in retries_scheduled:
                         retries_scheduled.add(retry_key)
                         route_score = candidate_score(provider, candidate_tier)
                         target = repair if exc.repair_note else priority_retry if route_score >= 500 else retry

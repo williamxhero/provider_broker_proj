@@ -189,7 +189,7 @@ class Store:
             state = "half_open" if not real and state == "open" else "healthy"
         else:
             failures += 1
-            if immediate_open or failures >= 3:
+            if immediate_open or state == "half_open" or failures >= 3:
                 state = "open"
                 level = min(level + 1, 4)
                 delay = (2, 5, 15, 30, 60)[level]

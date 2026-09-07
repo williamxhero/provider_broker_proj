@@ -394,6 +394,33 @@ async def test_manual_probe_can_target_an_open_provider(client, cpa):
     assert body['items'][0]['model'] == 'gpt-5.6-luna'
 
 
+async def test_half_open_failure_reopens_without_retrying_the_same_provider(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Recovery candidate', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'recovery-key', 'models': ['gpt-5.6-luna']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer recovery-key': {'status': 503}}
+    await client.post('/admin/v1/sync')
+    provider = client.app['store'].providers('standard')[0]
+    client.app['store'].record_health(provider.fingerprint, provider.models[0], success=False, real=True, immediate_open=True)
+
+    recovered = await client.post('/admin/v1/probes', json={
+        'stage': 'standard', 'mode': 'all', 'fingerprint': provider.fingerprint,
+        'model': provider.models[0], 'timeout_ms': 10_000, 'concurrency': 1,
+    })
+    assert recovered.status == 200
+    assert (await recovered.json())['items'][0]['state'] == 'succeeded'
+    assert client.app['store'].health(provider.fingerprint, provider.models[0])['state'] == 'half_open'
+
+    failed = await client.post('/v1/generate', json={'prompt': 'recover-or-reopen', 'intellect': 'standard'})
+
+    body = await failed.json()
+    assert failed.status == 503
+    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable']
+    health = client.app['store'].health(provider.fingerprint, provider.models[0])
+    assert health['state'] == 'open' and health['consecutive_failures'] == 1
+    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer recovery-key']
+
+
 async def test_plain_diagnostic_probe_does_not_mutate_health(client, cpa):
     await client.post('/admin/v1/sync')
     provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
