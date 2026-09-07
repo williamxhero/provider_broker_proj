@@ -886,7 +886,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             )
             normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
 
-    def queue_open_recovery(candidate_tier):
+    def queue_open_recovery(candidate_tier, *, allow_before_due: bool = False):
         if candidate_tier in recovery_queued_tiers or open_recovery_candidate_limit <= 0:
             return
         recovery_queued_tiers.add(candidate_tier)
@@ -896,12 +896,13 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         for provider in selector(
             candidate_tier, excluded_endpoints=normal_endpoints, limit=open_recovery_candidate_limit,
             cooldown_seconds=open_recovery_cooldown_seconds,
+            allow_before_due=allow_before_due,
         ):
             recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
     if not primary:
         for candidate_tier in tiers[tiers.index(tier):]:
-            queue_open_recovery(candidate_tier)
+            queue_open_recovery(candidate_tier, allow_before_due=True)
 
     logger.info(
         "route_started route_id=%s tier=%s client_deadline_ms=%d route_budget_ms=%d "

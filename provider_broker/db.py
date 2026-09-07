@@ -435,7 +435,8 @@ class Store:
         return result
 
     def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
-                           cooldown_seconds: int = 30, now: datetime | None = None) -> list[Provider]:
+                           cooldown_seconds: int = 120, allow_before_due: bool = False,
+                           now: datetime | None = None) -> list[Provider]:
         if limit <= 0:
             return []
         current_time = now or datetime.now(UTC)
@@ -445,10 +446,10 @@ class Store:
             JOIN source_provider s USING(fingerprint) JOIN policy p USING(fingerprint)
             JOIN model_catalog c ON c.model=h.model
             WHERE h.state='open' AND p.enabled=1 AND p.calibrated=1 AND c.intellect=?
-              AND h.next_probe_at IS NOT NULL AND h.next_probe_at<=?
+              AND (? OR h.next_probe_at IS NOT NULL AND h.next_probe_at<=?)
               AND (h.last_route_recovery_at IS NULL OR h.last_route_recovery_at<=?)
               AND NOT EXISTS(SELECT 1 FROM route_block b WHERE b.fingerprint=h.fingerprint AND b.model=h.model)
-            ORDER BY h.last_real_success IS NULL,h.last_real_success DESC,h.updated_at DESC""", (tier, stamp, cooldown_before)).fetchall()
+            ORDER BY h.last_real_success IS NULL,h.last_real_success DESC,h.updated_at DESC""", (tier, int(allow_before_due), stamp, cooldown_before)).fetchall()
         result = []
         endpoints = set(excluded_endpoints)
         with self.conn:
@@ -460,9 +461,10 @@ class Store:
                 if endpoint in endpoints:
                     continue
                 claimed = self.conn.execute("""UPDATE provider_health SET last_route_recovery_at=?,updated_at=?
-                    WHERE fingerprint=? AND model=? AND state='open' AND next_probe_at IS NOT NULL AND next_probe_at<=?
+                    WHERE fingerprint=? AND model=? AND state='open'
+                      AND (? OR next_probe_at IS NOT NULL AND next_probe_at<=?)
                       AND (last_route_recovery_at IS NULL OR last_route_recovery_at<=?)""",
-                    (stamp, stamp, provider.fingerprint, provider.models[0], stamp, cooldown_before),
+                    (stamp, stamp, provider.fingerprint, provider.models[0], int(allow_before_due), stamp, cooldown_before),
                 ).rowcount
                 if not claimed:
                     continue

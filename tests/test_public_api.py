@@ -1,6 +1,6 @@
 import asyncio
 import json
-from datetime import UTC, datetime, timedelta
+from datetime import UTC, datetime
 from pathlib import Path
 from types import SimpleNamespace
 from unittest.mock import AsyncMock, patch
@@ -443,12 +443,12 @@ async def test_six_smart_schema_calls_recover_an_open_independent_provider(clien
     primary = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'primary-key')
     recovery = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'recovery-key')
     client.app['store'].record_health(
-        primary.fingerprint, primary.models[0], success=False, real=True, immediate_open=True,
-        now=datetime.now(UTC) - timedelta(minutes=6),
+        recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
+        now=datetime.now(UTC),
     )
     client.app['store'].record_health(
-        recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
-        now=datetime.now(UTC) - timedelta(minutes=7),
+        primary.fingerprint, primary.models[0], success=False, real=True, immediate_open=True,
+        now=datetime.now(UTC),
     )
     schema = {'type': 'object', 'additionalProperties': False, 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}}}
 

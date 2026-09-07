@@ -23,7 +23,7 @@ class Settings:
     attempt_timeout_ms: int = 180_000
     route_attempt_budget: int = 32
     open_recovery_candidate_limit: int = 2
-    open_recovery_cooldown_seconds: int = 30
+    open_recovery_cooldown_seconds: int = 120
     response_reserve_ms: int = 5_000
     balance_scheduler_seconds: int = 15 * 60
 
@@ -47,7 +47,7 @@ class Settings:
             attempt_timeout_ms=int(os.getenv("BROKER_ATTEMPT_TIMEOUT_MS", "180000")),
             route_attempt_budget=int(os.getenv("BROKER_ROUTE_ATTEMPT_BUDGET", "32")),
             open_recovery_candidate_limit=int(os.getenv("BROKER_OPEN_RECOVERY_CANDIDATE_LIMIT", "2")),
-            open_recovery_cooldown_seconds=int(os.getenv("BROKER_OPEN_RECOVERY_COOLDOWN_SECONDS", "30")),
+            open_recovery_cooldown_seconds=int(os.getenv("BROKER_OPEN_RECOVERY_COOLDOWN_SECONDS", "120")),
             response_reserve_ms=int(os.getenv("BROKER_RESPONSE_RESERVE_MS", "5000")),
             balance_scheduler_seconds=int(os.getenv("BROKER_BALANCE_SCHEDULER_SECONDS", str(15 * 60))),
         )
