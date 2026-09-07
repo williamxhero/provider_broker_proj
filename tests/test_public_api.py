@@ -431,6 +431,30 @@ async def test_half_open_failure_reopens_without_retrying_the_same_provider(clie
     assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer recovery-key']
 
 
+async def test_successful_probe_keeps_a_recent_real_failure_suspect(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Schema candidate', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'schema-key', 'models': ['gpt-5.6-luna']},
+    ]}]}
+    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer schema-key': {'status': 400}}
+    await client.post('/admin/v1/sync')
+    provider = client.app['store'].providers('standard')[0]
+
+    failed = await client.post('/v1/generate', json={'prompt': 'long structured research shape ' + 'e' * 33_000, 'intellect': 'standard'})
+
+    assert failed.status == 503
+    assert client.app['store'].health(provider.fingerprint, provider.models[0])['state'] == 'suspect'
+
+    cpa.app['upstream_app']['hedge_behaviors'] = {}
+    recovered = await client.post('/admin/v1/probes', json={
+        'stage': 'standard', 'mode': 'all', 'fingerprint': provider.fingerprint,
+        'model': provider.models[0], 'timeout_ms': 10_000, 'concurrency': 1,
+    })
+
+    assert recovered.status == 200
+    health = await client.get('/admin/v1/health?stage=standard')
+    assert (await health.json())['items'][0]['state'] == 'half_open'
+
+
 async def test_six_smart_schema_calls_recover_an_open_independent_provider(client, cpa):
     cpa.app['config'] = {'providers': [
         {'name': 'Primary route', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [

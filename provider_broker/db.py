@@ -191,7 +191,7 @@ class Store:
         if success:
             failures, level, next_probe = 0, 0, None
             # Recovery probes deliberately require one real request before full health.
-            state = "half_open" if not real and state == "open" else "healthy"
+            state = "half_open" if not real and state in {"open", "suspect"} else "healthy"
         else:
             failures += 1
             if immediate_open or state == "half_open" or failures >= 3:
