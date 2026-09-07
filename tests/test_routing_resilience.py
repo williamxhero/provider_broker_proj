@@ -1,4 +1,5 @@
 import asyncio
+from datetime import UTC, datetime, timedelta
 import hashlib
 import json
 import time
@@ -1086,6 +1087,22 @@ def test_route_score_uses_only_safe_exact_request_shape_history(tmp_path):
 
     assert store.route_score(exact_winner, "gpt-5.6-luna", body) == 1000
     assert store.route_score(invalid, "gpt-5.6-luna", body) == -100
+
+
+def test_stale_probe_cannot_reopen_a_circuit_after_a_newer_real_failure(tmp_path):
+    store = Store(tmp_path / "broker.sqlite3", b"x" * 32)
+    probe_started = datetime(2026, 9, 7, 15, 52, 16, tzinfo=UTC)
+
+    store.record_health(
+        "provider", "gpt-5.6-luna", success=False, real=True, immediate_open=True,
+        now=probe_started + timedelta(seconds=3),
+    )
+    health = store.record_health(
+        "provider", "gpt-5.6-luna", success=True, real=False, now=probe_started,
+    )
+
+    assert health["state"] == "open"
+    assert health["consecutive_failures"] == 1
 
 
 async def test_route_reserves_time_to_serialize_and_transmit_before_client_deadline():

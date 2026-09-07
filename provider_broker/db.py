@@ -174,6 +174,8 @@ class Store:
         """Apply passive or probe evidence without touching ordinary call statistics."""
         stamp = self._timestamp(now)
         current = self.health(fingerprint, model)
+        if not real and current.get("last_real_attempt") and current["last_real_attempt"] > stamp:
+            return current
         state = current["state"]
         failures = int(current.get("consecutive_failures") or 0)
         level = int(current.get("backoff_level") or 0)
