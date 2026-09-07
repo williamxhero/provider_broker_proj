@@ -899,6 +899,10 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         ):
             recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
+    if not primary:
+        for candidate_tier in tiers[tiers.index(tier):]:
+            queue_open_recovery(candidate_tier)
+
     logger.info(
         "route_started route_id=%s tier=%s client_deadline_ms=%d route_budget_ms=%d "
         "response_reserve_ms=%d cancel_grace_ms=%d eligible_candidates=%d",

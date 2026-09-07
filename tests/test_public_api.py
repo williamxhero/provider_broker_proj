@@ -440,10 +440,15 @@ async def test_six_smart_schema_calls_recover_an_open_independent_provider(clien
     cpa.app['upstream_app']['models'] = ['gpt-5.6-terra']
     cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer primary-key': {'status': 503}}
     await client.post('/admin/v1/sync')
+    primary = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'primary-key')
     recovery = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'recovery-key')
     client.app['store'].record_health(
-        recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
+        primary.fingerprint, primary.models[0], success=False, real=True, immediate_open=True,
         now=datetime.now(UTC) - timedelta(minutes=6),
+    )
+    client.app['store'].record_health(
+        recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
+        now=datetime.now(UTC) - timedelta(minutes=7),
     )
     schema = {'type': 'object', 'additionalProperties': False, 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}}}
 
@@ -455,7 +460,7 @@ async def test_six_smart_schema_calls_recover_an_open_independent_provider(clien
     bodies = [await response.json() for response in responses]
     assert [response.status for response in responses] == [200] * 6
     assert all(body['fulfilled_intellect'] == 'smart' and json.loads(body['output_text']) == {'healthy': True} for body in bodies)
-    assert [attempt['diagnostic']['queue_kind'] for attempt in bodies[0]['attempts']] == ['primary', 'open_recovery']
+    assert [attempt['diagnostic']['queue_kind'] for attempt in bodies[0]['attempts']] == ['open_recovery', 'open_recovery']
     assert client.app['store'].health(recovery.fingerprint, recovery.models[0])['state'] == 'healthy'
     assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer primary-key']
 
