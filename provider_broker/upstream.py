@@ -63,6 +63,8 @@ DIAGNOSTIC_FIELDS = {
     "research_plan_output",
     "research_plan_context",
     "terminal_reason",
+    "upstream_error_code",
+    "upstream_error_type",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -85,6 +87,25 @@ def sanitize_diagnostic(value: dict) -> dict:
             result[key] = [str(part)[:80] for part in item[:12]]
         elif key in {"research_plan_output", "research_plan_context"} and isinstance(item, dict):
             result[key] = item
+    return result
+
+
+def upstream_error_diagnostic(value) -> dict:
+    """Extract only stable, non-secret upstream error classifiers."""
+    if not isinstance(value, dict):
+        return {}
+    error = value.get("error")
+    if not isinstance(error, dict) and isinstance(value.get("response"), dict):
+        error = value["response"].get("error")
+    if not isinstance(error, dict):
+        return {}
+    result = {}
+    for source, target in (("code", "upstream_error_code"), ("type", "upstream_error_type")):
+        item = error.get(source)
+        if isinstance(item, str):
+            item = item.strip()
+            if 0 < len(item) <= 80 and all(char.isascii() and (char.isalnum() or char in "._-:") for char in item):
+                result[target] = item
     return result
 
 
@@ -542,6 +563,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     response_status = None
     content_type = None
     normalized_properties = []
+    upstream_error = {}
     plan_audit = None
     plan_context = research_plan_context_audit(body)
     request_shape = request_shape_diagnostic(body)
@@ -565,6 +587,7 @@ async def invoke_stream(provider, body: dict) -> dict:
             "response_reserve_ms": body.get("_response_reserve_ms"),
             "research_plan_output": plan_audit,
             "research_plan_context": plan_context,
+            **upstream_error,
         })
 
     def record_progress():
@@ -576,9 +599,10 @@ async def invoke_stream(provider, body: dict) -> dict:
         saw_progress = True
 
     def consume_event(event):
-        nonlocal completed, finish_reason, ttft_ms
+        nonlocal completed, finish_reason, ttft_ms, upstream_error
         if not isinstance(event, dict):
             return False
+        upstream_error = upstream_error | upstream_error_diagnostic(event)
         event_type = event.get("type") if isinstance(event.get("type"), str) else "chat.chunk"
         if event_type not in event_types and len(event_types) < 12:
             event_types.append(event_type)
@@ -650,7 +674,10 @@ async def invoke_stream(provider, body: dict) -> dict:
                 ttfb_ms = round((time.monotonic() - started) * 1000, 2)
                 response_status, content_type = response.status, response.content_type
                 if response.status >= 400:
-                    await response.read()
+                    try:
+                        upstream_error = upstream_error | upstream_error_diagnostic(json.loads((await response.read()).decode("utf-8", errors="replace")))
+                    except json.JSONDecodeError:
+                        pass
                     raise AttemptFailure("unavailable", diagnostic=diagnostic())
                 if response.content_type == "application/json":
                     try:

@@ -151,6 +151,12 @@ async def cpa(client):
             return web.json_response({'id':'req-empty','model':'gpt-5.6-luna','output':[],'usage':{}})
         if payload.get('input') == 'fail-secret':
             return web.json_response({'error':'provider-secret must never escape'},status=500)
+        if payload.get('input') == 'upstream-error-code':
+            return web.json_response({'error': {'code': 'invalid_json_schema', 'type': 'invalid_request_error', 'message': 'provider-secret must never escape'}}, status=400)
+        if payload.get('input') == 'upstream-sse-error-code':
+            stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
+            await stream.write(b'data: {"type":"response.failed","response":{"error":{"code":"invalid_json_schema","type":"invalid_request_error","message":"provider-secret must never escape"}}}\n\n')
+            await stream.write_eof(); return stream
         if payload.get('input') == 'mismatch':
             return web.json_response({'id':'req-mismatch','model':'gpt-5.6-terra','output_text':'complete but wrong model','usage':{'input_tokens':2,'output_tokens':3}})
         if payload.get('input', '').startswith('production-schema-near-miss'):
@@ -369,6 +375,18 @@ async def test_generate_classifies_and_sanitizes_upstream_failures(client, cpa):
     diagnostic = audit['diagnostic']
     assert diagnostic['endpoint'] == '/responses' and diagnostic['http_status'] == 500
     assert 'provider-secret' not in str(diagnostic)
+
+
+async def test_generate_audits_safe_codes_from_http_and_sse_upstream_errors(client, cpa):
+    headers={'Authorization':'Bearer admin-secret'}
+    await client.post('/admin/v1/sync',headers=headers)
+    for prompt in ('upstream-error-code', 'upstream-sse-error-code'):
+        response=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':prompt,'intellect':'standard'})
+        body=await response.json()
+        assert response.status == 503
+        assert body['attempts'][0]['diagnostic']['upstream_error_code'] == 'invalid_json_schema'
+        assert body['attempts'][0]['diagnostic']['upstream_error_type'] == 'invalid_request_error'
+        assert 'provider-secret' not in str(body)
 
 
 async def test_model_upgrade_is_accepted_and_recorded_as_fulfilled_intellect(client, cpa):
