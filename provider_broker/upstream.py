@@ -914,6 +914,20 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     active = {}
     next_hedge_at = route_started
 
+    def has_active_lower_tier(candidate_tier):
+        candidate_rank = INTELLECT_RANK[candidate_tier]
+        return any(
+            INTELLECT_RANK[active_tier] < candidate_rank
+            for _sequence, _provider, active_tier in active.values()
+        )
+
+    def has_launchable_work():
+        if repair or priority_retry:
+            return True
+        if primary and not has_active_lower_tier(primary[0][1]):
+            return True
+        return bool(recovery or retry)
+
     def launch_one():
         nonlocal attempts_started, next_hedge_at
         while (repair or priority_retry or primary or recovery or retry) and attempts_started < attempt_budget and time.monotonic() < route_deadline:
@@ -924,6 +938,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 provider, candidate_tier, repair_note, route_score = priority_retry.popleft()
                 queue_kind = "priority_retry"
             elif primary:
+                if has_active_lower_tier(primary[0][1]):
+                    return False
                 provider, candidate_tier, repair_note, route_score = primary.popleft()
                 queue_kind = "primary"
             elif recovery:
@@ -999,7 +1015,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if not launch_one():
                     break
                 continue
-            can_hedge = bool(repair or priority_retry or primary or recovery or retry) and attempts_started < attempt_budget and len(active) < cap
+            can_hedge = has_launchable_work() and attempts_started < attempt_budget and len(active) < cap
             timeout = min(route_deadline - now, max(0, next_hedge_at - now)) if can_hedge else route_deadline - now
             done, _ = await asyncio.wait(active, timeout=timeout, return_when=asyncio.FIRST_COMPLETED)
             if not done:

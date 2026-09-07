@@ -178,6 +178,9 @@ async def cpa(client):
             return web.json_response({'error': 'synthetic upstream failure'}, status=behavior['status'])
         native_schema = ((payload.get('text') or {}).get('format') or {})
         if (isinstance(structured_envelope, dict) and isinstance(structured_envelope.get('output_schema'), dict)) or native_schema.get('type') == 'json_schema':
+            if behavior and 'long frozen research checkpoint' in payload.get('input', ''):
+                request.app.setdefault('long_schema_requests', []).append(request.headers['Authorization'])
+                await asyncio.sleep(behavior.get('delay', 0))
             stream=web.StreamResponse(headers={'Content-Type':'text/event-stream'}); await stream.prepare(request)
             await stream.write((f'data: {{"model":"{payload["model"]}"}}\n\n').encode())
             await stream.write(b'data: {"type":"response.output_text.delta","delta":"{\\"healthy\\":true}"}\n\n')
@@ -463,6 +466,52 @@ async def test_six_smart_schema_calls_recover_an_open_independent_provider(clien
     assert [attempt['diagnostic']['queue_kind'] for attempt in bodies[0]['attempts']] == ['open_recovery', 'open_recovery']
     assert client.app['store'].health(recovery.fingerprint, recovery.models[0])['state'] == 'healthy'
     assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer primary-key']
+
+
+async def test_six_long_smart_schema_calls_do_not_preemptively_consume_expert_capacity(client, cpa):
+    cpa.app['config'] = {'providers': [
+        {'name': 'Smart route', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+            {'key': 'smart-key', 'models': ['gpt-5.6-terra']},
+        ]},
+        {'name': 'Expert fallback', 'base_url': cpa.app['upstream'] + '/alt', 'type': 'openai', 'keys': [
+            {'key': 'expert-key', 'models': ['gpt-5.6-sol']},
+        ]},
+    ]}
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-terra', 'gpt-5.6-sol']
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        'Bearer smart-key': {'delay': .02},
+        'Bearer expert-key': {'delay': 0},
+    }
+    await client.post('/admin/v1/sync')
+    smart = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'smart-key')
+    expert = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'expert-key')
+    await client.put(f'/admin/v1/policy/{smart.fingerprint}', json={'tiers': ['smart']})
+    await client.put(f'/admin/v1/policy/{expert.fingerprint}', json={'tiers': ['expert']})
+    await client.patch('/admin/v1/routing', json={'race_parallel_cap': 2, 'hedge_delay_ms': 1})
+    schema = {'type': 'object', 'additionalProperties': False, 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}}}
+
+    responses = [await client.post('/v1/generate', json={
+        'prompt': f'long frozen research checkpoint {index}', 'intellect': 'smart',
+        'deadline_ms': 10_000, 'output_schema': schema,
+    }) for index in range(6)]
+
+    bodies = [await response.json() for response in responses]
+    assert [response.status for response in responses] == [200] * 6
+    assert all(body['actual_model'] == 'gpt-5.6-terra' and body['fulfilled_intellect'] == 'smart' for body in bodies)
+    assert all(len(body['attempts']) == 1 for body in bodies)
+    assert cpa.app['upstream_app']['long_schema_requests'] == ['Bearer smart-key'] * 6
+
+    cpa.app['upstream_app']['hedge_behaviors']['Bearer smart-key'] = {'status': 503}
+    fallback = await client.post('/v1/generate', json={
+        'prompt': 'smart failure must use expert fallback', 'intellect': 'smart',
+        'deadline_ms': 10_000, 'output_schema': schema,
+    })
+    fallback_body = await fallback.json()
+    assert fallback.status == 200
+    assert fallback_body['actual_model'] == 'gpt-5.6-sol' and fallback_body['fulfilled_intellect'] == 'expert'
+    fallback_statuses = [item['status'] for item in fallback_body['attempts']]
+    assert fallback_statuses[:2] == ['unavailable', 'completed']
+    assert set(fallback_statuses[2:]) <= {'cancelled'}
 
 
 async def test_plain_diagnostic_probe_does_not_mutate_health(client, cpa):
