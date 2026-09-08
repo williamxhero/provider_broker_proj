@@ -1084,6 +1084,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             sequence = attempts_started
             attempts_started += 1
             audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)
+            if hasattr(store, "route_milestone"):
+                store.route_milestone(route_id, first_attempt_ms=audit.row(sequence)["started_ms"])
 
             async def run(selected=provider, selected_repair_note=repair_note, selected_sequence=sequence):
                 try:
@@ -1097,6 +1099,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                             if stream_selected_sequence is None:
                                 stream_selected_sequence = selected_sequence
                                 first_client_delta_ms = round((time.monotonic() - route_started) * 1000, 2)
+                                if hasattr(store, "route_milestone"):
+                                    store.route_milestone(route_id, first_forwarded_delta_ms=first_client_delta_ms)
                             if stream_selected_sequence == selected_sequence:
                                 await downstream(text)
                         selected_body = {**selected_body, "_on_delta": forward_delta}
@@ -1211,23 +1215,25 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     fulfilled_tier = actual_tier if actual_tier and INTELLECT_RANK[actual_tier] > INTELLECT_RANK[candidate_tier] else candidate_tier
                     winner = (output, provider, fulfilled_tier)
 
-            if winner is not None:
-                output, provider, candidate_tier = winner
-                await cancel_active("cancelled")
-                logger.info(
-                    "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
-                    route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
-                )
-                if hasattr(store, "route_finished"):
-                    store.route_finished(route_id, outcome="completed", first_delta_ms=first_client_delta_ms,
-                                         completed_ms=round((time.monotonic() - route_started) * 1000, 2),
-                                         selected_fingerprint=provider.fingerprint, selected_model=output.get("actual_model"),
-                                         selected_site_id=getattr(provider, "site_id", None))
-                return output | {
-                    "provider": provider.name, "attempts": audit.public(),
-                    "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
-                    "route_id": route_id,
-                }
+                if winner is not None:
+                    output, provider, candidate_tier = winner
+                    await cancel_active("cancelled")
+                    logger.info(
+                        "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
+                        route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
+                    )
+                    if hasattr(store, "route_milestone") and structured_schema(body) is not None:
+                        store.route_milestone(route_id, validation_completed_ms=round((time.monotonic() - route_started) * 1000, 2))
+                    if hasattr(store, "route_finished"):
+                        store.route_finished(route_id, outcome="completed", first_delta_ms=first_client_delta_ms,
+                                             completed_ms=round((time.monotonic() - route_started) * 1000, 2),
+                                             selected_fingerprint=provider.fingerprint, selected_model=output.get("actual_model"),
+                                             selected_site_id=getattr(provider, "site_id", None))
+                    return output | {
+                        "provider": provider.name, "attempts": audit.public(),
+                        "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
+                        "route_id": route_id,
+                    }
 
             while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or recovery or retry):
                 if not launch_one():

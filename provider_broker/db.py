@@ -140,7 +140,9 @@ class Store:
           telemetry_version INTEGER, delivery_mode TEXT, release_version TEXT,
           routing_policy_version TEXT, configuration_fingerprint TEXT,
           shape_version INTEGER, input_bucket TEXT, output_budget_bucket TEXT,
-          deadline_bucket TEXT, schema_family TEXT, experiment_id TEXT, experiment_arm TEXT
+          deadline_bucket TEXT, schema_family TEXT, experiment_id TEXT, experiment_arm TEXT,
+          first_attempt_ms REAL, capacity_wait_ms REAL, first_response_header_ms REAL,
+          first_text_ms REAL, validation_completed_ms REAL
         );
         CREATE INDEX IF NOT EXISTS route_run_started ON route_run(started_at DESC);
         CREATE TABLE IF NOT EXISTS route_candidate (
@@ -208,7 +210,8 @@ class Store:
             ("routing_policy_version", "TEXT"), ("configuration_fingerprint", "TEXT"),
             ("shape_version", "INTEGER"), ("input_bucket", "TEXT"), ("output_budget_bucket", "TEXT"),
             ("deadline_bucket", "TEXT"), ("schema_family", "TEXT"), ("experiment_id", "TEXT"),
-            ("experiment_arm", "TEXT"),
+            ("experiment_arm", "TEXT"), ("first_attempt_ms", "REAL"), ("capacity_wait_ms", "REAL"),
+            ("first_response_header_ms", "REAL"), ("first_text_ms", "REAL"), ("validation_completed_ms", "REAL"),
         ]:
             try: self.conn.execute(f"ALTER TABLE route_run ADD COLUMN {name} {definition}")
             except sqlite3.OperationalError: pass
@@ -460,6 +463,18 @@ class Store:
                 self._timestamp(), outcome, first_delta_ms, completed_ms, selected_fingerprint,
                 selected_model, selected_site_id, terminal_reason, route_id,
             ))
+
+    def route_milestone(self, route_id: str, **milestones: float | None) -> None:
+        allowed = {"first_attempt_ms", "capacity_wait_ms", "first_response_header_ms", "first_text_ms",
+                   "validation_completed_ms", "first_forwarded_delta_ms"}
+        values = {key: value for key, value in milestones.items() if key in allowed and value is not None}
+        if not values:
+            return
+        if "first_forwarded_delta_ms" in values:
+            values["first_delta_ms"] = values.pop("first_forwarded_delta_ms")
+        assignments = ",".join(f"{key}=coalesce({key},?)" for key in values)
+        with self.conn:
+            self.conn.execute(f"UPDATE route_run SET {assignments} WHERE route_id=?", [*values.values(), route_id])
 
     def record_candidate(self, route_id: str, *, fingerprint: str | None, model: str | None,
                          site_id: str | None, eligible: bool, initial_rank: int | None = None,
@@ -955,6 +970,31 @@ class Store:
         earliest = self.conn.execute("SELECT min(started_at) FROM route_run WHERE telemetry_version=?", (TELEMETRY_SCHEMA_VERSION,)).fetchone()[0]
         telemetry_total = len(route_rows)
         first_forwarded = sorted(plain_stream_deltas)
+        delivery_latency = {}
+        for mode in DELIVERY_MODES:
+            mode_rows = [route for route in route_rows if route["delivery_mode"] == mode]
+            forwarded = sorted(route["first_delta_ms"] for route in mode_rows if route["first_delta_ms"] is not None)
+            completion = sorted(
+                row[0] for row in self.conn.execute(
+                    f"SELECT coalesce(validation_completed_ms,completed_ms) FROM route_run WHERE {route_where} "
+                    "AND delivery_mode=? AND coalesce(validation_completed_ms,completed_ms) IS NOT NULL "
+                    "ORDER BY coalesce(validation_completed_ms,completed_ms)", (*params, mode)
+                ).fetchall()
+            )
+            delivery_latency[mode] = {
+                "first_forwarded_delta": {
+                    "applicable_count": len(mode_rows) if mode == "plain_stream" else 0,
+                    "sample_count": len(forwarded) if mode == "plain_stream" else 0,
+                    "p50_ms": percentile(forwarded, .5) if mode == "plain_stream" else None,
+                    "p95_ms": percentile(forwarded, .95) if mode == "plain_stream" else None,
+                },
+                "valid_completion": {
+                    "applicable_count": len(mode_rows) if mode != "plain_stream" else 0,
+                    "sample_count": len(completion) if mode != "plain_stream" else 0,
+                    "p50_ms": percentile(completion, .5) if mode != "plain_stream" else None,
+                    "p95_ms": percentile(completion, .95) if mode != "plain_stream" else None,
+                },
+            }
         return {
             'calls': row['calls'], 'technical_success_rate': row['rate'], 'avg_ttft_ms': row['ttft'], 'p95_ttft_ms': p95,
             'total_cost': row['total_cost'], 'model_fulfillment_rate': fulfillment, 'failures': failures,
@@ -978,6 +1018,7 @@ class Store:
                 'p50_ms': percentile(first_forwarded, .5),
                 'p95_ms': percentile(first_forwarded, .95),
             },
+            'delivery_latency': delivery_latency,
         }
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]

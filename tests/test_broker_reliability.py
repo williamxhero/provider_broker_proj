@@ -87,6 +87,23 @@ def test_route_reconciliation_and_audit_detail_are_idempotent_and_private(tmp_pa
     assert health["in_progress"] == 0
 
 
+def test_delivery_latency_uses_applicable_modes_and_never_turns_unknown_into_zero(tmp_path):
+    db = store(tmp_path)
+    db.route_started("route-stream", "standard", "request-stream", delivery_mode="plain_stream")
+    db.route_milestone("route-stream", first_attempt_ms=8, capacity_wait_ms=3, first_forwarded_delta_ms=120)
+    db.route_finished("route-stream", outcome="completed", first_delta_ms=120, completed_ms=400)
+    db.route_started("route-structured", "standard", "request-structured", delivery_mode="validated_stream")
+    db.route_milestone("route-structured", validation_completed_ms=600)
+    db.route_finished("route-structured", outcome="completed", completed_ms=600)
+
+    metrics = db.quality()["delivery_latency"]
+
+    assert metrics["plain_stream"]["first_forwarded_delta"]["applicable_count"] == 1
+    assert metrics["plain_stream"]["first_forwarded_delta"]["p95_ms"] == 120
+    assert metrics["validated_stream"]["first_forwarded_delta"]["applicable_count"] == 0
+    assert metrics["validated_stream"]["valid_completion"]["p95_ms"] == 600
+
+
 def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure(tmp_path):
     db = store(tmp_path)
     original = {
