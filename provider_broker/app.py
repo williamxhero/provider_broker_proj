@@ -30,7 +30,7 @@ async def generate(request):
     try:
         settings = request.app["settings"]
         result = await route(
-            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector")}, request.app["store"].race_parallel_cap(),
+            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_delivery_mode": "non_stream"}, request.app["store"].race_parallel_cap(),
             hedge_delay_ms=request.app["store"].hedge_delay_ms(),
             first_event_timeout_ms=settings.first_event_timeout_ms,
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
@@ -84,7 +84,7 @@ async def stream(request):
     try:
         settings = request.app["settings"]
         result = await route(
-            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_on_delta": emit_delta}, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
+            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_on_delta": emit_delta, "_delivery_mode": "validated_stream" if structured else "plain_stream"}, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
             hedge_delay_ms=request.app["store"].hedge_delay_ms(),
             first_event_timeout_ms=settings.first_event_timeout_ms,
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,

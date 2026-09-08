@@ -1058,7 +1058,12 @@ async def test_quality_and_calls_are_derived_from_completed_generate(client, cpa
     await client.patch('/admin/v1/policy/'+provider['fingerprint'],headers=headers,json={'calibrated':True})
     await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'private','intellect':'standard','effort':'low'})
     quality=await client.get('/admin/v1/quality?window=24h',headers=headers)
-    assert (await quality.json())['calls'] == 1
+    quality_body = await quality.json()
+    assert quality_body['calls'] == 1
+    assert quality_body['request_success_numerator'] == 1
+    assert quality_body['request_success_denominator'] == 1
+    assert quality_body['request_coverage'] == 1
+    assert quality_body['first_forwarded_delta']['applicable_count'] == 0
     calls=await client.get('/admin/v1/calls?limit=1',headers=headers)
     row=(await calls.json())['items'][0]
     assert row['status'] == 'completed' and 'prompt' not in row and 'provider-secret' not in str(row)

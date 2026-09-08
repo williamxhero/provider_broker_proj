@@ -502,7 +502,13 @@ function fitMetricValues() {
 
 function renderQuality(payload) {
   const failures = payload.failures || {};
+  const requestMetrics = Object.hasOwn(payload, "request_success_denominator") ? [
+    metric("\u8bf7\u6c42\u6210\u529f\u7387", formatPercent(payload.request_success_rate)),
+    metric("\u5df2\u77e5\u8bf7\u6c42\u6837\u672c", `${payload.request_success_numerator}/${payload.request_success_denominator}`),
+    metric("\u9065\u6d4b\u8986\u76d6\u7387", formatPercent(payload.request_coverage)),
+  ] : [];
   byId("quality").replaceChildren(
+    ...requestMetrics,
     metric("可路由 API", state.summary.routable_apis),
     metric("技术成功率", formatPercent(payload.technical_success_rate)),
     metric("平均 TTFT", formatMs(payload.avg_ttft_ms)),

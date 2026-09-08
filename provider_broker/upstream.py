@@ -926,7 +926,14 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     route_id = str(uuid.uuid4())
     terminal_request_id = str(uuid.uuid4())
     if hasattr(store, "route_started"):
-        store.route_started(route_id, tier, terminal_request_id, body.get("effort"))
+        delivery_mode = body.get("_delivery_mode")
+        if not isinstance(delivery_mode, str):
+            delivery_mode = "validated_stream" if structured_schema(body) is not None else "non_stream"
+        store.route_started(
+            route_id, tier, terminal_request_id, body.get("effort"), body=body,
+            delivery_mode=delivery_mode, experiment_id=body.get("_experiment_id"),
+            experiment_arm=body.get("_experiment_arm"),
+        )
     deadline_exceeded = False
     stream_selected_sequence = None
     first_client_delta_ms = None

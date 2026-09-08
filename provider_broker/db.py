@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from importlib.metadata import PackageNotFoundError, version
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,45 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .catalog import blended_price
+
+
+TELEMETRY_SCHEMA_VERSION = 1
+ROUTING_POLICY_VERSION = "v1"
+DELIVERY_MODES = {"non_stream", "plain_stream", "validated_stream"}
+
+
+def broker_release_version() -> str:
+    """Return an installed release when packaged, with a stable source fallback."""
+    try:
+        return version("provider-broker")
+    except PackageNotFoundError:
+        return "0.2.0-dev"
+
+
+def _bucket(value: object, bounds: tuple[tuple[int, str], ...], unknown: str = "unknown") -> str:
+    if not isinstance(value, (int, float)) or value < 0:
+        return unknown
+    for maximum, label in bounds:
+        if value <= maximum:
+            return label
+    return bounds[-1][1]
+
+
+def request_shape(body: dict | None) -> dict[str, str]:
+    """Return only bounded cohorts.  Request content never leaves this function."""
+    body = body or {}
+    prompt = body.get("prompt")
+    length = len(prompt) if isinstance(prompt, str) else None
+    schema = body.get("output_schema")
+    schema_family = schema.get("type", "unknown") if isinstance(schema, dict) else "none"
+    if not isinstance(schema_family, str) or len(schema_family) > 32:
+        schema_family = "unknown"
+    return {
+        "input_bucket": _bucket(length, ((0, "empty"), (256, "1-256"), (2048, "257-2048"), (8192, "2049-8192"), (10**12, "8193+"))),
+        "output_budget_bucket": _bucket(body.get("output_token_limit"), ((0, "0"), (256, "1-256"), (1024, "257-1024"), (4096, "1025-4096"), (10**12, "4097+"))),
+        "deadline_bucket": _bucket(body.get("deadline_ms"), ((999, "under-1s"), (4999, "1s-5s"), (29999, "5s-30s"), (119999, "30s-120s"), (10**12, "120s+"))),
+        "schema_family": schema_family,
+    }
 
 
 @dataclass(frozen=True)
@@ -96,7 +136,11 @@ class Store:
           route_id TEXT PRIMARY KEY, tier TEXT NOT NULL, effort TEXT, request_id TEXT NOT NULL,
           started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
           outcome TEXT, first_delta_ms REAL, completed_ms REAL, selected_fingerprint TEXT,
-          selected_model TEXT, selected_site_id TEXT, terminal_reason TEXT
+          selected_model TEXT, selected_site_id TEXT, terminal_reason TEXT,
+          telemetry_version INTEGER, delivery_mode TEXT, release_version TEXT,
+          routing_policy_version TEXT, configuration_fingerprint TEXT,
+          shape_version INTEGER, input_bucket TEXT, output_budget_bucket TEXT,
+          deadline_bucket TEXT, schema_family TEXT, experiment_id TEXT, experiment_arm TEXT
         );
         CREATE INDEX IF NOT EXISTS route_run_started ON route_run(started_at DESC);
         CREATE TABLE IF NOT EXISTS site_policy (
@@ -146,6 +190,17 @@ class Store:
             self.conn.execute("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", (site,))
         try: self.conn.execute('ALTER TABLE provider_health ADD COLUMN last_route_recovery_at TEXT')
         except sqlite3.OperationalError: pass
+        for name, definition in [
+            ("telemetry_version", "INTEGER"), ("delivery_mode", "TEXT"), ("release_version", "TEXT"),
+            ("routing_policy_version", "TEXT"), ("configuration_fingerprint", "TEXT"),
+            ("shape_version", "INTEGER"), ("input_bucket", "TEXT"), ("output_budget_bucket", "TEXT"),
+            ("deadline_bucket", "TEXT"), ("schema_family", "TEXT"), ("experiment_id", "TEXT"),
+            ("experiment_arm", "TEXT"),
+        ]:
+            try: self.conn.execute(f"ALTER TABLE route_run ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError: pass
+        self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_telemetry_window ON route_run(telemetry_version, started_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_delivery_window ON route_run(delivery_mode, started_at DESC)")
         if not catalog_exists:
             from .catalog import CATALOG
             self.conn.executemany(
@@ -350,9 +405,37 @@ class Store:
             ))
         return True
 
-    def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None) -> None:
+    def routing_context(self) -> dict[str, str]:
+        values = {
+            "race_parallel_cap": self.race_parallel_cap(),
+            "hedge_delay_ms": self.hedge_delay_ms(),
+            "global_parallel_cap": self.global_parallel_cap(),
+        }
+        encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+        return {
+            "release_version": broker_release_version(),
+            "routing_policy_version": ROUTING_POLICY_VERSION,
+            "configuration_fingerprint": hashlib.sha256(encoded).hexdigest()[:16],
+        }
+
+    def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None,
+                      *, body: dict | None = None, delivery_mode: str = "non_stream",
+                      experiment_id: str | None = None, experiment_arm: str | None = None) -> None:
+        if delivery_mode not in DELIVERY_MODES:
+            delivery_mode = "non_stream"
+        shape = request_shape(body)
+        context = self.routing_context()
         with self.conn:
-            self.conn.execute("INSERT INTO route_run(route_id,tier,effort,request_id) VALUES(?,?,?,?)", (route_id, tier, effort, request_id))
+            self.conn.execute("""INSERT INTO route_run(
+                route_id,tier,effort,request_id,telemetry_version,delivery_mode,release_version,
+                routing_policy_version,configuration_fingerprint,shape_version,input_bucket,
+                output_budget_bucket,deadline_bucket,schema_family,experiment_id,experiment_arm
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(route_id) DO NOTHING""", (
+                route_id, tier, effort, request_id, TELEMETRY_SCHEMA_VERSION, delivery_mode,
+                context["release_version"], context["routing_policy_version"], context["configuration_fingerprint"],
+                TELEMETRY_SCHEMA_VERSION, shape["input_bucket"], shape["output_budget_bucket"],
+                shape["deadline_bucket"], shape["schema_family"], experiment_id, experiment_arm,
+            ))
 
     def route_finished(self, route_id: str, *, outcome: str, first_delta_ms: float | None = None,
                        completed_ms: float | None = None, selected_fingerprint: str | None = None,
@@ -364,6 +447,19 @@ class Store:
                 self._timestamp(), outcome, first_delta_ms, completed_ms, selected_fingerprint,
                 selected_model, selected_site_id, terminal_reason, route_id,
             ))
+
+    def route_detail(self, route_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM route_run WHERE route_id=?", (route_id,)).fetchone()
+        if row is None:
+            return None
+        allowed = (
+            "route_id", "tier", "effort", "started_at", "completed_at", "outcome", "first_delta_ms",
+            "completed_ms", "selected_fingerprint", "selected_model", "selected_site_id", "terminal_reason",
+            "telemetry_version", "delivery_mode", "release_version", "routing_policy_version",
+            "configuration_fingerprint", "shape_version", "input_bucket", "output_budget_bucket",
+            "deadline_bucket", "schema_family", "experiment_id", "experiment_arm",
+        )
+        return {name: row[name] for name in allowed}
 
     def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
                           failure_class: str | None = None) -> None:
@@ -751,6 +847,24 @@ class Store:
         complete = [r[0] for r in self.conn.execute(f"SELECT completed_ms FROM route_run WHERE {route_where} AND completed_ms IS NOT NULL ORDER BY completed_ms", params).fetchall()]
         cancelled = self.conn.execute(f"SELECT count(*) FROM observation WHERE {where} AND status IN ('cancelled','client_cancelled')", params).fetchone()[0]
         percentile = lambda values, fraction: values[max(0, int(len(values) * fraction) - 1)] if values else None
+        route_rows = self.conn.execute(f"SELECT outcome,telemetry_version,delivery_mode,first_delta_ms FROM route_run WHERE {route_where}", params).fetchall()
+        outcomes = {name: 0 for name in ("completed", "failed", "timed_out", "client_cancelled", "validation_rejected", "in_progress", "unknown")}
+        complete_telemetry = []
+        plain_stream_deltas = []
+        plain_stream_applicable = 0
+        for route in route_rows:
+            outcome = route["outcome"]
+            outcomes[outcome if outcome in outcomes else "in_progress" if outcome is None else "unknown"] += 1
+            if route["telemetry_version"] == TELEMETRY_SCHEMA_VERSION:
+                complete_telemetry.append(route)
+            if route["delivery_mode"] == "plain_stream":
+                plain_stream_applicable += 1
+                if route["first_delta_ms"] is not None:
+                    plain_stream_deltas.append(route["first_delta_ms"])
+        known_denominator = outcomes["completed"] + outcomes["failed"] + outcomes["timed_out"]
+        earliest = self.conn.execute("SELECT min(started_at) FROM route_run WHERE telemetry_version=?", (TELEMETRY_SCHEMA_VERSION,)).fetchone()[0]
+        telemetry_total = len(route_rows)
+        first_forwarded = sorted(plain_stream_deltas)
         return {
             'calls': row['calls'], 'technical_success_rate': row['rate'], 'avg_ttft_ms': row['ttft'], 'p95_ttft_ms': p95,
             'total_cost': row['total_cost'], 'model_fulfillment_rate': fulfillment, 'failures': failures,
@@ -759,6 +873,21 @@ class Store:
             'client_first_delta_p50_ms': percentile(deltas, .5), 'client_first_delta_p95_ms': percentile(deltas, .95),
             'request_completed_avg_ms': route_row['request_completed_avg_ms'],
             'request_completed_p95_ms': percentile(complete, .95), 'cancellation_neutral_attempts': cancelled,
+            'telemetry_schema_version': TELEMETRY_SCHEMA_VERSION,
+            'collection_started_at': earliest,
+            'request_outcomes': outcomes,
+            'request_success_numerator': outcomes['completed'],
+            'request_success_denominator': known_denominator,
+            'request_excluded_count': telemetry_total - known_denominator,
+            'request_coverage': len(complete_telemetry) / telemetry_total if telemetry_total else None,
+            'first_forwarded_delta': {
+                'metric_version': TELEMETRY_SCHEMA_VERSION,
+                'applicable_count': plain_stream_applicable,
+                'sample_count': len(first_forwarded),
+                'excluded_count': telemetry_total - plain_stream_applicable,
+                'p50_ms': percentile(first_forwarded, .5),
+                'p95_ms': percentile(first_forwarded, .95),
+            },
         }
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]
