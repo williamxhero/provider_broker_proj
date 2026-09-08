@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from collections import deque
 import hashlib
 import json
@@ -945,6 +946,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             delivery_mode=delivery_mode, experiment_id=body.get("_experiment_id"),
             experiment_arm=body.get("_experiment_arm"),
         )
+    started_callback = body.get("_on_route_started")
+    if callable(started_callback):
+        callback_result = started_callback(route_id)
+        if inspect.isawaitable(callback_result):
+            await callback_result
     deadline_exceeded = False
     stream_selected_sequence = None
     first_client_delta_ms = None

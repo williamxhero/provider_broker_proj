@@ -158,6 +158,17 @@ class Store:
           failure_class TEXT, started_ms REAL, elapsed_ms REAL, PRIMARY KEY(route_id, attempt_number)
         );
         CREATE INDEX IF NOT EXISTS route_attempt_route ON route_attempt(route_id, attempt_number);
+        CREATE TABLE IF NOT EXISTS configuration_event (
+          id INTEGER PRIMARY KEY, setting TEXT NOT NULL, before_value TEXT, after_value TEXT NOT NULL,
+          source TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS configuration_event_time ON configuration_event(created_at DESC);
+        CREATE TABLE IF NOT EXISTS client_telemetry (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), metric_type TEXT NOT NULL,
+          elapsed_ms REAL NOT NULL, client_family TEXT NOT NULL, client_version TEXT NOT NULL,
+          telemetry_version INTEGER NOT NULL, received_at TEXT NOT NULL,
+          PRIMARY KEY(route_id, metric_type, client_family, client_version)
+        );
         CREATE TABLE IF NOT EXISTS site_policy (
           site_id TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 8,
           enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT ''
@@ -434,6 +445,30 @@ class Store:
             "configuration_fingerprint": hashlib.sha256(encoded).hexdigest()[:16],
         }
 
+    def record_configuration_change(self, setting: str, before: object, after: object, *, source: str = "admin") -> None:
+        safe_settings = {"race_parallel_cap", "hedge_delay_ms", "global_parallel_cap", "site_policy"}
+        if setting not in safe_settings or before == after:
+            return
+        with self.conn:
+            self.conn.execute("INSERT INTO configuration_event(setting,before_value,after_value,source,created_at) VALUES(?,?,?,?,?)",
+                (setting, json.dumps(before, sort_keys=True), json.dumps(after, sort_keys=True), source[:32], self._timestamp()))
+
+    def configuration_events(self, limit: int = 100) -> list[dict]:
+        return [dict(row) for row in self.conn.execute("SELECT setting,before_value,after_value,source,created_at FROM configuration_event ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def record_client_telemetry(self, *, route_id: str, metric_type: str, elapsed_ms: float,
+                                client_family: str, client_version: str, telemetry_version: int) -> bool:
+        if metric_type != "client_first_delta" or not 0 <= elapsed_ms <= 3_600_000 or not client_family or not client_version:
+            raise ValueError("invalid telemetry")
+        route = self.conn.execute("SELECT delivery_mode,outcome,started_at FROM route_run WHERE route_id=?", (route_id,)).fetchone()
+        if route is None or route["delivery_mode"] != "plain_stream" or route["outcome"] not in (None, "completed"):
+            raise LookupError("unknown or ineligible route")
+        with self.conn:
+            inserted = self.conn.execute("""INSERT OR IGNORE INTO client_telemetry(route_id,metric_type,elapsed_ms,
+                client_family,client_version,telemetry_version,received_at) VALUES(?,?,?,?,?,?,?)""",
+                (route_id, metric_type, elapsed_ms, client_family[:64], client_version[:64], telemetry_version, self._timestamp())).rowcount
+        return bool(inserted)
+
     def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None,
                       *, body: dict | None = None, delivery_mode: str = "non_stream",
                       experiment_id: str | None = None, experiment_arm: str | None = None) -> None:
@@ -612,6 +647,8 @@ class Store:
             eligible,exclusion_reason,initial_rank,launched,role FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
         detail["attempts"] = [dict(attempt) for attempt in self.conn.execute("""SELECT attempt_number,fingerprint,model,
             site_id,role,status,failure_class,started_ms,elapsed_ms FROM route_attempt WHERE route_id=? ORDER BY attempt_number""", (route_id,))]
+        detail["client_telemetry"] = [dict(item) for item in self.conn.execute("""SELECT metric_type,elapsed_ms,
+            client_family,client_version,telemetry_version,received_at FROM client_telemetry WHERE route_id=?""", (route_id,))]
         detail["amplification"] = self.route_amplification(route_id, detail["attempts"])
         return detail
 
@@ -1045,6 +1082,9 @@ class Store:
         earliest = self.conn.execute("SELECT min(started_at) FROM route_run WHERE telemetry_version=?", (TELEMETRY_SCHEMA_VERSION,)).fetchone()[0]
         telemetry_total = len(route_rows)
         first_forwarded = sorted(plain_stream_deltas)
+        client_deltas = [row[0] for row in self.conn.execute(f"""SELECT t.elapsed_ms FROM client_telemetry t
+            JOIN route_run r USING(route_id) WHERE r.{route_where} AND t.metric_type='client_first_delta'
+            ORDER BY t.elapsed_ms""", params).fetchall()]
         delivery_latency = {}
         for mode in DELIVERY_MODES:
             mode_rows = [route for route in route_rows if route["delivery_mode"] == mode]
@@ -1097,6 +1137,11 @@ class Store:
                 'excluded_count': telemetry_total - plain_stream_applicable,
                 'p50_ms': percentile(first_forwarded, .5),
                 'p95_ms': percentile(first_forwarded, .95),
+            },
+            'client_first_delta': {
+                'metric_version': TELEMETRY_SCHEMA_VERSION, 'applicable_count': plain_stream_applicable,
+                'sample_count': len(client_deltas), 'coverage': len(client_deltas) / plain_stream_applicable if plain_stream_applicable else None,
+                'p50_ms': percentile(client_deltas, .5), 'p95_ms': percentile(client_deltas, .95),
             },
             'delivery_latency': delivery_latency,
             'amplification': {

@@ -79,12 +79,15 @@ async def stream(request):
             nonlocal emitted_delta
             emitted_delta = True
             await sse.write(f"event: delta\ndata: {json.dumps({'text': text})}\n\n".encode())
+        async def emit_route(route_id):
+            await sse.write(f"event: route\ndata: {json.dumps({'route_id': route_id})}\n\n".encode())
     else:
         emit_delta = None
+        emit_route = None
     try:
         settings = request.app["settings"]
         result = await route(
-            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_on_delta": emit_delta, "_delivery_mode": "validated_stream" if structured else "plain_stream"}, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
+            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_on_delta": emit_delta, "_on_route_started": emit_route, "_delivery_mode": "validated_stream" if structured else "plain_stream"}, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
             hedge_delay_ms=request.app["store"].hedge_delay_ms(),
             first_event_timeout_ms=settings.first_event_timeout_ms,
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
@@ -219,6 +222,29 @@ async def analytics(request):
         return web.json_response({"error": "invalid analytics dimension"}, status=400)
 
 
+async def configuration_events(request):
+    return web.json_response({"items": request.app["store"].configuration_events()})
+
+
+async def client_telemetry(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    allowed = {"route_id", "metric_type", "elapsed_ms", "client_family", "client_version", "telemetry_version"}
+    valid = isinstance(body, dict) and set(body) == allowed and isinstance(body.get("route_id"), str)
+    valid = valid and body.get("metric_type") == "client_first_delta" and type(body.get("elapsed_ms")) in (int, float)
+    valid = valid and all(isinstance(body.get(key), str) and 0 < len(body[key]) <= 64 for key in ("client_family", "client_version"))
+    valid = valid and type(body.get("telemetry_version")) is int
+    if not valid:
+        return web.json_response({"error": "invalid telemetry"}, status=400)
+    try:
+        created = request.app["store"].record_client_telemetry(**body)
+    except (ValueError, LookupError):
+        return web.json_response({"error": "telemetry route is not eligible"}, status=404)
+    return web.json_response({"accepted": True, "duplicate": not created}, status=201 if created else 200)
+
+
 async def calls(request):
     try:
         limit = int(request.query.get("limit", 50))
@@ -310,7 +336,11 @@ async def routing(request):
     body = await request.json()
     if not isinstance(body, dict) or not body or not set(body) <= {'race_parallel_cap', 'hedge_delay_ms'} or ('race_parallel_cap' in body and (type(body['race_parallel_cap']) is not int or not 1 <= body['race_parallel_cap'] <= 32)) or ('hedge_delay_ms' in body and (type(body['hedge_delay_ms']) is not int or not 0 <= body['hedge_delay_ms'] <= 10000)):
         return web.json_response({'error': 'invalid routing policy'}, status=400)
+    before = {'race_parallel_cap': store.race_parallel_cap(), 'hedge_delay_ms': store.hedge_delay_ms()}
     store.update_routing(race_parallel_cap=body.get('race_parallel_cap'), hedge_delay_ms=body.get('hedge_delay_ms'))
+    after = {'race_parallel_cap': store.race_parallel_cap(), 'hedge_delay_ms': store.hedge_delay_ms()}
+    for key in after:
+        store.record_configuration_change(key, before[key], after[key])
     return web.json_response({'race_parallel_cap': store.race_parallel_cap(), 'hedge_delay_ms': store.hedge_delay_ms()})
 
 
@@ -350,8 +380,11 @@ async def update_site(request):
     valid = valid and ("note" not in body or isinstance(body["note"], str) and len(body["note"]) <= 240)
     if not valid:
         return web.json_response({"error": "invalid site policy"}, status=400)
-    if not request.app["store"].update_site_policy(request.match_info["site_id"], body):
+    store = request.app["store"]
+    before = next((site for site in store.sites() if site['site_id'] == request.match_info['site_id']), None)
+    if not store.update_site_policy(request.match_info["site_id"], body):
         return web.json_response({"error": "site not found"}, status=404)
+    store.record_configuration_change("site_policy", before, body)
     return web.json_response({"updated": True})
 
 
@@ -362,8 +395,11 @@ async def update_global_capacity(request):
         body = None
     if not isinstance(body, dict) or set(body) != {"global_parallel_cap"} or type(body["global_parallel_cap"]) is not int or not 1 <= body["global_parallel_cap"] <= 512:
         return web.json_response({"error": "invalid global capacity"}, status=400)
-    request.app["store"].update_global_parallel_cap(body["global_parallel_cap"])
-    return web.json_response({"global_parallel_cap": request.app["store"].global_parallel_cap()})
+    store = request.app["store"]
+    before = store.global_parallel_cap()
+    store.update_global_parallel_cap(body["global_parallel_cap"])
+    store.record_configuration_change("global_parallel_cap", before, store.global_parallel_cap())
+    return web.json_response({"global_parallel_cap": store.global_parallel_cap()})
 
 
 async def home(request):
@@ -577,7 +613,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),

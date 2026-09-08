@@ -115,6 +115,20 @@ def test_analytics_groups_only_allowlisted_route_dimensions(tmp_path):
     assert report["groups"][0]["insufficient"] is True
 
 
+def test_client_first_delta_telemetry_is_idempotent_and_only_accepts_plain_routes(tmp_path):
+    db = store(tmp_path)
+    db.route_started("plain-route", "standard", "plain-request", delivery_mode="plain_stream")
+    assert db.record_client_telemetry(route_id="plain-route", metric_type="client_first_delta", elapsed_ms=130, client_family="desktop", client_version="1", telemetry_version=1)
+    assert not db.record_client_telemetry(route_id="plain-route", metric_type="client_first_delta", elapsed_ms=130, client_family="desktop", client_version="1", telemetry_version=1)
+    db.route_started("json-route", "standard", "json-request", delivery_mode="validated_stream")
+    try:
+        db.record_client_telemetry(route_id="json-route", metric_type="client_first_delta", elapsed_ms=130, client_family="desktop", client_version="1", telemetry_version=1)
+    except LookupError:
+        pass
+    else:
+        raise AssertionError("structured route must reject client first delta telemetry")
+
+
 def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure(tmp_path):
     db = store(tmp_path)
     original = {
