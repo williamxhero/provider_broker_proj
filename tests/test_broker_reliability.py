@@ -43,6 +43,23 @@ def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure
     assert provider["inventory_status"] == "stale"
 
 
+def test_upgrade_backfills_site_domain_for_existing_inventory(tmp_path):
+    path = tmp_path / "broker.sqlite3"
+    db = Store(path, b"0123456789abcdef")
+    db.replace_source_snapshot([{
+        "name": "Terra", "base_url": "https://terra.example/v1", "api_key": "key",
+        "models": ["gpt-5.6-luna"], "inventory_status": "available", "source": {},
+    }], "2026-09-08T00:00:00+00:00")
+    with db.conn:
+        db.conn.execute("UPDATE source_provider SET site_id='default'")
+        db.conn.execute("DELETE FROM site_policy")
+    db.conn.close()
+
+    upgraded = Store(path, b"0123456789abcdef")
+
+    assert upgraded.sites()[0]["site_id"] == "terra.example"
+
+
 def test_fault_classification_does_not_open_circuit_for_contract_rejection():
     assert classify_failure("structured_output_invalid", {}) == "contract"
     assert classify_failure("cancelled", {}) == "neutral"

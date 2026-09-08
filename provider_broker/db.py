@@ -131,6 +131,19 @@ class Store:
         except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN site_id TEXT NOT NULL DEFAULT 'default'")
         except sqlite3.OperationalError: pass
+        # Existing inventories predate explicit site fault domains.  Derive a
+        # stable non-secret domain before routing starts so upgrade does not
+        # collapse every old key into the synthetic "default" site.
+        for row in self.conn.execute("SELECT fingerprint,base_url,source_json,site_id FROM source_provider"):
+            try:
+                source = json.loads(row["source_json"])
+            except (TypeError, ValueError):
+                source = {}
+            site = row["site_id"]
+            if not site or site == "default":
+                site = self.site_id(source.get("site_name"), row["base_url"])
+                self.conn.execute("UPDATE source_provider SET site_id=? WHERE fingerprint=?", (site, row["fingerprint"]))
+            self.conn.execute("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", (site,))
         try: self.conn.execute('ALTER TABLE provider_health ADD COLUMN last_route_recovery_at TEXT')
         except sqlite3.OperationalError: pass
         if not catalog_exists:
