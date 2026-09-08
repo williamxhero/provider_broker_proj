@@ -93,6 +93,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "request_success_rate": 0.9, "request_success_numerator": 9, "request_success_denominator": 10, "request_coverage": 0.8, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/data-health"):
             return {"in_progress": 0, "reconciled_unknown": 0, "legacy_records": 0, "unknown": 0, "collection_errors": 0}
+        if path.startswith("/admin/v1/analytics"):
+            return {"groups": [{"group": "alpha", "success_rate": 0.9, "success_denominator": 10, "confidence_interval_95": [0.6, 0.98], "insufficient": True}]}
         if path.startswith("/admin/v1/routes/route-1"):
             return {"route_id": "route-1", "outcome": "completed", "candidates": [], "attempts": []}
         if path.startswith("/admin/v1/routes"):
@@ -148,6 +150,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#quality > div").count() == 15
         assert page.locator("#quality").get_by_text("请求成功率", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("90.0%", exact=True).count() == 1
+        assert page.locator("#analytics").get_by_text("insufficient", exact=True).count() == 1
         page.locator("#routes").get_by_role("button", name="view").click()
         page.locator("#route-detail").get_by_text('"route_id": "route-1"').wait_for()
         assert page.locator("#quality > div").filter(has_text="传输失败").locator("strong").inner_text() == "50.0%"

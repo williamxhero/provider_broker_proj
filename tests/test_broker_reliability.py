@@ -104,6 +104,17 @@ def test_delivery_latency_uses_applicable_modes_and_never_turns_unknown_into_zer
     assert metrics["validated_stream"]["valid_completion"]["p95_ms"] == 600
 
 
+def test_analytics_groups_only_allowlisted_route_dimensions(tmp_path):
+    db = store(tmp_path)
+    db.route_started("route-a", "smart", "request-a", delivery_mode="non_stream")
+    db.route_finished("route-a", outcome="completed", selected_site_id="site-a", completed_ms=50)
+    report = db.analytics(group_by="site", filters={"intellect": "smart"})
+
+    assert report["groups"][0]["group"] == "site-a"
+    assert report["groups"][0]["success_numerator"] == 1
+    assert report["groups"][0]["insufficient"] is True
+
+
 def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure(tmp_path):
     db = store(tmp_path)
     original = {

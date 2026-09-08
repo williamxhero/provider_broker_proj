@@ -507,8 +507,14 @@ function renderQuality(payload) {
     metric("\u5df2\u77e5\u8bf7\u6c42\u6837\u672c", `${payload.request_success_numerator}/${payload.request_success_denominator}`),
     metric("\u9065\u6d4b\u8986\u76d6\u7387", formatPercent(payload.request_coverage)),
   ] : [];
+  const amplification = payload.amplification ? [
+    metric("attempt P95", payload.amplification.attempts_p95),
+    metric("hedge rescue", `${payload.amplification.hedge_rescue_numerator}/${payload.amplification.hedge_rescue_denominator}`),
+    metric("cost coverage", formatPercent(payload.amplification.cost_coverage)),
+  ] : [];
   byId("quality").replaceChildren(
     ...requestMetrics,
+    ...amplification,
     metric("可路由 API", state.summary.routable_apis),
     metric("技术成功率", formatPercent(payload.technical_success_rate)),
     metric("平均 TTFT", formatMs(payload.avg_ttft_ms)),
@@ -588,6 +594,21 @@ async function loadDataHealth() {
     : "telemetry coverage is complete for collected routes";
 }
 
+function renderAnalytics(payload) {
+  const table = byId("analytics");
+  const body = tableHead(table, [{ label: "cohort" }, { label: "request success" }, { label: "sample" }, { label: "95% CI" }, { label: "status" }], "analytics", () => renderAnalytics(payload));
+  payload.groups.forEach((group) => {
+    const interval = group.confidence_interval_95 ? group.confidence_interval_95.map(formatPercent).join(" - ") : "n/a";
+    const row = document.createElement("tr");
+    [group.group, formatPercent(group.success_rate), group.success_denominator, interval, group.insufficient ? "insufficient" : "ready"].forEach((value) => row.append(cell(value)));
+    body.append(row);
+  });
+}
+
+async function loadAnalytics() {
+  renderAnalytics(await requestJson(`/admin/v1/analytics?window=${encodeURIComponent(state.qualityWindow)}&group_by=site`));
+}
+
 async function load() {
   const [summary, providers, catalog, quality, routing, balances] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
@@ -608,6 +629,7 @@ async function load() {
   await loadCalls("");
   await loadRoutes();
   await loadDataHealth();
+  await loadAnalytics();
 }
 
 byId("policy").addEventListener("submit", async (event) => {

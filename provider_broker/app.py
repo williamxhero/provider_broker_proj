@@ -208,6 +208,17 @@ async def route_detail(request):
     return web.json_response(detail)
 
 
+async def analytics(request):
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    filters = {key.removeprefix("filter_"): value for key, value in request.query.items() if key.startswith("filter_")}
+    try:
+        return web.json_response(request.app["store"].analytics(window=window, group_by=request.query.get("group_by"), filters=filters))
+    except ValueError:
+        return web.json_response({"error": "invalid analytics dimension"}, status=400)
+
+
 async def calls(request):
     try:
         limit = int(request.query.get("limit", 50))
@@ -566,7 +577,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),

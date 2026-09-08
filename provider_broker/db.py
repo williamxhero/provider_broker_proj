@@ -548,6 +548,54 @@ class Store:
             "terminal_reason": row["terminal_reason"], "telemetry_version": row["telemetry_version"],
         } for row in rows]
 
+    def analytics(self, *, window: str = "24h", group_by: str | None = None,
+                  filters: dict[str, str] | None = None) -> dict:
+        columns = {
+            "provider": "selected_fingerprint", "site": "selected_site_id", "actual_model": "selected_model",
+            "intellect": "tier", "effort": "effort", "delivery_mode": "delivery_mode",
+            "outcome": "outcome", "release_version": "release_version", "policy_version": "routing_policy_version",
+            "configuration": "configuration_fingerprint", "experiment_arm": "experiment_arm", "input_bucket": "input_bucket",
+            "output_budget_bucket": "output_budget_bucket", "deadline_bucket": "deadline_bucket", "schema_family": "schema_family",
+        }
+        if group_by and group_by not in columns:
+            raise ValueError("invalid group")
+        filters = filters or {}
+        if any(key not in columns for key in filters):
+            raise ValueError("invalid filter")
+        modifier = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}[window]
+        clauses, params = ["started_at >= datetime('now', ?)"], [modifier]
+        for key, value in filters.items():
+            clauses.append(f"{columns[key]}=?")
+            params.append(value)
+        field = columns.get(group_by or "", "'all'")
+        rows = self.conn.execute(f"""SELECT {field} group_value, count(*) sample_count,
+            sum(outcome='completed') successes, sum(outcome IN ('completed','failed','timed_out')) known,
+            sum(outcome='unknown') unknown, sum(outcome IS NULL) in_progress,
+            avg(completed_ms) completion_mean_ms FROM route_run WHERE {' AND '.join(clauses)}
+            GROUP BY {field} ORDER BY sample_count DESC""", params).fetchall()
+        groups = []
+        for row in rows:
+            known = int(row["known"] or 0)
+            success = int(row["successes"] or 0)
+            # Wilson 95% interval, defined even for an empty denominator as unavailable.
+            if known:
+                z2, center = 1.96 ** 2, success / known
+                delta = 1.96 * ((center * (1 - center) / known + z2 / (4 * known ** 2)) ** .5)
+                denominator = 1 + z2 / known
+                interval = [max(0, (center + z2 / (2 * known) - delta) / denominator), min(1, (center + z2 / (2 * known) + delta) / denominator)]
+            else:
+                interval = None
+            groups.append({
+                "group": row["group_value"] if row["group_value"] is not None else "unknown",
+                "sample_count": int(row["sample_count"]), "success_numerator": success,
+                "success_denominator": known, "success_rate": success / known if known else None,
+                "confidence_interval_95": interval, "unknown_count": int(row["unknown"] or 0),
+                "in_progress_count": int(row["in_progress"] or 0), "completion_mean_ms": row["completion_mean_ms"],
+                "insufficient": known < 200,
+            })
+        return {"metric_version": TELEMETRY_SCHEMA_VERSION, "window": window, "group_by": group_by,
+                "filters": filters, "minimum_sample": 200, "groups": groups}
+
     def route_detail(self, route_id: str) -> dict | None:
         row = self.conn.execute("SELECT * FROM route_run WHERE route_id=?", (route_id,)).fetchone()
         if row is None:
@@ -564,7 +612,34 @@ class Store:
             eligible,exclusion_reason,initial_rank,launched,role FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
         detail["attempts"] = [dict(attempt) for attempt in self.conn.execute("""SELECT attempt_number,fingerprint,model,
             site_id,role,status,failure_class,started_ms,elapsed_ms FROM route_attempt WHERE route_id=? ORDER BY attempt_number""", (route_id,))]
+        detail["amplification"] = self.route_amplification(route_id, detail["attempts"])
         return detail
+
+    def route_amplification(self, route_id: str, attempts: list[dict] | None = None) -> dict:
+        attempts = attempts if attempts is not None else [dict(row) for row in self.conn.execute(
+            "SELECT * FROM route_attempt WHERE route_id=? ORDER BY attempt_number", (route_id,))]
+        usage = self.conn.execute("""SELECT fingerprint,status,input_tokens,output_tokens,cost FROM observation
+            WHERE route_id=? AND attempt_number IS NOT NULL AND attempt_number>0""", (route_id,)).fetchall()
+        known_costs = [row["cost"] for row in usage if row["cost"] is not None]
+        known_tokens = [int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in usage
+                        if row["input_tokens"] is not None and row["output_tokens"] is not None]
+        winner = next((row for row in usage if row["status"] == "completed"), None)
+        roles = {role: sum(item.get("role") == role for item in attempts) for role in ("primary", "hedge", "retry", "repair", "exploration", "recovery")}
+        hedge_winner = any(item.get("role") == "hedge" and item.get("status") == "completed" for item in attempts)
+        primary_delivered = any(item.get("role") == "primary" and item.get("status") == "completed" for item in attempts)
+        return {
+            "attempts_started": len(attempts), "attempts_completed": sum(item.get("status") == "completed" for item in attempts),
+            "attempts_cancelled": sum(item.get("status") == "cancelled" for item in attempts), "roles": roles,
+            "distinct_sites": len({item.get("site_id") for item in attempts if item.get("site_id")}),
+            "total_elapsed_ms": sum(item.get("elapsed_ms") or 0 for item in attempts),
+            "known_cost": sum(known_costs) if known_costs else None,
+            "cost_known_attempts": len(known_costs), "cost_attempts": len(usage),
+            "known_tokens": sum(known_tokens) if known_tokens else None,
+            "winner_cost": winner["cost"] if winner and winner["cost"] is not None else None,
+            "winner_tokens": (int(winner["input_tokens"] or 0) + int(winner["output_tokens"] or 0)) if winner and winner["input_tokens"] is not None and winner["output_tokens"] is not None else None,
+            "hedge_started": roles["hedge"] > 0,
+            "hedge_rescue": hedge_winner and not primary_delivered,
+        }
 
     def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
                           failure_class: str | None = None) -> None:
@@ -995,6 +1070,11 @@ class Store:
                     "p95_ms": percentile(completion, .95) if mode != "plain_stream" else None,
                 },
             }
+        route_ids = [row[0] for row in self.conn.execute(f"SELECT route_id FROM route_run WHERE {route_where}", params).fetchall()]
+        amplifications = [self.route_amplification(route_id) for route_id in route_ids]
+        attempts = sorted(item["attempts_started"] for item in amplifications)
+        hedges = [item for item in amplifications if item["hedge_started"]]
+        costs_known = [item for item in amplifications if item["cost_attempts"]]
         return {
             'calls': row['calls'], 'technical_success_rate': row['rate'], 'avg_ttft_ms': row['ttft'], 'p95_ttft_ms': p95,
             'total_cost': row['total_cost'], 'model_fulfillment_rate': fulfillment, 'failures': failures,
@@ -1019,6 +1099,15 @@ class Store:
                 'p95_ms': percentile(first_forwarded, .95),
             },
             'delivery_latency': delivery_latency,
+            'amplification': {
+                'sample_count': len(amplifications), 'attempts_p50': percentile(attempts, .5),
+                'attempts_p95': percentile(attempts, .95), 'hedge_started_numerator': len(hedges),
+                'hedge_started_denominator': len(amplifications),
+                'hedge_rescue_numerator': sum(item['hedge_rescue'] for item in hedges),
+                'hedge_rescue_denominator': len(hedges),
+                'cross_site_count': sum(item['distinct_sites'] > 1 for item in amplifications),
+                'cost_coverage': len(costs_known) / len(amplifications) if amplifications else None,
+            },
         }
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]
