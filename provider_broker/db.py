@@ -267,7 +267,8 @@ class Store:
         if not value:
             return None
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
         except ValueError:
             return None
 
@@ -473,8 +474,11 @@ class Store:
                                 client_family: str, client_version: str, telemetry_version: int) -> bool:
         if metric_type != "client_first_delta" or not 0 <= elapsed_ms <= 3_600_000 or not client_family or not client_version:
             raise ValueError("invalid telemetry")
-        route = self.conn.execute("SELECT delivery_mode,outcome,started_at FROM route_run WHERE route_id=?", (route_id,)).fetchone()
-        if route is None or route["delivery_mode"] != "plain_stream" or route["outcome"] not in (None, "completed"):
+        route = self.conn.execute("SELECT delivery_mode,outcome,started_at,completed_ms FROM route_run WHERE route_id=?", (route_id,)).fetchone()
+        started = self._parse_timestamp(route["started_at"]) if route else None
+        too_old = started is None or started < datetime.now(UTC) - timedelta(hours=24)
+        impossible = route and route["completed_ms"] is not None and elapsed_ms > float(route["completed_ms"]) + 60_000
+        if route is None or route["delivery_mode"] != "plain_stream" or route["outcome"] not in (None, "completed") or too_old or impossible or telemetry_version != TELEMETRY_SCHEMA_VERSION:
             raise LookupError("unknown or ineligible route")
         with self.conn:
             inserted = self.conn.execute("""INSERT OR IGNORE INTO client_telemetry(route_id,metric_type,elapsed_ms,

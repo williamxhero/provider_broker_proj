@@ -235,7 +235,7 @@ async def client_telemetry(request):
     valid = isinstance(body, dict) and set(body) == allowed and isinstance(body.get("route_id"), str)
     valid = valid and body.get("metric_type") == "client_first_delta" and type(body.get("elapsed_ms")) in (int, float)
     valid = valid and all(isinstance(body.get(key), str) and 0 < len(body[key]) <= 64 for key in ("client_family", "client_version"))
-    valid = valid and type(body.get("telemetry_version")) is int
+    valid = valid and body.get("telemetry_version") == 1
     if not valid:
         return web.json_response({"error": "invalid telemetry"}, status=400)
     try:
