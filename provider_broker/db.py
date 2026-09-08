@@ -26,6 +26,7 @@ class Provider:
     max_parallel: int
     enabled: bool
     multiplier: float
+    site_id: str = "default"
 
 
 class Store:
@@ -35,6 +36,8 @@ class Store:
         self.conn.row_factory = sqlite3.Row
         self.aes = AESGCM(encryption_key)
         self._inflight: dict[str, int] = {}
+        self._site_inflight: dict[str, int] = {}
+        self._global_inflight = 0
         self.default_race_parallel_cap = default_race_parallel_cap
         self._migrate()
 
@@ -89,6 +92,23 @@ class Store:
           checked_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS balance_setting (name TEXT PRIMARY KEY, value BLOB NOT NULL);
+        CREATE TABLE IF NOT EXISTS route_run (
+          route_id TEXT PRIMARY KEY, tier TEXT NOT NULL, effort TEXT, request_id TEXT NOT NULL,
+          started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
+          outcome TEXT, first_delta_ms REAL, completed_ms REAL, selected_fingerprint TEXT,
+          selected_model TEXT, selected_site_id TEXT, terminal_reason TEXT
+        );
+        CREATE INDEX IF NOT EXISTS route_run_started ON route_run(started_at DESC);
+        CREATE TABLE IF NOT EXISTS site_policy (
+          site_id TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 8,
+          enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT ''
+        );
+        CREATE TABLE IF NOT EXISTS provider_capability (
+          fingerprint TEXT NOT NULL, model TEXT NOT NULL, contract TEXT NOT NULL,
+          state TEXT NOT NULL DEFAULT 'unknown', last_failure_class TEXT,
+          updated_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP,
+          PRIMARY KEY(fingerprint, model, contract)
+        );
         CREATE INDEX IF NOT EXISTS balance_snapshot_site_time ON balance_snapshot(site_id, id DESC);
         """)
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
@@ -109,6 +129,8 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
+        try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN site_id TEXT NOT NULL DEFAULT 'default'")
+        except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE provider_health ADD COLUMN last_route_recovery_at TEXT')
         except sqlite3.OperationalError: pass
         if not catalog_exists:
@@ -119,6 +141,7 @@ class Store:
             )
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('race_parallel_cap',?)", (str(self.default_race_parallel_cap),))
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('hedge_delay_ms','750')")
+        self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('global_parallel_cap',?)", (str(max(4, self.default_race_parallel_cap * 4)),))
         from .balances import SITES
         self.conn.executemany(
             """INSERT OR IGNORE INTO balance_site(id,name,adapter,base_url,currency,low_threshold)
@@ -287,6 +310,55 @@ class Store:
                 self.conn.execute("UPDATE broker_setting SET value=? WHERE name='race_parallel_cap'", (str(race_parallel_cap),))
             if hedge_delay_ms is not None:
                 self.conn.execute("UPDATE broker_setting SET value=? WHERE name='hedge_delay_ms'", (str(hedge_delay_ms),))
+
+    def global_parallel_cap(self) -> int:
+        return int(self.conn.execute("SELECT value FROM broker_setting WHERE name='global_parallel_cap'").fetchone()[0])
+
+    def update_global_parallel_cap(self, value: int) -> None:
+        with self.conn:
+            self.conn.execute("UPDATE broker_setting SET value=? WHERE name='global_parallel_cap'", (str(value),))
+
+    def sites(self) -> list[dict]:
+        rows = self.conn.execute("""SELECT sp.site_id,sp.max_parallel,sp.enabled,sp.note,
+            count(s.fingerprint) keys FROM site_policy sp LEFT JOIN source_provider s USING(site_id)
+            GROUP BY sp.site_id ORDER BY sp.site_id""").fetchall()
+        return [{"site_id": r["site_id"], "max_parallel": r["max_parallel"],
+                 "enabled": bool(r["enabled"]), "note": r["note"], "keys": r["keys"],
+                 "inflight": self._site_inflight.get(r["site_id"], 0)} for r in rows]
+
+    def update_site_policy(self, site_id: str, body: dict) -> bool:
+        current = self.conn.execute("SELECT * FROM site_policy WHERE site_id=?", (site_id,)).fetchone()
+        if current is None:
+            return False
+        with self.conn:
+            self.conn.execute("UPDATE site_policy SET max_parallel=?,enabled=?,note=? WHERE site_id=?", (
+                int(body.get("max_parallel", current["max_parallel"])), int(body.get("enabled", current["enabled"])),
+                str(body.get("note", current["note"])), site_id,
+            ))
+        return True
+
+    def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("INSERT INTO route_run(route_id,tier,effort,request_id) VALUES(?,?,?,?)", (route_id, tier, effort, request_id))
+
+    def route_finished(self, route_id: str, *, outcome: str, first_delta_ms: float | None = None,
+                       completed_ms: float | None = None, selected_fingerprint: str | None = None,
+                       selected_model: str | None = None, selected_site_id: str | None = None,
+                       terminal_reason: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("""UPDATE route_run SET completed_at=?,outcome=?,first_delta_ms=?,completed_ms=?,
+                selected_fingerprint=?,selected_model=?,selected_site_id=?,terminal_reason=? WHERE route_id=?""", (
+                self._timestamp(), outcome, first_delta_ms, completed_ms, selected_fingerprint,
+                selected_model, selected_site_id, terminal_reason, route_id,
+            ))
+
+    def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
+                          failure_class: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("""INSERT INTO provider_capability(fingerprint,model,contract,state,last_failure_class,updated_at)
+                VALUES(?,?,?,?,?,?) ON CONFLICT(fingerprint,model,contract) DO UPDATE SET
+                state=excluded.state,last_failure_class=excluded.last_failure_class,updated_at=excluded.updated_at""",
+                (fingerprint, model, contract, state, failure_class, self._timestamp()))
     def catalog_counts(self):
         rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.catalog()}
         for name in counts:
@@ -393,27 +465,58 @@ class Store:
         rows = []
         site_notes = []
         catalog = self.catalog()
+        existing = {}
+        for row in self.conn.execute("SELECT fingerprint,base_url,api_key,models_json FROM source_provider"):
+            try:
+                existing[(row["base_url"], self._decrypt(row["api_key"]))] = row
+            except Exception:
+                continue
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             from .catalog import canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             models = [model for model in source_models if model in catalog]
-            fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
+            prior = existing.get((base_url, api_key))
+            unavailable = entry.get("inventory_status") == "unavailable" or source_models == ["unavailable"]
+            # Model discovery is auxiliary evidence.  Never erase a known-good
+            # route merely because a CPA /models refresh transiently fails.
+            if unavailable and prior is not None:
+                prior_models = json.loads(prior["models_json"])
+                if prior_models:
+                    source_models = prior_models
+                    models = [model for model in source_models if model in catalog]
+                    entry = entry | {"inventory_status": "stale"}
+                    fp = prior["fingerprint"]
+                else:
+                    fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
+            else:
+                fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
+            site_id = self.site_id(entry.get("site_name"), base_url)
             if isinstance(entry.get('site_name'), str) and entry['site_name'].strip():
                 site_notes.append((entry['site_name'].strip(), fp))
             source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
             request_headers = json.dumps(entry.get('request_headers') or {}, sort_keys=True)
-            rows.append((fp, entry.get("name") or (models[0] if models else "unavailable"), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at))
+            rows.append((fp, entry.get("name") or (models[0] if models else "unavailable"), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at, site_id))
         with self.conn:
             self.conn.execute("CREATE TEMP TABLE incoming AS SELECT * FROM source_provider WHERE 0")
-            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at) VALUES(?,?,?,?,?,?,?,?,?)", rows)
+            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
             self.conn.execute("DELETE FROM source_provider")
-            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at) SELECT fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at FROM incoming")
+            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id) SELECT fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id FROM incoming")
+            self.conn.execute("DELETE FROM route_block WHERE fingerprint NOT IN (SELECT fingerprint FROM incoming)")
             self.conn.execute("DROP TABLE incoming")
-            self.conn.execute("DELETE FROM route_block")
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
+            self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[9],) for r in rows])
             self.conn.executemany("UPDATE policy SET calibrated=? WHERE fingerprint=?", [(int(any(model in catalog for model in json.loads(r[6]))), r[0]) for r in rows])
             self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=?", site_notes)
+
+    @staticmethod
+    def site_id(site_name: object, base_url: str) -> str:
+        """Stable, non-secret fault-domain identifier from CPA site metadata."""
+        value = str(site_name or "").strip().lower()
+        if not value:
+            from urllib.parse import urlsplit
+            value = urlsplit(base_url).hostname or base_url
+        return "".join(char if char.isalnum() or char in "._-" else "-" for char in value)[:80] or "default"
 
     def providers(self, tier: str) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
@@ -433,7 +536,7 @@ class Store:
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
                     pricing = catalog[model]
-                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier'])))
+                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier']),r['site_id']))
         return result
 
     def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
@@ -488,17 +591,27 @@ class Store:
             return None
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
         pricing = catalog[model]
-        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']))
+        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'])
 
     def try_acquire(self, provider: Provider) -> bool:
         active = self._inflight.get(provider.fingerprint, 0)
-        if active >= provider.max_parallel:
+        site = getattr(provider, "site_id", "default")
+        site_row = self.conn.execute("SELECT max_parallel,enabled FROM site_policy WHERE site_id=?", (site,)).fetchone()
+        site_limit = int(site_row["max_parallel"]) if site_row else 8
+        global_limit = int(self.conn.execute("SELECT value FROM broker_setting WHERE name='global_parallel_cap'").fetchone()[0])
+        if active >= provider.max_parallel or self._site_inflight.get(site, 0) >= site_limit or self._global_inflight >= global_limit or site_row and not site_row["enabled"]:
             return False
         self._inflight[provider.fingerprint] = active + 1
+        self._site_inflight[site] = self._site_inflight.get(site, 0) + 1
+        self._global_inflight += 1
         return True
 
     def has_capacity(self, provider: Provider) -> bool:
-        return self._inflight.get(provider.fingerprint, 0) < provider.max_parallel
+        site = getattr(provider, "site_id", "default")
+        row = self.conn.execute("SELECT max_parallel,enabled FROM site_policy WHERE site_id=?", (site,)).fetchone()
+        site_limit = int(row["max_parallel"]) if row else 8
+        global_limit = int(self.conn.execute("SELECT value FROM broker_setting WHERE name='global_parallel_cap'").fetchone()[0])
+        return self._inflight.get(provider.fingerprint, 0) < provider.max_parallel and self._site_inflight.get(site, 0) < site_limit and self._global_inflight < global_limit and (row is None or bool(row["enabled"]))
 
     def release(self, provider: Provider):
         active = self._inflight.get(provider.fingerprint, 0)
@@ -506,6 +619,13 @@ class Store:
             self._inflight.pop(provider.fingerprint, None)
         else:
             self._inflight[provider.fingerprint] = active - 1
+        site = getattr(provider, "site_id", "default")
+        site_active = self._site_inflight.get(site, 0)
+        if site_active <= 1:
+            self._site_inflight.pop(site, None)
+        else:
+            self._site_inflight[site] = site_active - 1
+        self._global_inflight = max(0, self._global_inflight - 1)
 
     def block_route(self, fingerprint: str, model: str):
         with self.conn:
@@ -528,7 +648,7 @@ class Store:
             encoded = json.dumps(schema, ensure_ascii=False, sort_keys=True, separators=(',', ':')).encode('utf-8')
             schema_sha256 = hashlib.sha256(encoded).hexdigest()
         rows = self.conn.execute("""
-            SELECT actual_model,status,diagnostic_json FROM observation
+            SELECT actual_model,status,latency_ms,diagnostic_json FROM observation
             WHERE fingerprint=? AND requested_model=? AND created_at>=datetime('now','-24 hours')
             ORDER BY id DESC LIMIT 100
         """, (provider.fingerprint, requested_model)).fetchall()
@@ -545,10 +665,16 @@ class Store:
                 diagnostic = {}
             exact_shape = diagnostic.get('prompt_sha256') == prompt_sha256 and diagnostic.get('schema_sha256') == schema_sha256
             fulfilled = row['status'] == 'completed' and row['actual_model'] == requested_model
+            # Hedge cancellations and client disconnects say nothing about a
+            # provider's capability; including them was the main source of the
+            # misleading attempt-level success score.
+            neutral = row['status'] in {'cancelled', 'client_cancelled'}
             if exact_shape:
-                score += 1000 if fulfilled else -100 if row['status'] == 'structured_output_invalid' else -20
+                score += 1000 if fulfilled else 0 if neutral else -100 if row['status'] == 'structured_output_invalid' else -20
             else:
-                score += 10 if fulfilled else -1
+                score += 10 if fulfilled else 0 if neutral else -1
+            if not exact_shape and fulfilled and row['latency_ms'] is not None:
+                score += max(-20, min(20, int((2500 - float(row['latency_ms'])) / 125)))
         return score
 
     def inventory(self, window='24h') -> list[dict]:
@@ -603,7 +729,24 @@ class Store:
         p95=values[max(0, int(len(values)*.95)-1)] if values else None
         fulfillment=self.conn.execute(f'SELECT avg(actual_model=requested_model) FROM observation WHERE {where}',params).fetchone()[0]
         failures={s:self.conn.execute(f'SELECT count(*) FROM observation WHERE {where} AND status=?',params+(s,)).fetchone()[0] for s in ('cancelled','timed_out','transport_failed','protocol_failed','stream_incomplete')}
-        return {'calls':row['calls'],'technical_success_rate':row['rate'],'avg_ttft_ms':row['ttft'],'p95_ttft_ms':p95,'total_cost':row['total_cost'],'model_fulfillment_rate':fulfillment,'failures':failures}
+        route_where = "started_at >= datetime('now', ?)"
+        route_row = self.conn.execute(f"""SELECT count(*) calls,
+            avg(outcome='completed') request_success_rate, avg(first_delta_ms) client_first_delta_avg_ms,
+            avg(completed_ms) request_completed_avg_ms
+            FROM route_run WHERE {route_where} AND outcome IN ('completed','failed','timed_out')""", params).fetchone()
+        deltas = [r[0] for r in self.conn.execute(f"SELECT first_delta_ms FROM route_run WHERE {route_where} AND first_delta_ms IS NOT NULL ORDER BY first_delta_ms", params).fetchall()]
+        complete = [r[0] for r in self.conn.execute(f"SELECT completed_ms FROM route_run WHERE {route_where} AND completed_ms IS NOT NULL ORDER BY completed_ms", params).fetchall()]
+        cancelled = self.conn.execute(f"SELECT count(*) FROM observation WHERE {where} AND status IN ('cancelled','client_cancelled')", params).fetchone()[0]
+        percentile = lambda values, fraction: values[max(0, int(len(values) * fraction) - 1)] if values else None
+        return {
+            'calls': row['calls'], 'technical_success_rate': row['rate'], 'avg_ttft_ms': row['ttft'], 'p95_ttft_ms': p95,
+            'total_cost': row['total_cost'], 'model_fulfillment_rate': fulfillment, 'failures': failures,
+            'request_calls': route_row['calls'], 'request_success_rate': route_row['request_success_rate'],
+            'client_first_delta_avg_ms': route_row['client_first_delta_avg_ms'],
+            'client_first_delta_p50_ms': percentile(deltas, .5), 'client_first_delta_p95_ms': percentile(deltas, .95),
+            'request_completed_avg_ms': route_row['request_completed_avg_ms'],
+            'request_completed_p95_ms': percentile(complete, .95), 'cancellation_neutral_attempts': cancelled,
+        }
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]
         if cursor: clauses.append('o.id < ?'); params.append(int(cursor))

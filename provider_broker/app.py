@@ -6,13 +6,13 @@ import asyncio
 from datetime import UTC, datetime
 from pathlib import Path
 
-from aiohttp import web
+from aiohttp import TCPConnector, web
 
 from .db import Store
 from .catalog import blended_price
 from .settings import Settings
-from .source import sync_cpa
-from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route
+from .source import sync_cpa, scheduler as source_scheduler
+from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route, structured_schema
 from .health import run_probe, scheduler
 from .balances import BalanceFailure, login as balance_login, login_with_cookie as balance_cookie_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
 from .browser import BalanceBrowser, BrowserFailure
@@ -30,7 +30,7 @@ async def generate(request):
     try:
         settings = request.app["settings"]
         result = await route(
-            request.app["store"], tier, body, request.app["store"].race_parallel_cap(),
+            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector")}, request.app["store"].race_parallel_cap(),
             hedge_delay_ms=request.app["store"].hedge_delay_ms(),
             first_event_timeout_ms=settings.first_event_timeout_ms,
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
@@ -65,10 +65,26 @@ async def stream(request):
     tier = body.get("intellect")
     if "model" in body or not isinstance(body.get("prompt"), str) or tier not in ("standard", "smart", "expert"):
         return web.json_response({"error": "prompt and valid intellect are required"}, status=400)
+    # Strict structured contracts cannot safely expose a provisional fragment:
+    # validate the complete JSON before committing HTTP 200.  Plain text can
+    # stream the winning provider's first token immediately.
+    structured = structured_schema(body) is not None
+    sse = None
+    emitted_delta = False
+    if not structured:
+        sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+        await sse.prepare(request)
+
+        async def emit_delta(text):
+            nonlocal emitted_delta
+            emitted_delta = True
+            await sse.write(f"event: delta\ndata: {json.dumps({'text': text})}\n\n".encode())
+    else:
+        emit_delta = None
     try:
         settings = request.app["settings"]
         result = await route(
-            request.app["store"], tier, body, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
+            request.app["store"], tier, body | {"_http_connector": request.app.get("upstream_connector"), "_on_delta": emit_delta}, request.app["store"].race_parallel_cap(), invoker=invoke_stream,
             hedge_delay_ms=request.app["store"].hedge_delay_ms(),
             first_event_timeout_ms=settings.first_event_timeout_ms,
             stream_idle_timeout_ms=settings.stream_idle_timeout_ms,
@@ -79,19 +95,29 @@ async def stream(request):
             response_reserve_ms=settings.response_reserve_ms,
         )
     except ClientDeadlineExceeded as exc:
+        if sse is not None:
+            await sse.write(f"event: error\ndata: {json.dumps({'status': 'timed_out', 'request_id': exc.request_id, 'route_id': exc.route_id})}\n\n".encode())
+            await sse.write_eof()
+            return sse
         return web.json_response({
             "status": "timed_out", "error": "client deadline exceeded", "attempts": exc.attempts,
             "request_id": exc.request_id, "route_id": exc.route_id,
         }, status=504)
     except UpstreamFailure as exc:
+        if sse is not None:
+            await sse.write(f"event: error\ndata: {json.dumps({'status': 'failed', 'request_id': exc.request_id, 'route_id': exc.route_id})}\n\n".encode())
+            await sse.write_eof()
+            return sse
         return web.json_response({
             "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
             "request_id": exc.request_id, "route_id": exc.route_id,
         }, status=503)
-    sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
-    await sse.prepare(request)
-    for chunk in result["chunks"]:
-        await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
+    if sse is None:
+        sse = web.StreamResponse(status=200, headers={"Content-Type": "text/event-stream", "Cache-Control": "no-cache"})
+        await sse.prepare(request)
+    if not emitted_delta:
+        for chunk in result["chunks"]:
+            await sse.write(f"event: delta\ndata: {json.dumps({'text': chunk})}\n\n".encode())
     final = {
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
         "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
@@ -139,7 +165,14 @@ async def summary(request):
     row = db.execute("SELECT avg(success),avg(latency_ms) FROM observation WHERE created_at >= datetime('now',?)", (modifiers[window],)).fetchone()
     routable = len({provider.fingerprint for tier in ("standard", "smart", "expert") for provider in request.app["store"].providers(tier)})
     synced = db.execute("SELECT max(synced_at) FROM source_provider").fetchone()[0]
-    return web.json_response({"routable_apis": routable, "technical_success_rate": row[0], "avg_ttft_ms": row[1], "last_successful_sync": synced})
+    route_row = db.execute("""SELECT count(*),avg(outcome='completed'),avg(first_delta_ms),avg(completed_ms)
+        FROM route_run WHERE started_at >= datetime('now',?) AND outcome IN ('completed','failed','timed_out')""", (modifiers[window],)).fetchone()
+    return web.json_response({
+        "routable_apis": routable, "technical_success_rate": row[0], "avg_ttft_ms": row[1],
+        "request_calls": route_row[0], "request_success_rate": route_row[1],
+        "client_first_delta_avg_ms": route_row[2], "request_completed_avg_ms": route_row[3],
+        "last_successful_sync": synced,
+    })
 
 
 async def quality(request):
@@ -263,6 +296,37 @@ async def update_policy(request):
     if not request.app["store"].update_policy(request.match_info["fingerprint"], body):
         return web.json_response({"error": "provider not found"}, status=404)
     return web.json_response({"updated": True})
+
+
+async def sites(request):
+    return web.json_response({"global_parallel_cap": request.app["store"].global_parallel_cap(), "sites": request.app["store"].sites()})
+
+
+async def update_site(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    valid = isinstance(body, dict) and bool(body) and set(body) <= {"max_parallel", "enabled", "note"}
+    valid = valid and ("max_parallel" not in body or type(body["max_parallel"]) is int and 1 <= body["max_parallel"] <= 128)
+    valid = valid and ("enabled" not in body or type(body["enabled"]) is bool)
+    valid = valid and ("note" not in body or isinstance(body["note"], str) and len(body["note"]) <= 240)
+    if not valid:
+        return web.json_response({"error": "invalid site policy"}, status=400)
+    if not request.app["store"].update_site_policy(request.match_info["site_id"], body):
+        return web.json_response({"error": "site not found"}, status=404)
+    return web.json_response({"updated": True})
+
+
+async def update_global_capacity(request):
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or set(body) != {"global_parallel_cap"} or type(body["global_parallel_cap"]) is not int or not 1 <= body["global_parallel_cap"] <= 512:
+        return web.json_response({"error": "invalid global capacity"}, status=400)
+    request.app["store"].update_global_parallel_cap(body["global_parallel_cap"])
+    return web.json_response({"global_parallel_cap": request.app["store"].global_parallel_cap()})
 
 
 async def home(request):
@@ -441,16 +505,25 @@ def create_app(settings: Settings, *, clock=None):
     app["clock"] = clock or (lambda: datetime.now(UTC))
 
     async def start_scheduler(app):
+        app["upstream_connector"] = TCPConnector(limit=64, ttl_dns_cache=300, enable_cleanup_closed=True)
         app["store"].ensure_health_targets(app["clock"]())
         app["health_scheduler"] = asyncio.create_task(scheduler(app))
         app["balance_scheduler"] = asyncio.create_task(balance_scheduler(app))
+        app["source_scheduler"] = asyncio.create_task(source_scheduler(app))
 
     async def stop_scheduler(app):
+        connector = app.get("upstream_connector")
+        if connector:
+            await connector.close()
         task = app.get("health_scheduler")
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
         task = app.get("balance_scheduler")
+        if task:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+        task = app.get("source_scheduler")
         if task:
             task.cancel()
             await asyncio.gather(task, return_exceptions=True)
@@ -464,6 +537,7 @@ def create_app(settings: Settings, *, clock=None):
         web.patch("/admin/v1/balances/configuration", balance_configuration), web.get("/admin/v1/balances/configuration", balance_configuration),
         web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
+        web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),

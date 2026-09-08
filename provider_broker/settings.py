@@ -26,6 +26,7 @@ class Settings:
     open_recovery_cooldown_seconds: int = 120
     response_reserve_ms: int = 5_000
     balance_scheduler_seconds: int = 15 * 60
+    source_scheduler_seconds: int = 15 * 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -50,6 +51,7 @@ class Settings:
             open_recovery_cooldown_seconds=int(os.getenv("BROKER_OPEN_RECOVERY_COOLDOWN_SECONDS", "120")),
             response_reserve_ms=int(os.getenv("BROKER_RESPONSE_RESERVE_MS", "5000")),
             balance_scheduler_seconds=int(os.getenv("BROKER_BALANCE_SCHEDULER_SECONDS", str(15 * 60))),
+            source_scheduler_seconds=int(os.getenv("BROKER_SOURCE_SCHEDULER_SECONDS", str(15 * 60))),
         )
 
     def key_bytes(self) -> bytes:

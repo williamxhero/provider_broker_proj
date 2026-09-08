@@ -317,6 +317,22 @@ async def test_stream_emits_delta_before_final(client, cpa):
     assert audit['input_tokens']==3 and audit['output_tokens']==2
 
 
+async def test_plain_stream_commits_headers_before_upstream_completion(client, cpa):
+    await client.post('/admin/v1/sync')
+    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    await client.patch(f"/admin/v1/policy/{provider['fingerprint']}", json={'calibrated': True})
+    cpa.app['upstream_app']['hedge_behaviors'] = {
+        'Bearer provider-secret': {'delay': 0, 'tail_delay': .35, 'text': 'first'},
+    }
+    started = asyncio.get_running_loop().time()
+
+    streamed = await asyncio.wait_for(client.post('/v1/generate/stream', json={'prompt': 'stream now', 'intellect': 'standard'}), .15)
+
+    assert streamed.status == 200
+    assert asyncio.get_running_loop().time() - started < .15
+    assert 'event: delta' in await streamed.text()
+
+
 async def test_generate_parses_chat_completions_without_native_tools(client, cpa):
     cpa.app['config']={'claude-api-key':[{'name':'Claude compatible','base_url':cpa.app['upstream'],'api_key':'claude-secret'}]}
     headers={'Authorization':'Bearer admin-secret'}

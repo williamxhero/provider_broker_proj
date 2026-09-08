@@ -65,6 +65,7 @@ DIAGNOSTIC_FIELDS = {
     "terminal_reason",
     "upstream_error_code",
     "upstream_error_type",
+    "failure_class",
 }
 
 RETRYABLE_ATTEMPT_STATUSES = {
@@ -586,6 +587,7 @@ async def invoke_stream(provider, body: dict) -> dict:
     plan_audit = None
     plan_context = research_plan_context_audit(body)
     request_shape = request_shape_diagnostic(body)
+    on_delta = body.get("_on_delta") if schema is None else None
 
     def diagnostic():
         return sanitize_diagnostic({
@@ -617,7 +619,7 @@ async def invoke_stream(provider, body: dict) -> dict:
         progress_event_count += 1
         saw_progress = True
 
-    def consume_event(event):
+    async def consume_event(event):
         nonlocal completed, finish_reason, ttft_ms, upstream_error
         if not isinstance(event, dict):
             return False
@@ -671,6 +673,8 @@ async def invoke_stream(provider, body: dict) -> dict:
             if not chunks:
                 ttft_ms = round((time.monotonic() - started) * 1000, 2)
             chunks.append(output_delta)
+            if callable(on_delta):
+                await on_delta(output_delta)
         return recognized
 
     if schema is not None:
@@ -684,7 +688,11 @@ async def invoke_stream(provider, body: dict) -> dict:
 
     timeout = ClientTimeout(total=max(.001, attempt_deadline - time.monotonic()))
     try:
-        async with ClientSession(timeout=timeout) as session:
+        connector = body.get("_http_connector")
+        session_options = {"timeout": timeout}
+        if connector is not None:
+            session_options |= {"connector": connector, "connector_owner": False}
+        async with ClientSession(**session_options) as session:
             try:
                 response = await asyncio.wait_for(session.post(api_url(provider.base_url, endpoint), json=payload, headers=provider_headers(provider)), max(.001, first_event_deadline - time.monotonic()))
             except (asyncio.TimeoutError, TimeoutError) as exc:
@@ -717,6 +725,8 @@ async def invoke_stream(provider, body: dict) -> dict:
                     chunks = [text]
                     completed = True
                     ttft_ms = round((time.monotonic() - started) * 1000, 2)
+                    if callable(on_delta):
+                        await on_delta(text)
                     record_progress()
                 else:
                     sse_event_type = None
@@ -752,7 +762,7 @@ async def invoke_stream(provider, body: dict) -> dict:
                             if isinstance(event, dict) and sse_event_type and not isinstance(event.get("type"), str):
                                 event = {**event, "type": sse_event_type}
                             sse_event_type = None
-                            if consume_event(event):
+                            if await consume_event(event):
                                 record_progress()
                         except json.JSONDecodeError as exc:
                             raise AttemptFailure("protocol_failed", diagnostic=diagnostic()) from exc
@@ -800,22 +810,32 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
     output = output or {}
     attempt = attempt or {}
     usage = output.get("usage") or {}
+    diagnostic = sanitize_diagnostic(attempt.get("diagnostic") or output.get("diagnostic") or {})
+    failure_class = classify_failure(status, diagnostic)
+    diagnostic["failure_class"] = failure_class
     store.observe(
         fingerprint=provider.fingerprint, requested_model=requested_model,
         actual_model=output.get("actual_model"), tier=tier, effort=body.get("effort"),
         success=int(status == "completed"), latency_ms=output.get("latency_ms"), error=None,
         status=status, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
         cost=output.get("cost"), request_id=output.get("request_id") or str(uuid.uuid4()),
-        diagnostic_json=json.dumps(sanitize_diagnostic(attempt.get("diagnostic") or output.get("diagnostic") or {}), sort_keys=True),
+        diagnostic_json=json.dumps(diagnostic, sort_keys=True),
         route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
         elapsed_ms=attempt.get("elapsed_ms"),
     )
-    neutral = {"cancelled", "client_cancelled"}
-    if status not in neutral and hasattr(store, "record_health"):
+    if hasattr(store, "record_capability") and failure_class == "contract":
+        store.record_capability(provider.fingerprint, requested_model, "structured" if structured_schema(body) else "plain", "unsupported", failure_class)
+    if status == "completed" and hasattr(store, "record_capability"):
+        store.record_capability(provider.fingerprint, requested_model, "structured" if structured_schema(body) else "plain", "supported")
+    # Only route/provider conditions affect availability.  A caller-side schema
+    # contract rejection is intentionally isolated as capability evidence.
+    if failure_class in {"provider", "provider_overload", "transport"} and hasattr(store, "record_health"):
         return store.record_health(
             provider.fingerprint, requested_model, success=status == "completed", real=True,
-            ttft_ms=output.get("latency_ms"), immediate_open=status == "model_mismatch",
+            ttft_ms=output.get("latency_ms"), immediate_open=False,
         )
+    if status == "completed" and hasattr(store, "record_health"):
+        return store.record_health(provider.fingerprint, requested_model, success=True, real=True, ttft_ms=output.get("latency_ms"))
     return None
 
 
@@ -862,6 +882,28 @@ def retryable_attempt(failure: AttemptFailure) -> bool:
     return status is None or status in {408, 409, 425, 429} or isinstance(status, int) and status >= 500
 
 
+def classify_failure(status: str, diagnostic: dict) -> str:
+    """Attribute failures before changing shared provider health.
+
+    Contract errors are useful capability evidence but must not trip a whole
+    provider circuit.  Race cancellation is intentionally neutral.
+    """
+    if status in {"cancelled", "client_cancelled"}:
+        return "neutral"
+    if status in {"structured_output_invalid", "structured_schema_invalid", "output_truncated", "model_mismatch"}:
+        return "contract"
+    code = diagnostic.get("http_status")
+    if code in {401, 403}:
+        return "credential"
+    if code in {408, 409, 425, 429}:
+        return "provider_overload"
+    if status in {"transport_failed", "protocol_failed"}:
+        return "transport"
+    if status in {"timed_out", "first_token_timeout", "stream_incomplete", "unavailable"}:
+        return "provider"
+    return "unknown"
+
+
 async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=invoke,
                 *, hedge_delay_ms: int = 750, first_event_timeout_ms: int = 30000,
                 stream_idle_timeout_ms: int = 90000, attempt_timeout_ms: int = 180000,
@@ -883,7 +925,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     audit = AttemptAudit(route_started)
     route_id = str(uuid.uuid4())
     terminal_request_id = str(uuid.uuid4())
+    if hasattr(store, "route_started"):
+        store.route_started(route_id, tier, terminal_request_id, body.get("effort"))
     deadline_exceeded = False
+    stream_selected_sequence = None
+    first_client_delta_ms = None
     attempts_started = 0
     effort_multiplier = {"medium": 2, "high": 3}.get(body.get("effort"), 1)
     effective_first_event_timeout_ms = max(1, int(first_event_timeout_ms) * effort_multiplier)
@@ -917,20 +963,24 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         return route_scores[key]
 
     for candidate_tier in tiers[tiers.index(tier):]:
-        for band in price_bands(store.providers(candidate_tier)):
-            eligible_candidates += len(band)
-            available = [provider for provider in band if store.has_capacity(provider)]
-            randomized = random.sample(available, k=len(available))
-            ranked = sorted(
-                randomized,
-                key=lambda provider: candidate_score(provider, candidate_tier),
-                reverse=True,
-            )
-            primary.extend(
-                (provider, candidate_tier, None, candidate_score(provider, candidate_tier))
-                for provider in ranked
-            )
-            normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
+        candidates = store.providers(candidate_tier)
+        eligible_candidates += len(candidates)
+        available = [provider for provider in candidates if store.has_capacity(provider)]
+        randomized = random.sample(available, k=len(available)) if available else []
+        ranked = sorted(randomized, key=lambda provider: candidate_score(provider, candidate_tier), reverse=True)
+        # A request's first two independent attempts should span fault domains
+        # whenever possible.  Price stays in the score, but no longer forms a
+        # hard wall that prevents a healthy complementary site from racing.
+        diversified, deferred, used_sites = [], [], set()
+        for provider in ranked:
+            if getattr(provider, "site_id", provider.base_url) in used_sites:
+                deferred.append(provider)
+            else:
+                diversified.append(provider)
+                used_sites.add(getattr(provider, "site_id", provider.base_url))
+        ranked = diversified + deferred
+        primary.extend((provider, candidate_tier, None, candidate_score(provider, candidate_tier)) for provider in ranked)
+        normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
 
     def queue_open_recovery(candidate_tier, *, allow_before_due: bool = False):
         if candidate_tier in recovery_queued_tiers or open_recovery_candidate_limit <= 0:
@@ -991,7 +1041,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             elif recovery:
                 provider, candidate_tier, repair_note, route_score = recovery.popleft()
                 queue_kind = "open_recovery"
-            else:
+            elif retry:
                 provider, candidate_tier, repair_note, route_score = retry.popleft()
                 queue_kind = "retry"
             if not store.try_acquire(provider):
@@ -1000,17 +1050,32 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             attempts_started += 1
             audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)
 
-            async def run(selected=provider, selected_repair_note=repair_note):
+            async def run(selected=provider, selected_repair_note=repair_note, selected_sequence=sequence):
                 try:
                     selected_body = invocation_body
                     if selected_repair_note:
                         selected_body = {**invocation_body, "_structured_repair_note": selected_repair_note}
+                    downstream = invocation_body.get("_on_delta")
+                    if callable(downstream):
+                        async def forward_delta(text):
+                            nonlocal stream_selected_sequence, first_client_delta_ms
+                            if stream_selected_sequence is None:
+                                stream_selected_sequence = selected_sequence
+                                first_client_delta_ms = round((time.monotonic() - route_started) * 1000, 2)
+                            if stream_selected_sequence == selected_sequence:
+                                await downstream(text)
+                        selected_body = {**selected_body, "_on_delta": forward_delta}
                     return await invoker(selected, selected_body)
                 finally:
                     store.release(selected)
 
             active[asyncio.create_task(run())] = (sequence, provider, candidate_tier)
-            next_hedge_at = time.monotonic() + max(0, hedge_delay_ms) / 1000
+            health = store.health(provider.fingerprint, canonicalize(provider.models[0])) if hasattr(store, "health") else {}
+            expected_ttft = health.get("smoothed_ttft_ms")
+            delay = max(0, hedge_delay_ms)
+            if isinstance(expected_ttft, (int, float)) and expected_ttft > delay:
+                delay = max(50, min(delay, int(expected_ttft * .5)))
+            next_hedge_at = time.monotonic() + delay / 1000
             return True
         return False
 
@@ -1106,7 +1171,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     store, provider, requested_model, candidate_tier, body, "completed", output=output,
                     attempt=audit.row(sequence), route_id=route_id,
                 )
-                if winner is None:
+                if winner is None and (stream_selected_sequence is None or stream_selected_sequence == sequence):
                     actual_tier = fulfilled_intellect(output["actual_model"])
                     fulfilled_tier = actual_tier if actual_tier and INTELLECT_RANK[actual_tier] > INTELLECT_RANK[candidate_tier] else candidate_tier
                     winner = (output, provider, fulfilled_tier)
@@ -1118,6 +1183,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
                     route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
                 )
+                if hasattr(store, "route_finished"):
+                    store.route_finished(route_id, outcome="completed", first_delta_ms=first_client_delta_ms,
+                                         completed_ms=round((time.monotonic() - route_started) * 1000, 2),
+                                         selected_fingerprint=provider.fingerprint, selected_model=output.get("actual_model"),
+                                         selected_site_id=getattr(provider, "site_id", None))
                 return output | {
                     "provider": provider.name, "attempts": audit.public(),
                     "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
@@ -1131,6 +1201,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     break
     except asyncio.CancelledError:
         await cancel_active("cancelled")
+        if hasattr(store, "route_finished"):
+            store.route_finished(route_id, outcome="client_cancelled", completed_ms=round((time.monotonic() - route_started) * 1000, 2), terminal_reason="client_cancelled")
         logger.info(
             "route_cancelled route_id=%s elapsed_ms=%.2f attempts=%d",
             route_id, (time.monotonic() - route_started) * 1000, len(audit.rows),
@@ -1161,7 +1233,37 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 request_id=terminal_request_id, diagnostic_json=json.dumps(terminal["diagnostic"], sort_keys=True),
                 route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
             )
+    if deadline_exceeded:
+        # Persist one route-level terminal fact even when active attempts were
+        # cancelled for the client deadline.  Attempt rows alone cannot answer
+        # whether a caller actually received a completed response.
+        elapsed_ms = round((time.monotonic() - route_started) * 1000, 2)
+        terminal_observation = dict(
+            fingerprint="provider-broker", requested_model=tier, actual_model=None,
+            tier=tier, effort=body.get("effort"), success=0, latency_ms=None,
+            error="client_deadline_exceeded", status="route_timed_out", input_tokens=None,
+            output_tokens=None, cost=None, request_id=terminal_request_id,
+            diagnostic_json=json.dumps({"queue_kind": "route_terminal", "terminal_reason": "client_deadline_exceeded"}, sort_keys=True),
+            route_id=route_id, attempt_number=0, started_ms=0, elapsed_ms=elapsed_ms,
+        )
+
+        async def persist_terminal_later():
+            # Deadline response time wins over a best-effort local audit write.
+            # Yield once so a contended SQLite/FakeStore cannot hold the client
+            # response hostage; the immutable route_run row is already closed.
+            await asyncio.sleep(0)
+            store.observe(**terminal_observation)
+
+        # Test/dry-run stores can deliberately make ``observe`` blocking; they
+        # have no durable route table to reconcile.  The production SQLite
+        # store records this terminal fact after yielding to the HTTP response.
+        if hasattr(store, "conn"):
+            asyncio.create_task(persist_terminal_later())
     failure_type = ClientDeadlineExceeded if deadline_exceeded else UpstreamFailure
+    if hasattr(store, "route_finished"):
+        store.route_finished(route_id, outcome="timed_out" if deadline_exceeded else "failed",
+                             completed_ms=round((time.monotonic() - route_started) * 1000, 2),
+                             terminal_reason="client_deadline_exceeded" if deadline_exceeded else "all_candidates_failed")
     log = logger.warning if deadline_exceeded else logger.info
     log(
         "route_%s route_id=%s elapsed_ms=%.2f attempts=%d client_deadline_ms=%d",

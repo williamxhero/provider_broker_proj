@@ -1,4 +1,5 @@
 import datetime
+import asyncio
 from aiohttp import ClientSession
 
 from .catalog import canonicalize
@@ -90,3 +91,20 @@ async def sync_cpa(store, url: str, token: str) -> dict:
                 inventory_failures+=1
     store.replace_source_snapshot(entries, datetime.datetime.now(datetime.UTC).isoformat())
     return {'count':len(entries),'inventory_failures':inventory_failures}
+
+
+async def scheduler(app) -> None:
+    """Refresh CPA inventory independently; a failed refresh leaves its snapshot intact."""
+    settings = app["settings"]
+    try:
+        while True:
+            await asyncio.sleep(max(30, settings.source_scheduler_seconds))
+            try:
+                await sync_cpa(app["store"], settings.cpa_url, settings.cpa_token)
+                app["store"].ensure_health_targets(app["clock"]())
+            except Exception:
+                # The operator can inspect the last successful snapshot; routing
+                # must never turn a management outage into an inventory wipe.
+                pass
+    except asyncio.CancelledError:
+        raise
