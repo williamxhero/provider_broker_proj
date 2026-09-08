@@ -823,6 +823,17 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
         route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
         elapsed_ms=attempt.get("elapsed_ms"),
     )
+    role_by_queue = {
+        "primary": "primary", "hedge": "hedge", "priority_retry": "retry", "retry": "retry",
+        "repair": "repair", "open_recovery": "recovery", "exploration": "exploration",
+    }
+    if route_id and hasattr(store, "record_attempt") and attempt.get("attempt"):
+        store.record_attempt(
+            route_id, attempt_number=int(attempt["attempt"]), fingerprint=provider.fingerprint,
+            model=requested_model, site_id=getattr(provider, "site_id", None),
+            role=role_by_queue.get(diagnostic.get("queue_kind"), "retry"), status=status,
+            failure_class=failure_class, started_ms=attempt.get("started_ms"), elapsed_ms=attempt.get("elapsed_ms"),
+        )
     if hasattr(store, "record_capability") and failure_class == "contract":
         store.record_capability(provider.fingerprint, requested_model, "structured" if structured_schema(body) else "plain", "unsupported", failure_class)
     if status == "completed" and hasattr(store, "record_capability"):
@@ -986,6 +997,12 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 diversified.append(provider)
                 used_sites.add(getattr(provider, "site_id", provider.base_url))
         ranked = diversified + deferred
+        if hasattr(store, "record_candidate"):
+            for rank, provider in enumerate(ranked, 1):
+                store.record_candidate(
+                    route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
+                    site_id=getattr(provider, "site_id", None), eligible=True, initial_rank=rank,
+                )
         primary.extend((provider, candidate_tier, None, candidate_score(provider, candidate_tier)) for provider in ranked)
         normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
 
@@ -1001,6 +1018,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             cooldown_seconds=open_recovery_cooldown_seconds,
             allow_before_due=allow_before_due,
         ):
+            if hasattr(store, "record_candidate"):
+                store.record_candidate(
+                    route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
+                    site_id=getattr(provider, "site_id", None), eligible=True, role="recovery",
+                )
             recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
     if not primary:
@@ -1044,15 +1066,21 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if has_active_lower_tier(primary[0][1]):
                     return False
                 provider, candidate_tier, repair_note, route_score = primary.popleft()
-                queue_kind = "primary"
+                queue_kind = "primary" if attempts_started == 0 else "hedge"
             elif recovery:
                 provider, candidate_tier, repair_note, route_score = recovery.popleft()
                 queue_kind = "open_recovery"
             elif retry:
                 provider, candidate_tier, repair_note, route_score = retry.popleft()
                 queue_kind = "retry"
+            model = canonicalize(provider.models[0])
+            role = {"primary": "primary", "hedge": "hedge", "priority_retry": "retry", "retry": "retry", "repair": "repair", "open_recovery": "recovery"}[queue_kind]
             if not store.try_acquire(provider):
+                if hasattr(store, "mark_candidate"):
+                    store.mark_candidate(route_id, fingerprint=provider.fingerprint, model=model, role=role, exclusion_reason="key_capacity")
                 continue
+            if hasattr(store, "mark_candidate"):
+                store.mark_candidate(route_id, fingerprint=provider.fingerprint, model=model, role=role)
             sequence = attempts_started
             attempts_started += 1
             audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)

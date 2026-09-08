@@ -143,6 +143,19 @@ class Store:
           deadline_bucket TEXT, schema_family TEXT, experiment_id TEXT, experiment_arm TEXT
         );
         CREATE INDEX IF NOT EXISTS route_run_started ON route_run(started_at DESC);
+        CREATE TABLE IF NOT EXISTS route_candidate (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), ordinal INTEGER NOT NULL,
+          fingerprint TEXT, model TEXT, site_id TEXT, eligible INTEGER NOT NULL,
+          exclusion_reason TEXT, initial_rank INTEGER, launched INTEGER NOT NULL DEFAULT 0,
+          role TEXT, PRIMARY KEY(route_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS route_candidate_route ON route_candidate(route_id, ordinal);
+        CREATE TABLE IF NOT EXISTS route_attempt (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), attempt_number INTEGER NOT NULL,
+          fingerprint TEXT, model TEXT, site_id TEXT, role TEXT NOT NULL, status TEXT,
+          failure_class TEXT, started_ms REAL, elapsed_ms REAL, PRIMARY KEY(route_id, attempt_number)
+        );
+        CREATE INDEX IF NOT EXISTS route_attempt_route ON route_attempt(route_id, attempt_number);
         CREATE TABLE IF NOT EXISTS site_policy (
           site_id TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 8,
           enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT ''
@@ -443,10 +456,82 @@ class Store:
                        terminal_reason: str | None = None) -> None:
         with self.conn:
             self.conn.execute("""UPDATE route_run SET completed_at=?,outcome=?,first_delta_ms=?,completed_ms=?,
-                selected_fingerprint=?,selected_model=?,selected_site_id=?,terminal_reason=? WHERE route_id=?""", (
+                selected_fingerprint=?,selected_model=?,selected_site_id=?,terminal_reason=? WHERE route_id=? AND outcome IS NULL""", (
                 self._timestamp(), outcome, first_delta_ms, completed_ms, selected_fingerprint,
                 selected_model, selected_site_id, terminal_reason, route_id,
             ))
+
+    def record_candidate(self, route_id: str, *, fingerprint: str | None, model: str | None,
+                         site_id: str | None, eligible: bool, initial_rank: int | None = None,
+                         exclusion_reason: str | None = None, launched: bool = False,
+                         role: str | None = None) -> None:
+        reasons = {"policy_disabled", "inventory_mismatch", "capability_unsupported", "health_open",
+                   "route_blocked", "site_disabled", "key_capacity", "site_capacity", "global_capacity",
+                   "deadline_budget"}
+        if exclusion_reason not in reasons:
+            exclusion_reason = None if eligible else "inventory_mismatch"
+        ordinal = self.conn.execute("SELECT coalesce(max(ordinal), -1)+1 FROM route_candidate WHERE route_id=?", (route_id,)).fetchone()[0]
+        with self.conn:
+            self.conn.execute("""INSERT INTO route_candidate(route_id,ordinal,fingerprint,model,site_id,eligible,
+                exclusion_reason,initial_rank,launched,role) VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                route_id, ordinal, fingerprint, model, site_id, int(eligible), exclusion_reason,
+                initial_rank, int(launched), role,
+            ))
+
+    def record_attempt(self, route_id: str, *, attempt_number: int, fingerprint: str | None,
+                       model: str | None, site_id: str | None, role: str, status: str | None,
+                       failure_class: str | None = None, started_ms: float | None = None,
+                       elapsed_ms: float | None = None) -> None:
+        if role not in {"primary", "hedge", "retry", "repair", "exploration", "recovery"}:
+            role = "retry"
+        with self.conn:
+            self.conn.execute("""INSERT INTO route_attempt(route_id,attempt_number,fingerprint,model,site_id,role,
+                status,failure_class,started_ms,elapsed_ms) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(route_id,attempt_number) DO UPDATE SET status=excluded.status,
+                failure_class=excluded.failure_class,elapsed_ms=excluded.elapsed_ms""", (
+                route_id, attempt_number, fingerprint, model, site_id, role, status, failure_class,
+                started_ms, elapsed_ms,
+            ))
+
+    def mark_candidate(self, route_id: str, *, fingerprint: str, model: str, role: str,
+                       exclusion_reason: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("""UPDATE route_candidate SET launched=?,role=?,exclusion_reason=?
+                WHERE route_id=? AND ordinal=(SELECT ordinal FROM route_candidate WHERE route_id=?
+                AND fingerprint=? AND model=? AND launched=0 ORDER BY ordinal LIMIT 1)""", (
+                int(exclusion_reason is None), role, exclusion_reason, route_id, route_id, fingerprint, model,
+            ))
+
+    def reconcile_open_routes(self, *, grace_seconds: int = 300, now: datetime | None = None) -> int:
+        cutoff = self._timestamp((now or datetime.now(UTC)) - timedelta(seconds=max(0, grace_seconds)))
+        with self.conn:
+            return self.conn.execute("""UPDATE route_run SET outcome='unknown', completed_at=?,
+                terminal_reason='reconciled_after_restart' WHERE outcome IS NULL AND started_at<?""",
+                (self._timestamp(now), cutoff)).rowcount
+
+    def data_health(self) -> dict[str, int]:
+        row = self.conn.execute("""SELECT
+            sum(outcome IS NULL) in_progress,
+            sum(outcome='unknown' AND terminal_reason='reconciled_after_restart') reconciled_unknown,
+            sum(telemetry_version IS NULL) legacy_records,
+            sum(outcome='unknown') unknown
+            FROM route_run""").fetchone()
+        return {name: int(row[name] or 0) for name in ("in_progress", "reconciled_unknown", "legacy_records", "unknown")} | {"collection_errors": 0}
+
+    def routes(self, *, window: str = "24h", limit: int = 50, cursor: str | None = None) -> list[dict]:
+        modifier = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}[window]
+        clauses, params = ["started_at >= datetime('now', ? )"], [modifier]
+        if cursor:
+            clauses.append("rowid < ?")
+            params.append(int(cursor))
+        rows = self.conn.execute("SELECT rowid,* FROM route_run WHERE " + " AND ".join(clauses) +
+            " ORDER BY rowid DESC LIMIT ?", [*params, limit]).fetchall()
+        return [{
+            "cursor": row["rowid"], "route_id": row["route_id"], "started_at": row["started_at"],
+            "outcome": row["outcome"], "delivery_mode": row["delivery_mode"], "tier": row["tier"],
+            "selected_model": row["selected_model"], "selected_site_id": row["selected_site_id"],
+            "terminal_reason": row["terminal_reason"], "telemetry_version": row["telemetry_version"],
+        } for row in rows]
 
     def route_detail(self, route_id: str) -> dict | None:
         row = self.conn.execute("SELECT * FROM route_run WHERE route_id=?", (route_id,)).fetchone()
@@ -459,7 +544,12 @@ class Store:
             "configuration_fingerprint", "shape_version", "input_bucket", "output_budget_bucket",
             "deadline_bucket", "schema_family", "experiment_id", "experiment_arm",
         )
-        return {name: row[name] for name in allowed}
+        detail = {name: row[name] for name in allowed}
+        detail["candidates"] = [dict(candidate) for candidate in self.conn.execute("""SELECT fingerprint,model,site_id,
+            eligible,exclusion_reason,initial_rank,launched,role FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
+        detail["attempts"] = [dict(attempt) for attempt in self.conn.execute("""SELECT attempt_number,fingerprint,model,
+            site_id,role,status,failure_class,started_ms,elapsed_ms FROM route_attempt WHERE route_id=? ORDER BY attempt_number""", (route_id,))]
+        return detail
 
     def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
                           failure_class: str | None = None) -> None:

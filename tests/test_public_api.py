@@ -1064,6 +1064,13 @@ async def test_quality_and_calls_are_derived_from_completed_generate(client, cpa
     assert quality_body['request_success_denominator'] == 1
     assert quality_body['request_coverage'] == 1
     assert quality_body['first_forwarded_delta']['applicable_count'] == 0
+    generated = (await client.get('/admin/v1/routes?limit=1', headers=headers)).json
+    routes = await generated()
+    assert routes['items'][0]['route_id']
+    route = await (await client.get(f"/admin/v1/routes/{routes['items'][0]['route_id']}", headers=headers)).json()
+    assert route['delivery_mode'] == 'non_stream'
+    assert 'private' not in str(route) and 'provider-secret' not in str(route)
+    assert (await (await client.get('/admin/v1/data-health', headers=headers)).json())['in_progress'] == 0
     calls=await client.get('/admin/v1/calls?limit=1',headers=headers)
     row=(await calls.json())['items'][0]
     assert row['status'] == 'completed' and 'prompt' not in row and 'provider-secret' not in str(row)

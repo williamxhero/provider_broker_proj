@@ -560,6 +560,34 @@ async function loadCalls(cursor = state.cursor) {
   if (requestNumber === state.callsRequest) renderCalls(payload);
 }
 
+function renderRoutes(payload) {
+  const table = byId("routes");
+  const columns = [{ label: "time" }, { label: "outcome" }, { label: "mode" }, { label: "model" }, { label: "site" }, { label: "detail" }];
+  const body = tableHead(table, columns, "routes", () => renderRoutes(payload));
+  payload.items.forEach((item) => {
+    const row = document.createElement("tr");
+    [formatShanghaiTime(item.started_at), displayStatus(item.outcome), item.delivery_mode, item.selected_model, item.selected_site_id].forEach((value) => row.append(cell(value)));
+    const detail = document.createElement("button");
+    detail.type = "button"; detail.className = "text-button"; detail.textContent = "view";
+    detail.addEventListener("click", async () => {
+      const audit = await requestJson(`/admin/v1/routes/${encodeURIComponent(item.route_id)}`);
+      byId("route-detail").textContent = JSON.stringify(audit, null, 2);
+    });
+    const action = document.createElement("td"); action.append(detail); row.append(action); body.append(row);
+  });
+}
+
+async function loadRoutes() {
+  renderRoutes(await requestJson(`/admin/v1/routes?window=${encodeURIComponent(state.qualityWindow)}&limit=25`));
+}
+
+async function loadDataHealth() {
+  const health = await requestJson("/admin/v1/data-health");
+  byId("telemetry-health").textContent = health.in_progress || health.reconciled_unknown || health.legacy_records
+    ? `telemetry warning: in-progress=${health.in_progress}, reconciled-unknown=${health.reconciled_unknown}, legacy=${health.legacy_records}`
+    : "telemetry coverage is complete for collected routes";
+}
+
 async function load() {
   const [summary, providers, catalog, quality, routing, balances] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
@@ -578,6 +606,8 @@ async function load() {
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
   renderBalances(balances);
   await loadCalls("");
+  await loadRoutes();
+  await loadDataHealth();
 }
 
 byId("policy").addEventListener("submit", async (event) => {

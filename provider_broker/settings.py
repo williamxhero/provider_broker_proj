@@ -27,6 +27,7 @@ class Settings:
     response_reserve_ms: int = 5_000
     balance_scheduler_seconds: int = 15 * 60
     source_scheduler_seconds: int = 15 * 60
+    route_reconcile_grace_seconds: int = 5 * 60
 
     @classmethod
     def from_env(cls) -> "Settings":
@@ -52,6 +53,7 @@ class Settings:
             response_reserve_ms=int(os.getenv("BROKER_RESPONSE_RESERVE_MS", "5000")),
             balance_scheduler_seconds=int(os.getenv("BROKER_BALANCE_SCHEDULER_SECONDS", str(15 * 60))),
             source_scheduler_seconds=int(os.getenv("BROKER_SOURCE_SCHEDULER_SECONDS", str(15 * 60))),
+            route_reconcile_grace_seconds=int(os.getenv("BROKER_ROUTE_RECONCILE_GRACE_SECONDS", str(5 * 60))),
         )
 
     def key_bytes(self) -> bytes:

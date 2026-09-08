@@ -1,3 +1,4 @@
+from datetime import UTC, datetime, timedelta
 from pathlib import Path
 
 from provider_broker.db import Store
@@ -61,6 +62,29 @@ def test_versioned_route_telemetry_reports_safe_cohorts_and_request_coverage(tmp
     assert quality["request_coverage"] == 1
     assert quality["first_forwarded_delta"]["applicable_count"] == 0
     assert quality["first_forwarded_delta"]["p95_ms"] is None
+
+
+def test_route_reconciliation_and_audit_detail_are_idempotent_and_private(tmp_path):
+    db = store(tmp_path)
+    db.route_started("route-open", "standard", "request-open", body={"prompt": "secret prompt"})
+    with db.conn:
+        db.conn.execute("UPDATE route_run SET started_at=? WHERE route_id='route-open'", ((datetime.now(UTC) - timedelta(minutes=5)).isoformat(),))
+    db.record_candidate("route-open", fingerprint="key-1", model="luna", site_id="site-a", eligible=True, initial_rank=1)
+    db.record_candidate("route-open", fingerprint="key-2", model="luna", site_id="site-b", eligible=False, exclusion_reason="health_open", initial_rank=2)
+    db.record_attempt("route-open", attempt_number=1, fingerprint="key-1", model="luna", site_id="site-a", role="primary", status="cancelled")
+
+    assert db.reconcile_open_routes(grace_seconds=30) == 1
+    db.route_finished("route-open", outcome="completed")
+    detail = db.route_detail("route-open")
+    health = db.data_health()
+
+    assert detail["outcome"] == "unknown"
+    assert detail["terminal_reason"] == "reconciled_after_restart"
+    assert detail["candidates"][1]["exclusion_reason"] == "health_open"
+    assert detail["attempts"][0]["role"] == "primary"
+    assert "secret prompt" not in str(detail)
+    assert health["reconciled_unknown"] == 1
+    assert health["in_progress"] == 0
 
 
 def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure(tmp_path):

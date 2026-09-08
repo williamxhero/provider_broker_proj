@@ -182,6 +182,32 @@ async def quality(request):
     return web.json_response(request.app["store"].quality(window))
 
 
+async def data_health(request):
+    return web.json_response(request.app["store"].data_health())
+
+
+async def routes(request):
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    try:
+        limit = int(request.query.get("limit", 50))
+    except ValueError:
+        limit = 0
+    cursor = request.query.get("cursor")
+    if not 1 <= limit <= 100 or cursor and not cursor.isdigit():
+        return web.json_response({"error": "invalid pagination"}, status=400)
+    items = request.app["store"].routes(window=window, limit=limit, cursor=cursor)
+    return web.json_response({"items": items, "next_cursor": str(items[-1]["cursor"]) if len(items) == limit else None})
+
+
+async def route_detail(request):
+    detail = request.app["store"].route_detail(request.match_info["route_id"])
+    if detail is None:
+        return web.json_response({"error": "route not found"}, status=404)
+    return web.json_response(detail)
+
+
 async def calls(request):
     try:
         limit = int(request.query.get("limit", 50))
@@ -506,6 +532,7 @@ def create_app(settings: Settings, *, clock=None):
 
     async def start_scheduler(app):
         app["upstream_connector"] = TCPConnector(limit=64, ttl_dns_cache=300, enable_cleanup_closed=True)
+        app["store"].reconcile_open_routes(grace_seconds=app["settings"].route_reconcile_grace_seconds)
         app["store"].ensure_health_targets(app["clock"]())
         app["health_scheduler"] = asyncio.create_task(scheduler(app))
         app["balance_scheduler"] = asyncio.create_task(balance_scheduler(app))
@@ -539,7 +566,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),
