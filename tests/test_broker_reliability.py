@@ -129,6 +129,21 @@ def test_client_first_delta_telemetry_is_idempotent_and_only_accepts_plain_route
         raise AssertionError("structured route must reject client first delta telemetry")
 
 
+def test_rollups_are_idempotent_and_retention_requires_a_watermark(tmp_path):
+    db = store(tmp_path)
+    db.route_started("old-route", "standard", "old-request")
+    db.route_finished("old-route", outcome="completed")
+    with db.conn:
+        db.conn.execute("UPDATE route_run SET started_at=? WHERE route_id='old-route'", ((datetime.now(UTC) - timedelta(days=100)).isoformat(),))
+
+    first = db.run_rollups()
+    second = db.run_rollups()
+
+    assert first["built"] == second["built"] == 1
+    assert db.apply_retention(raw_days=90) == 1
+    assert db.rollup_status()["hourly_count"] == 1
+
+
 def test_source_snapshot_keeps_last_known_working_inventory_on_discovery_failure(tmp_path):
     db = store(tmp_path)
     original = {

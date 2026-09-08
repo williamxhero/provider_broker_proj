@@ -169,6 +169,19 @@ class Store:
           telemetry_version INTEGER NOT NULL, received_at TEXT NOT NULL,
           PRIMARY KEY(route_id, metric_type, client_family, client_version)
         );
+        CREATE TABLE IF NOT EXISTS route_rollup (
+          granularity TEXT NOT NULL, bucket_start TEXT NOT NULL, telemetry_version INTEGER NOT NULL,
+          route_count INTEGER NOT NULL, completed_count INTEGER NOT NULL, known_count INTEGER NOT NULL,
+          payload_json TEXT NOT NULL, built_at TEXT NOT NULL,
+          PRIMARY KEY(granularity, bucket_start, telemetry_version)
+        );
+        CREATE TABLE IF NOT EXISTS telemetry_maintenance (
+          name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alert_state (
+          rule_name TEXT PRIMARY KEY, status TEXT NOT NULL, last_evaluated_at TEXT,
+          last_triggered_at TEXT, detail_json TEXT NOT NULL DEFAULT '{}'
+        );
         CREATE TABLE IF NOT EXISTS site_policy (
           site_id TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 8,
           enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT ''
@@ -566,7 +579,59 @@ class Store:
             sum(telemetry_version IS NULL) legacy_records,
             sum(outcome='unknown') unknown
             FROM route_run""").fetchone()
-        return {name: int(row[name] or 0) for name in ("in_progress", "reconciled_unknown", "legacy_records", "unknown")} | {"collection_errors": 0}
+        maintenance = {item["name"]: item["value"] for item in self.conn.execute("SELECT name,value FROM telemetry_maintenance")}
+        return {name: int(row[name] or 0) for name in ("in_progress", "reconciled_unknown", "legacy_records", "unknown")} | {
+            "collection_errors": 0, "latest_rollup_at": maintenance.get("latest_rollup_at"),
+            "rollup_watermark": maintenance.get("rollup_watermark"), "retention_watermark": maintenance.get("retention_watermark"),
+        }
+
+    def run_rollups(self, *, now: datetime | None = None) -> dict[str, int | str | None]:
+        now = now or datetime.now(UTC)
+        cutoff = self._timestamp(now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
+        rows = self.conn.execute("""SELECT strftime('%Y-%m-%dT%H:00:00Z', started_at) bucket,
+            telemetry_version,count(*) routes,sum(outcome='completed') completed,
+            sum(outcome IN ('completed','failed','timed_out')) known FROM route_run
+            WHERE started_at<? GROUP BY bucket,telemetry_version""", (cutoff,)).fetchall()
+        built = 0
+        with self.conn:
+            for row in rows:
+                payload = {"success_rate": row["completed"] / row["known"] if row["known"] else None,
+                           "unknown": int(row["routes"] or 0) - int(row["known"] or 0)}
+                self.conn.execute("""INSERT INTO route_rollup(granularity,bucket_start,telemetry_version,route_count,
+                    completed_count,known_count,payload_json,built_at) VALUES('hour',?,?,?,?,?,?,?)
+                    ON CONFLICT(granularity,bucket_start,telemetry_version) DO UPDATE SET route_count=excluded.route_count,
+                    completed_count=excluded.completed_count,known_count=excluded.known_count,payload_json=excluded.payload_json,built_at=excluded.built_at""",
+                    (row["bucket"], row["telemetry_version"] or 0, row["routes"], row["completed"] or 0,
+                     row["known"] or 0, json.dumps(payload, sort_keys=True), self._timestamp(now)))
+                built += 1
+            stamp = self._timestamp(now)
+            for name, value in (("latest_rollup_at", stamp), ("rollup_watermark", cutoff)):
+                self.conn.execute("INSERT INTO telemetry_maintenance(name,value,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (name, value, stamp))
+        return {"built": built, "watermark": cutoff}
+
+    def apply_retention(self, *, raw_days: int = 90, batch_size: int = 500, now: datetime | None = None) -> int:
+        now = now or datetime.now(UTC)
+        raw_days = min(365, max(7, int(raw_days)))
+        cutoff = self._timestamp(now - timedelta(days=raw_days))
+        watermark = self.conn.execute("SELECT value FROM telemetry_maintenance WHERE name='rollup_watermark'").fetchone()
+        if watermark is None:
+            return 0
+        safe_before = min(cutoff, watermark[0])
+        with self.conn:
+            route_ids = [row[0] for row in self.conn.execute("SELECT route_id FROM route_run WHERE started_at<? LIMIT ?", (safe_before, max(1, batch_size))).fetchall()]
+            if not route_ids:
+                return 0
+            marks = ",".join("?" for _ in route_ids)
+            self.conn.execute(f"DELETE FROM route_candidate WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM route_attempt WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM client_telemetry WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM observation WHERE route_id IN ({marks})", route_ids)
+            deleted = self.conn.execute(f"DELETE FROM route_run WHERE route_id IN ({marks})", route_ids).rowcount
+            self.conn.execute("INSERT INTO telemetry_maintenance(name,value,updated_at) VALUES('retention_watermark',?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (safe_before, self._timestamp(now)))
+        return deleted
+
+    def rollup_status(self) -> dict:
+        return self.data_health() | {"hourly_count": self.conn.execute("SELECT count(*) FROM route_rollup WHERE granularity='hour'").fetchone()[0]}
 
     def routes(self, *, window: str = "24h", limit: int = 50, cursor: str | None = None) -> list[dict]:
         modifier = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}[window]

@@ -245,6 +245,42 @@ async def client_telemetry(request):
     return web.json_response({"accepted": True, "duplicate": not created}, status=201 if created else 200)
 
 
+async def telemetry_maintenance(request):
+    store = request.app["store"]
+    if request.method == "POST":
+        rollup = store.run_rollups()
+        return web.json_response({"rollup": rollup, "retained": store.apply_retention(raw_days=request.app["settings"].telemetry_raw_retention_days)})
+    return web.json_response(store.rollup_status())
+
+
+async def analytics_export(request):
+    window = request.query.get("window", "30d")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    filters = {key.removeprefix("filter_"): value for key, value in request.query.items() if key.startswith("filter_")}
+    try:
+        report = request.app["store"].analytics(window=window, group_by=request.query.get("group_by"), filters=filters)
+    except ValueError:
+        return web.json_response({"error": "invalid analytics dimension"}, status=400)
+    report["generated_at"] = datetime.now(UTC).isoformat()
+    report["privacy"] = "aggregate allowlist; no prompt, output, credential, header, cookie, or URL"
+    return web.json_response(report, headers={"Content-Disposition": "attachment; filename=provider-broker-analytics.json"})
+
+
+async def alerts(request):
+    store = request.app["store"]
+    if request.method == "POST":
+        quality = store.quality(request.query.get("window", "24h"))
+        known = quality["request_success_denominator"]
+        status = "insufficient" if known < 200 else "healthy"
+        with store.conn:
+            store.conn.execute("""INSERT INTO alert_state(rule_name,status,last_evaluated_at,detail_json) VALUES(?,?,?,?)
+                ON CONFLICT(rule_name) DO UPDATE SET status=excluded.status,last_evaluated_at=excluded.last_evaluated_at,detail_json=excluded.detail_json""",
+                ("request_success", status, store._timestamp(), json.dumps({"known": known, "minimum": 200})))
+    items = [dict(row) for row in store.conn.execute("SELECT rule_name,status,last_evaluated_at,last_triggered_at,detail_json FROM alert_state ORDER BY rule_name")]
+    return web.json_response({"items": items, "notification_mode": "canary_only"})
+
+
 async def calls(request):
     try:
         limit = int(request.query.get("limit", 50))
@@ -580,6 +616,7 @@ def create_app(settings: Settings, *, clock=None):
     async def start_scheduler(app):
         app["upstream_connector"] = TCPConnector(limit=64, ttl_dns_cache=300, enable_cleanup_closed=True)
         app["store"].reconcile_open_routes(grace_seconds=app["settings"].route_reconcile_grace_seconds)
+        app["store"].run_rollups()
         app["store"].ensure_health_targets(app["clock"]())
         app["health_scheduler"] = asyncio.create_task(scheduler(app))
         app["balance_scheduler"] = asyncio.create_task(balance_scheduler(app))
@@ -613,7 +650,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),
