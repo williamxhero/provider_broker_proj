@@ -6,7 +6,7 @@ const sortDefaults = {
   probeResults: { key: "provider", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, catalogModel: null, balanceSite: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, summary: {}, sorts: {}, probeResults: [] };
+const state = { cursor: "", provider: null, catalogModel: null, callsRequest: 0, filterTimer: null, qualityWindow: "24h", providers: [], catalog: {}, summary: {}, sorts: {}, probeResults: [] };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
@@ -22,6 +22,7 @@ const formatFailureRate = (count, calls) => Number.isFinite(Number(count)) && Nu
 const statusLabels = {
   completed: "成功", cancelled: "已取消", timed_out: "超时", unavailable: "不可用",
   transport_failed: "传输失败", protocol_failed: "协议失败", stream_incomplete: "流式响应不完整",
+  first_token_timeout: "首字超时", model_mismatch: "模型不匹配", capacity_reached: "容量不足",
 };
 const displayStatus = (status) => statusLabels[status] || empty(status);
 const statusCode = (value) => Object.entries(statusLabels).find(([, label]) => label === value)?.[0] || value;
@@ -80,136 +81,6 @@ async function requestJson(url, options) {
   const body = raw ? JSON.parse(raw) : {};
   if (!response.ok) throw new Error(body.error || `HTTP ${response.status}`);
   return body;
-}
-
-function formatBalance(value, currency) {
-  if (!Number.isFinite(Number(value))) return "n/a";
-  return new Intl.NumberFormat("zh-CN", { style: "currency", currency, maximumFractionDigits: 2 }).format(Number(value));
-}
-
-function renderBalances(payload) {
-  const table = byId("balances");
-  const columns = [{ label: "站点" }, { label: "当前余额" }, { label: "低余额阈值" }, { label: "状态" }, { label: "最近更新" }, { label: "操作" }];
-  const body = tableHead(table, columns, "balances", () => renderBalances(payload));
-  payload.sites.forEach((site) => {
-    const row = document.createElement("tr");
-    if (site.low) row.className = "inactive-row";
-    const threshold = document.createElement("input");
-    threshold.type = "number";
-    threshold.min = "0";
-    threshold.step = "0.01";
-    threshold.value = site.low_threshold;
-    threshold.setAttribute("aria-label", `${site.name} 低余额阈值`);
-    const thresholdCell = document.createElement("td");
-    thresholdCell.append(threshold, document.createTextNode(` ${site.currency}`));
-    const status = site.last_error ? `更新失败：${site.last_error}` : !site.configured ? "尚未登录" : site.low ? "余额不足" : "正常";
-    const actions = document.createElement("td");
-    const browserLogin = document.createElement("button");
-    browserLogin.type = "button";
-    browserLogin.className = "text-button";
-    browserLogin.textContent = site.configured ? "网页重新登录" : "网页登录";
-    browserLogin.addEventListener("click", () => openBalanceBrowserLogin(site));
-    const confirmLogin = document.createElement("button");
-    confirmLogin.type = "button";
-    confirmLogin.className = "text-button";
-    confirmLogin.textContent = "验证完成";
-    confirmLogin.addEventListener("click", () => confirmBalanceBrowserLogin(site));
-    const login = document.createElement("button");
-    login.type = "button";
-    login.className = "text-button";
-    login.textContent = "账号登录";
-    login.addEventListener("click", () => openBalanceLogin(site));
-    const cookie = document.createElement("button");
-    cookie.type = "button";
-    cookie.className = "text-button";
-    cookie.textContent = "导入 Cookie";
-    cookie.addEventListener("click", () => openBalanceCookieImport(site));
-    const sync = document.createElement("button");
-    sync.type = "button";
-    sync.className = "text-button";
-    sync.textContent = "更新";
-    sync.disabled = !site.configured;
-    sync.addEventListener("click", async () => {
-      byId("balance-result").textContent = `正在更新 ${site.name}…`;
-      try { await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/sync`, { method: "POST" }); await loadBalances(); }
-      catch (error) { byId("balance-result").textContent = `${site.name} 更新失败：${error.message}`; }
-    });
-    const save = document.createElement("button");
-    save.type = "button";
-    save.className = "text-button";
-    save.textContent = "保存阈值";
-    save.addEventListener("click", async () => {
-      try {
-        await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}`, { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ low_threshold: Number(threshold.value) }) });
-        byId("balance-result").textContent = `${site.name} 阈值已保存。`;
-        await loadBalances();
-      } catch (error) { byId("balance-result").textContent = `${site.name} 阈值保存失败：${error.message}`; }
-    });
-    actions.append(browserLogin, document.createTextNode(" · "), confirmLogin, document.createTextNode(" · "), login, document.createTextNode(" · "), cookie, document.createTextNode(" · "), sync, document.createTextNode(" · "), save);
-    [site.name, formatBalance(site.last_balance, site.currency), thresholdCell, status, formatShanghaiTime(site.last_checked_at), actions].forEach((value) => row.append(value instanceof HTMLElement ? value : cell(value)));
-    body.append(row);
-  });
-  byId("webhook-state").textContent = payload.configuration.webhook_configured ? "已配置" : "未配置（仅在管理页显示余额不足）";
-}
-
-async function loadBalances() {
-  const payload = await requestJson("/admin/v1/balances");
-  renderBalances(payload);
-}
-
-function openBalanceLogin(site) {
-  state.balanceSite = site;
-  const form = byId("balance-login-form");
-  form.reset();
-  byId("balance-login-site").textContent = `${site.name} · ${site.currency} · 账号与密码仅加密存于小电脑。`;
-  byId("balance-login-editor").hidden = false;
-  form.elements.account.focus();
-}
-
-function closeBalanceLogin() {
-  byId("balance-login-editor").hidden = true;
-  state.balanceSite = null;
-}
-
-function openBalanceCookieImport(site) {
-  state.balanceSite = site;
-  const form = byId("balance-cookie-form");
-  form.reset();
-  byId("balance-cookie-site").textContent = `${site.name} · 请从你本地 Chrome 的同一站点请求中手动复制 Cookie 和 User-Agent；它们仅加密保存于小电脑，永不回显。`;
-  byId("balance-cookie-editor").hidden = false;
-  form.elements.cookie.focus();
-}
-
-function closeBalanceCookieImport() {
-  byId("balance-cookie-editor").hidden = true;
-  state.balanceSite = null;
-}
-
-async function openBalanceBrowserLogin(site) {
-  const output = byId("balance-result");
-  const popup = window.open("about:blank", "provider-browser", "popup,width=1440,height=920");
-  output.textContent = `正在打开 ${site.name} 的小电脑浏览器…`;
-  try {
-    const result = await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/browser-login`, { method: "POST" });
-    if (!popup) throw new Error("浏览器拦截了登录窗口，请允许弹出窗口后重试");
-    popup.location.assign(result.login_url);
-    output.textContent = `请在打开的远程 Chrome 中登录 ${site.name} 并完成验证码，然后回到这里点击“验证完成”。`;
-  } catch (error) {
-    if (popup) popup.close();
-    output.textContent = `${site.name} 网页登录未打开：${error.message}`;
-  }
-}
-
-async function confirmBalanceBrowserLogin(site) {
-  const output = byId("balance-result");
-  output.textContent = `正在验证 ${site.name} 的登录状态…`;
-  try {
-    await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/browser-confirm`, { method: "POST" });
-    output.textContent = `${site.name} 已登录，余额已更新。`;
-    await loadBalances();
-  } catch (error) {
-    output.textContent = `${site.name} 尚未完成网页登录：${error.message}`;
-  }
 }
 
 function sortFor(list) {
@@ -336,7 +207,7 @@ function closeCatalogEditor() {
 function renderProviders(payload) {
   state.providers = payload.providers;
   const table = byId("providers");
-  const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "cost_24h", label: `${state.qualityWindow} 费用` }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "last_test_at", label: "最后测试" }, { key: "cost_24h", label: `${state.qualityWindow} 费用` }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
   const groups = [...payload.providers.reduce((byUrl, provider) => {
     const domain = providerDomain(provider.base_url);
@@ -372,7 +243,10 @@ function renderProviders(payload) {
       });
       if (!tags.childElementCount) tags.textContent = "n/a";
       models.append(tags);
-      row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.family), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
+      const lastTest = provider.last_test_at
+        ? `${provider.last_test_ttft_ms === null || provider.last_test_ttft_ms === undefined ? displayStatus(provider.last_test_status) : formatMs(provider.last_test_ttft_ms)} · ${formatShanghaiTime(provider.last_test_at)}`
+        : "n/a";
+      row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.family), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(lastTest), cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
       const action = document.createElement("td");
       const edit = document.createElement("button");
       edit.type = "button";
@@ -555,13 +429,12 @@ async function loadCalls(cursor = state.cursor) {
 }
 
 async function load() {
-  const [summary, providers, catalog, quality, routing, balances] = await Promise.all([
+  const [summary, providers, catalog, quality, routing] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/catalog"),
     requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
-    requestJson("/admin/v1/balances"),
   ]);
   renderSummary(summary);
   renderProviders(providers);
@@ -570,7 +443,6 @@ async function load() {
   renderQuality(quality);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
-  renderBalances(balances);
   await loadCalls("");
 }
 
@@ -654,54 +526,27 @@ byId("sync").addEventListener("click", async () => {
   }
 });
 
-byId("balance-sync").addEventListener("click", async () => {
-  const output = byId("balance-result");
-  output.textContent = "正在更新已登录站点…";
+byId("test-all-keys").addEventListener("click", async (event) => {
+  const button = event.currentTarget;
+  const output = byId("syncresult");
+  button.disabled = true;
+  output.textContent = "正在测试所有 API Key 的首字返回时间…";
   try {
-    const result = await requestJson("/admin/v1/balances/sync", { method: "POST" });
-    const failed = result.results.filter((item) => !item.ok);
-    output.textContent = failed.length ? `${failed.length} 个站点更新失败。` : "所有已登录站点余额已更新。";
-    await loadBalances();
-  } catch (error) { output.textContent = `余额更新失败：${error.message}`; }
-});
-
-byId("balance-webhook").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const webhook_url = event.currentTarget.elements.webhook_url.value.trim() || null;
-  try {
-    await requestJson("/admin/v1/balances/configuration", { method: "PATCH", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ webhook_url }) });
-    event.currentTarget.reset();
-    byId("balance-result").textContent = webhook_url ? "低余额 Webhook 已保存。" : "低余额 Webhook 已关闭。";
-    await loadBalances();
-  } catch (error) { byId("balance-result").textContent = `Webhook 保存失败：${error.message}`; }
-});
-
-byId("balance-login-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const site = state.balanceSite;
-  if (!site) return;
-  byId("balance-result").textContent = `正在登录 ${site.name}…`;
-  try {
-    await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/login`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ account: form.elements.account.value, password: form.elements.password.value }) });
-    closeBalanceLogin();
-    byId("balance-result").textContent = `${site.name} 登录成功，余额已更新。`;
-    await loadBalances();
-  } catch (error) { byId("balance-result").textContent = `${site.name} 登录失败：${error.message}`; }
-});
-
-byId("balance-cookie-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const site = state.balanceSite;
-  if (!site) return;
-  byId("balance-result").textContent = `正在导入 ${site.name} 的浏览器会话…`;
-  try {
-    await requestJson(`/admin/v1/balances/${encodeURIComponent(site.id)}/cookie`, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ cookie: form.elements.cookie.value.trim(), user_agent: form.elements.user_agent.value.trim() }) });
-    closeBalanceCookieImport();
-    byId("balance-result").textContent = `${site.name} 会话已导入，余额已更新。`;
-    await loadBalances();
-  } catch (error) { byId("balance-result").textContent = `${site.name} 会话导入失败：${error.message}`; }
+    const result = await requestJson("/admin/v1/providers/test", { method: "POST" });
+    const providers = await requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`);
+    renderProviders(providers);
+    renderModelView();
+    const succeeded = result.items.filter((item) => item.state === "succeeded").length;
+    const total = result.total_keys ?? result.items.length;
+    const failed = total - succeeded;
+    output.textContent = failed
+      ? `测试完成：${succeeded} 个成功，${failed} 个失败`
+      : `测试完成：${total} 个 API Key 全部成功`;
+  } catch (error) {
+    output.textContent = `一键测试失败：${error.message}`;
+  } finally {
+    button.disabled = false;
+  }
 });
 
 byId("windows").addEventListener("click", async (event) => {
@@ -737,10 +582,6 @@ function scheduleCallsReset() {
 byId("next").addEventListener("click", () => loadCalls(byId("next").dataset.cursor));
 byId("close-editor").addEventListener("click", closeEditor);
 byId("cancel-editor").addEventListener("click", closeEditor);
-byId("close-balance-login").addEventListener("click", closeBalanceLogin);
-byId("cancel-balance-login").addEventListener("click", closeBalanceLogin);
-byId("close-balance-cookie").addEventListener("click", closeBalanceCookieImport);
-byId("cancel-balance-cookie").addEventListener("click", closeBalanceCookieImport);
 restoreControls();
 load().catch(() => { byId("syncresult").textContent = "管理数据加载失败"; });
 window.addEventListener("resize", () => requestAnimationFrame(fitMetricValues));

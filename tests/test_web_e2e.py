@@ -48,6 +48,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
         "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
         "avg_ttft_ms": 1800, "cost_24h": 0.02, "multiplier": 1.0, "max_parallel": 3,
+        "last_test_at": "2026-08-29T10:00:00Z", "last_test_ttft_ms": 180,
     }
     same_site_provider = provider | {
         "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
@@ -87,8 +88,6 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             return {"catalog": catalog}
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
-        if path == "/admin/v1/balances":
-            return {"sites": [], "configuration": {"webhook_configured": False}}
         if path.startswith("/admin/v1/quality"):
             return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
         if path.startswith("/admin/v1/calls"):
@@ -111,6 +110,10 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
                 body = request.post_data_json
                 catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"blended_price": 2.456, "available_provider_count": 0}
                 route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
+            elif path == "/admin/v1/providers/test" and request.method == "POST":
+                provider["last_test_at"] = "2026-08-29T11:00:00Z"
+                provider["last_test_ttft_ms"] = 95
+                route.fulfill(status=200, content_type="application/json", body='{"items":[{"state":"succeeded","ttft_ms":95}],"total_keys":1}')
             elif path == "/admin/v1/routing" and request.method == "PATCH":
                 route.fulfill(status=200, content_type="application/json", body='{"race_parallel_cap":2}')
             elif path == "/admin/v1/catalog/apply" and request.method == "POST":
@@ -159,6 +162,13 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#providers .model-tag").all_inner_texts() == ["nova", "luna", "luna", "luna"]
         assert "available" not in page.locator("#providers").inner_text()
         assert page.locator("#providers").get_by_role("button", name="24h 费用").count() == 1
+        assert page.locator("#providers").get_by_role("button", name="最后测试").count() == 1
+        page.get_by_text("180 ms · 2026/08/29 18:00", exact=True).first.wait_for()
+        assert page.get_by_text("中转站余额", exact=True).count() == 0
+        assert not any("/admin/v1/balances" in path for _, path, _ in seen)
+        page.get_by_role("button", name="一键测试").click()
+        page.get_by_text("测试完成：1 个 API Key 全部成功", exact=True).wait_for()
+        page.get_by_text("95 ms · 2026/08/29 19:00", exact=True).wait_for()
         page.get_by_text("$0.02", exact=True).first.wait_for()
         cell_styles = page.locator("#providers tbody td, #model-view tbody td, #catalog tbody td, #calls tbody td").evaluate_all("cells => cells.map(cell => { const style = getComputedStyle(cell); return [style.lineHeight, style.paddingBottom]; })")
         assert set(map(tuple, cell_styles)) == {("32px", "0px")}

@@ -633,14 +633,54 @@ async def test_manual_probe_is_isolated_from_call_quality_and_records_health(cli
     assert health['items'][0]['state'] == 'healthy' and health['items'][0]['ttft_ms'] is not None
 
 
+async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it(client, cpa):
+    await client.post('/admin/v1/sync')
+
+    tested = await client.post('/admin/v1/providers/test')
+    result = await tested.json()
+    assert tested.status == 200 and result['total_keys'] == len(result['items']) == 1
+    assert result['items'][0]['state'] == 'succeeded' and result['items'][0]['ttft_ms'] is not None
+
+    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    assert provider['last_test_ttft_ms'] == result['items'][0]['ttft_ms']
+    assert provider['last_test_at'] is not None
+    assert provider['last_test_status'] == 'completed'
+
+    store = client.app['store']
+    with store.conn:
+        store.conn.execute("UPDATE probe_event SET created_at='2026-01-01T00:00:00+00:00'")
+        store.conn.execute("""INSERT INTO observation(
+            fingerprint,requested_model,actual_model,tier,success,latency_ms,status,created_at
+        ) VALUES(?,?,?,?,?,?,?,?)""", (
+            provider['fingerprint'], 'gpt-5.6-luna', 'gpt-5.6-luna', 'standard', 1, 42.5,
+            'completed', '2099-01-01T00:00:00+00:00',
+        ))
+
+    refreshed = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    assert refreshed['last_test_ttft_ms'] == 42.5
+    assert refreshed['last_test_at'] == '2099-01-01T00:00:00+00:00'
+
+    store.record_probe(
+        fingerprint=provider['fingerprint'], model='gpt-5.6-luna', tier='standard', mode='all',
+        reachable=True, responded=False, first_token=False, model_matched=False,
+        ttfb_ms=None, ttft_ms=None, duration_ms=10000, error_type='first_token_timeout',
+        error='first_token_timeout', now=datetime(2100, 1, 1, tzinfo=UTC),
+    )
+    failed_latest = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
+    assert failed_latest['last_test_ttft_ms'] is None
+    assert failed_latest['last_test_status'] == 'first_token_timeout'
+    assert failed_latest['last_test_at'] == '2100-01-01T00:00:00+00:00'
+
+
 async def test_web_console_is_direct_and_management_api_needs_no_session(client):
     response=await client.get('/')
     assert response.status == 200
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('最近同步','从 CPA 手动同步','API Key','Stage视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','一键测试','API Key','Stage视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
+    assert '中转站余额' not in page
     assert 'CPA 是唯一人工维护源' not in page
     assert 'client-secret' not in page and 'admin-secret' not in page
     css=await client.get('/static/styles.css')
@@ -648,6 +688,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert css.status == 200 and css.content_type == 'text/css'
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
+    assert '最后测试' in script
     for token in ('renderQuality','renderCalls','renderModelView','sortItems','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','可路由 API','技术成功率','平均 TTFT','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200

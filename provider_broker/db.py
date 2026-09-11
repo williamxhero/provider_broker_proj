@@ -606,6 +606,26 @@ class Store:
         pricing = catalog[model]
         return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'])
 
+    def key_test_providers(self) -> list[Provider]:
+        """Return one representative model for every API key in inventory."""
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.multiplier,p.max_parallel
+            FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id""").fetchall()
+        catalog = self.catalog()
+        result = []
+        for row in rows:
+            model = next((item for item in json.loads(row['models_json']) if item in catalog), None)
+            if model is None:
+                continue
+            headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
+            pricing = catalog[model]
+            result.append(Provider(
+                row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
+                row['provider_type'], headers, [model], pricing,
+                int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']),
+                bool(row['enabled']), float(row['multiplier']), row['site_id'],
+            ))
+        return result
+
     def try_acquire(self, provider: Provider) -> bool:
         active = self._inflight.get(provider.fingerprint, 0)
         site = getattr(provider, "site_id", "default")
@@ -699,6 +719,15 @@ class Store:
                 "SELECT avg(success) rate, avg(latency_ms) ttft, sum(cost) cost FROM observation WHERE fingerprint=? AND created_at>=datetime('now',?)",
                 (row['fingerprint'], modifier),
             ).fetchone()
+            latest = self.conn.execute("""SELECT evidence_at,ttft_ms,status FROM (
+                    SELECT created_at evidence_at,latency_ms ttft_ms,status,1 source_priority
+                    FROM observation WHERE fingerprint=? AND latency_ms IS NOT NULL
+                    UNION ALL
+                    SELECT created_at evidence_at,ttft_ms,COALESCE(error_type,'completed') status,0 source_priority
+                    FROM probe_event WHERE fingerprint=?
+                ) ORDER BY julianday(evidence_at) DESC,source_priority DESC LIMIT 1""",
+                (row['fingerprint'], row['fingerprint']),
+            ).fetchone()
             api_key = self._decrypt(row['api_key'])
             inventory.append({
                 'fingerprint': row['fingerprint'], 'name': row['name'], 'base_url': row['base_url'], 'family': row['provider_type'],
@@ -707,6 +736,9 @@ class Store:
                 'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
                 'multiplier': row['multiplier'], 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],
                 'cost_24h': stats['cost'], 'tiers': json.loads(row['tiers_json']), 'synced_at': row['synced_at'],
+                'last_test_at': latest['evidence_at'] if latest else None,
+                'last_test_ttft_ms': latest['ttft_ms'] if latest else None,
+                'last_test_status': latest['status'] if latest else None,
             })
         return inventory
 

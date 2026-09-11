@@ -497,6 +497,16 @@ async def probe(request):
     return web.json_response({"items": results})
 
 
+async def test_provider_keys(request):
+    results = await run_probe(
+        request.app["store"], tier="all", mode="all",
+        timeout_ms=request.app["settings"].probe_timeout_ms,
+        concurrency=request.app["settings"].probe_concurrency,
+        clock=request.app["clock"],
+    )
+    return web.json_response({"items": results, "total_keys": len(request.app["store"].inventory())})
+
+
 def create_app(settings: Settings, *, clock=None):
     app = web.Application(middlewares=[json_contract])
     app["settings"] = settings
@@ -538,7 +548,7 @@ def create_app(settings: Settings, *, clock=None):
         web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
-        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.get("/admin/v1/summary", summary),
+        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),

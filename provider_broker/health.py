@@ -48,13 +48,15 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
                     concurrency: int = 2, contract: str = "structured", record: bool = True,
                     clock=None) -> list[dict]:
     """Probe selected inventory targets with the exact streaming transport used by routing."""
-    if tier not in ("standard", "smart", "expert") or mode not in ("race", "all"):
+    if tier not in ("standard", "smart", "expert", "all") or mode not in ("race", "all") or tier == "all" and mode != "all":
         raise ValueError("invalid probe request")
     if contract not in ("plain", "structured"):
         raise ValueError("invalid probe contract")
     now = (clock or (lambda: datetime.now(UTC)))()
     candidates = store.providers(tier) if mode == "race" else []
-    if mode == "all":
+    if tier == "all":
+        candidates = store.key_test_providers()
+    elif mode == "all":
         # A filtered manual probe must always reach its explicit target, including
         # an open circuit. Due-target preselection can otherwise select another
         # row and leave the requested target with an empty result.
@@ -64,7 +66,7 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
             rows = store.health_results(tier, fingerprint, model)
             candidates = [store.probe_provider(row["fingerprint"], row["model"]) for row in rows]
     catalog = store.catalog()
-    candidates = [candidate for candidate in candidates if candidate and catalog.get(candidate.models[0], {}).get("intellect") == tier
+    candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("intellect") == tier)
                   and (not fingerprint or candidate.fingerprint == fingerprint) and (not model or candidate.models[0] == model)]
     if mode == "race":
         bands = price_bands(candidates)
@@ -76,26 +78,28 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
 
     async def one(provider):
         requested_model = provider.models[0]
+        candidate_tier = catalog[requested_model]["intellect"]
         started = (clock or (lambda: datetime.now(UTC)))()
         result = {"fingerprint": provider.fingerprint, "provider": provider.name, "model": requested_model,
                   "state": "failed", "error_type": None, "ttfb_ms": None, "ttft_ms": None, "duration_ms": None}
+        await semaphore.acquire()
         if not store.try_acquire(provider):
+            semaphore.release()
             result["error_type"] = "capacity_reached"
             if record:
-                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=tier, mode=mode,
+                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=candidate_tier, mode=mode,
                                    reachable=False, responded=False, first_token=False, model_matched=False,
                                    ttfb_ms=None, ttft_ms=None, duration_ms=None, error_type="capacity_reached", error="capacity_reached", now=started)
             return result
         try:
-            async with semaphore:
-                output = await invoke_stream(provider, {"prompt": "只输出1", "output_token_limit": 1,
-                                                        "deadline_ms": timeout_ms, "effort": "low", "probe_contract": contract})
+            output = await invoke_stream(provider, {"prompt": "只输出1", "output_token_limit": 1,
+                                                    "deadline_ms": timeout_ms, "effort": "low", "probe_contract": contract})
             matched = model_fulfills(requested_model, output["actual_model"])
             result.update({"state": "succeeded" if matched else "failed", "ttfb_ms": output.get("ttfb_ms"),
                            "ttft_ms": output.get("latency_ms"), "duration_ms": output.get("duration_ms"),
                            "error_type": None if matched else "model_mismatch"})
             if record:
-                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=tier, mode=mode,
+                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=candidate_tier, mode=mode,
                                    reachable=True, responded=True, first_token=True, model_matched=matched,
                                    ttfb_ms=output.get("ttfb_ms"), ttft_ms=output.get("latency_ms"), duration_ms=output.get("duration_ms"),
                                    error_type=result["error_type"], error=result["error_type"], now=started)
@@ -106,13 +110,14 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
             result["error_type"] = status
             result["duration_ms"] = round(((clock or (lambda: datetime.now(UTC)))() - started).total_seconds() * 1000, 2)
             if record:
-                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=tier, mode=mode,
+                store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=candidate_tier, mode=mode,
                                    reachable=status not in {"transport_failed", "timed_out"}, responded=False, first_token=False,
                                    model_matched=False, ttfb_ms=None, ttft_ms=None, duration_ms=result["duration_ms"],
                                    error_type=status, error=status, now=started)
                 store.record_health(provider.fingerprint, requested_model, success=False, real=False, now=started)
         finally:
             store.release(provider)
+            semaphore.release()
         return result
 
     return await asyncio.gather(*(one(candidate) for candidate in candidates))
