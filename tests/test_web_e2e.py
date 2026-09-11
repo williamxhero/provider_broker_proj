@@ -47,20 +47,20 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "note": "initial note <script>window.__injected=2</script>", "enabled": True,
         "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
         "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
-        "avg_ttft_ms": 1800, "cost_24h": 0.02, "multiplier": 1.0, "max_parallel": 3,
+        "avg_ttft_ms": 1800, "cost_24h": 0.02, "total_tokens": 14, "multiplier": 1.0, "max_parallel": 3,
         "last_test_at": "2026-08-29T10:00:00Z", "last_test_ttft_ms": 180,
     }
     same_site_provider = provider | {
         "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
-        "base_url": "https://alpha.invalid/v1", "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "multiplier": 1.5,
+        "base_url": "https://alpha.invalid/v1", "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "total_tokens": 12, "multiplier": 1.5,
     }
     cheapest_provider = provider | {
         "fingerprint": "provider-c", "note": "cheapest note", "api_key_mask": "ghi***rst",
-        "base_url": "https://alpha.invalid/api", "models": ["nova"], "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "multiplier": 0.5,
+        "base_url": "https://alpha.invalid/api", "models": ["nova"], "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "total_tokens": 8, "multiplier": 0.5,
     }
     disabled_provider = provider | {
         "fingerprint": "provider-d", "note": "disabled note", "api_key_mask": "jkl***mno", "enabled": False,
-        "base_url": "https://alpha.invalid/disabled", "technical_success_rate": None, "avg_ttft_ms": None, "cost_24h": None, "multiplier": 2.0,
+        "base_url": "https://alpha.invalid/disabled", "technical_success_rate": None, "avg_ttft_ms": None, "cost_24h": None, "total_tokens": None, "multiplier": 2.0,
     }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
@@ -78,9 +78,9 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path.startswith("/admin/v1/providers"):
             if "window=7d" in path:
                 return {"providers": [
-                    provider | {"technical_success_rate": 0.7, "avg_ttft_ms": 700, "cost_24h": 0.07},
-                    same_site_provider | {"technical_success_rate": 0.6, "avg_ttft_ms": 600, "cost_24h": 0.06},
-                    cheapest_provider | {"technical_success_rate": 0.5, "avg_ttft_ms": 500, "cost_24h": 0.05},
+                    provider | {"technical_success_rate": 0.7, "avg_ttft_ms": 700, "cost_24h": 0.07, "total_tokens": 70},
+                    same_site_provider | {"technical_success_rate": 0.6, "avg_ttft_ms": 600, "cost_24h": 0.06, "total_tokens": 60},
+                    cheapest_provider | {"technical_success_rate": 0.5, "avg_ttft_ms": 500, "cost_24h": 0.05, "total_tokens": 50},
                     disabled_provider,
                 ]}
             return {"providers": [provider, same_site_provider, cheapest_provider, disabled_provider]}
@@ -156,6 +156,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("1.8 s", exact=True).first.wait_for()
         page.get_by_text("2026/08/29 18:00", exact=True).wait_for()
         assert page.locator("#providers #race-parallel-cap").count() == 0
+        assert page.locator("#providers").get_by_role("button", name="24h 总 Token 用量").count() == 1
+        assert page.locator("#providers").get_by_text("14", exact=True).count() == 1
         assert page.locator("section:has(#model-view-title) #race-parallel-cap").count() == 1
         assert "价格决定先后" not in page.content()
         assert "stage 决定路由分区" not in page.content()
@@ -219,6 +221,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_role("button", name="7d").click()
         page.get_by_text("7", exact=True).last.wait_for()
         page.locator("#providers").get_by_role("button", name="7d 费用").wait_for()
+        page.locator("#providers").get_by_role("button", name="7d 总 Token 用量").wait_for()
+        page.locator("#providers").get_by_text("70", exact=True).wait_for()
         page.get_by_text("$0.07", exact=True).wait_for()
         page.locator("#callprovider").fill("Alpha")
         page.locator("#callstatus").fill("completed")

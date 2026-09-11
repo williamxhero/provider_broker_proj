@@ -292,9 +292,11 @@ async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa)
     quality = await (await client.get('/admin/v1/quality?window=1h')).json()
 
     assert inventory[0]['cost_24h'] == .125
+    assert inventory[0]['total_tokens'] == 150
     assert inventory[0]['technical_success_rate'] == 1
     assert inventory[0]['avg_ttft_ms'] == 100
     assert seven_day_inventory[0]['cost_24h'] == .625
+    assert seven_day_inventory[0]['total_tokens'] == 300
     assert seven_day_inventory[0]['technical_success_rate'] == .5
     assert seven_day_inventory[0]['avg_ttft_ms'] == 200
     assert quality['total_cost'] == .125

@@ -716,7 +716,7 @@ class Store:
         inventory = []
         for row in rows:
             stats = self.conn.execute(
-                "SELECT avg(success) rate, avg(latency_ms) ttft, sum(cost) cost FROM observation WHERE fingerprint=? AND created_at>=datetime('now',?)",
+                "SELECT avg(success) rate, avg(latency_ms) ttft, sum(cost) cost, sum(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN input_tokens + output_tokens END) total_tokens FROM observation WHERE fingerprint=? AND created_at>=datetime('now',?)",
                 (row['fingerprint'], modifier),
             ).fetchone()
             latest = self.conn.execute("""SELECT evidence_at,ttft_ms,status FROM (
@@ -735,7 +735,7 @@ class Store:
                 'inventory_status': json.loads(row['source_json']).get('inventory_status'), 'enabled': bool(row['enabled']),
                 'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
                 'multiplier': row['multiplier'], 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],
-                'cost_24h': stats['cost'], 'tiers': json.loads(row['tiers_json']), 'synced_at': row['synced_at'],
+                'cost_24h': stats['cost'], 'total_tokens': stats['total_tokens'], 'tiers': json.loads(row['tiers_json']), 'synced_at': row['synced_at'],
                 'last_test_at': latest['evidence_at'] if latest else None,
                 'last_test_ttft_ms': latest['ttft_ms'] if latest else None,
                 'last_test_status': latest['status'] if latest else None,

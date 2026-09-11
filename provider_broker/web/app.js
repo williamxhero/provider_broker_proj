@@ -35,6 +35,9 @@ const formatMultiplier = (value) => value === null || value === undefined || !Nu
 const formatCost = (value) => value === null || value === undefined || !Number.isFinite(Number(value))
   ? "n/a"
   : new Intl.NumberFormat("en-US", { style: "currency", currency: "USD", maximumFractionDigits: 6 }).format(Number(value));
+const formatTokens = (value) => value === null || value === undefined || !Number.isFinite(Number(value))
+  ? "n/a"
+  : new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(value));
 
 function savePreferences() {
   window.localStorage.setItem(preferencesKey, JSON.stringify(preferences));
@@ -208,6 +211,7 @@ function renderProviders(payload) {
   state.providers = payload.providers;
   const table = byId("providers");
   const columns = [{ key: "base_url", label: "域名" }, { key: "enabled", label: "状态" }, { key: "note", label: "备注名" }, { key: "api_key_mask", label: "API Key" }, { key: "family", label: "Provider 类型" }, { key: "multiplier", label: "费率倍率" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "models", label: "模型库存" }, { key: "last_test_at", label: "最后测试" }, { key: "cost_24h", label: `${state.qualityWindow} 费用` }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_ttft_ms", label: "平均首字延迟" }, { label: "操作" }];
+  columns.splice(columns.length - 1, 0, { key: "total_tokens", label: `${state.qualityWindow} 总 Token 用量` });
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
   const groups = [...payload.providers.reduce((byUrl, provider) => {
     const domain = providerDomain(provider.base_url);
@@ -248,6 +252,7 @@ function renderProviders(payload) {
         : "n/a";
       row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.family), cell(formatMultiplier(provider.multiplier)), cell(provider.max_parallel), models, cell(lastTest), cell(formatCost(provider.cost_24h)), cell(formatPercent(provider.technical_success_rate)), cell(formatMs(provider.avg_ttft_ms)));
       const action = document.createElement("td");
+      row.insertBefore(cell(formatTokens(provider.total_tokens)), action);
       const edit = document.createElement("button");
       edit.type = "button";
       edit.className = "text-button";
