@@ -1,4 +1,5 @@
 import asyncio
+import inspect
 from collections import deque
 import hashlib
 import json
@@ -823,6 +824,17 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
         route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
         elapsed_ms=attempt.get("elapsed_ms"),
     )
+    role_by_queue = {
+        "primary": "primary", "hedge": "hedge", "priority_retry": "retry", "retry": "retry",
+        "repair": "repair", "open_recovery": "recovery", "exploration": "exploration",
+    }
+    if route_id and hasattr(store, "record_attempt") and attempt.get("attempt"):
+        store.record_attempt(
+            route_id, attempt_number=int(attempt["attempt"]), fingerprint=provider.fingerprint,
+            model=requested_model, site_id=getattr(provider, "site_id", None),
+            role=role_by_queue.get(diagnostic.get("queue_kind"), "retry"), status=status,
+            failure_class=failure_class, started_ms=attempt.get("started_ms"), elapsed_ms=attempt.get("elapsed_ms"),
+        )
     if hasattr(store, "record_capability") and failure_class == "contract":
         store.record_capability(provider.fingerprint, requested_model, "structured" if structured_schema(body) else "plain", "unsupported", failure_class)
     if status == "completed" and hasattr(store, "record_capability"):
@@ -926,7 +938,19 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
     route_id = str(uuid.uuid4())
     terminal_request_id = str(uuid.uuid4())
     if hasattr(store, "route_started"):
-        store.route_started(route_id, tier, terminal_request_id, body.get("effort"))
+        delivery_mode = body.get("_delivery_mode")
+        if not isinstance(delivery_mode, str):
+            delivery_mode = "validated_stream" if structured_schema(body) is not None else "non_stream"
+        store.route_started(
+            route_id, tier, terminal_request_id, body.get("effort"), body=body,
+            delivery_mode=delivery_mode, experiment_id=body.get("_experiment_id"),
+            experiment_arm=body.get("_experiment_arm"),
+        )
+    started_callback = body.get("_on_route_started")
+    if callable(started_callback):
+        callback_result = started_callback(route_id)
+        if inspect.isawaitable(callback_result):
+            await callback_result
     deadline_exceeded = False
     stream_selected_sequence = None
     first_client_delta_ms = None
@@ -979,6 +1003,12 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 diversified.append(provider)
                 used_sites.add(getattr(provider, "site_id", provider.base_url))
         ranked = diversified + deferred
+        if hasattr(store, "record_candidate"):
+            for rank, provider in enumerate(ranked, 1):
+                store.record_candidate(
+                    route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
+                    site_id=getattr(provider, "site_id", None), eligible=True, initial_rank=rank,
+                )
         primary.extend((provider, candidate_tier, None, candidate_score(provider, candidate_tier)) for provider in ranked)
         normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
 
@@ -994,6 +1024,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
             cooldown_seconds=open_recovery_cooldown_seconds,
             allow_before_due=allow_before_due,
         ):
+            if hasattr(store, "record_candidate"):
+                store.record_candidate(
+                    route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
+                    site_id=getattr(provider, "site_id", None), eligible=True, role="recovery",
+                )
             recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
     if not primary:
@@ -1037,18 +1072,26 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 if has_active_lower_tier(primary[0][1]):
                     return False
                 provider, candidate_tier, repair_note, route_score = primary.popleft()
-                queue_kind = "primary"
+                queue_kind = "primary" if attempts_started == 0 else "hedge"
             elif recovery:
                 provider, candidate_tier, repair_note, route_score = recovery.popleft()
                 queue_kind = "open_recovery"
             elif retry:
                 provider, candidate_tier, repair_note, route_score = retry.popleft()
                 queue_kind = "retry"
+            model = canonicalize(provider.models[0])
+            role = {"primary": "primary", "hedge": "hedge", "priority_retry": "retry", "retry": "retry", "repair": "repair", "open_recovery": "recovery"}[queue_kind]
             if not store.try_acquire(provider):
+                if hasattr(store, "mark_candidate"):
+                    store.mark_candidate(route_id, fingerprint=provider.fingerprint, model=model, role=role, exclusion_reason="key_capacity")
                 continue
+            if hasattr(store, "mark_candidate"):
+                store.mark_candidate(route_id, fingerprint=provider.fingerprint, model=model, role=role)
             sequence = attempts_started
             attempts_started += 1
             audit.start(sequence, provider, queue_kind=queue_kind, route_score=route_score)
+            if hasattr(store, "route_milestone"):
+                store.route_milestone(route_id, first_attempt_ms=audit.row(sequence)["started_ms"])
 
             async def run(selected=provider, selected_repair_note=repair_note, selected_sequence=sequence):
                 try:
@@ -1062,6 +1105,8 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                             if stream_selected_sequence is None:
                                 stream_selected_sequence = selected_sequence
                                 first_client_delta_ms = round((time.monotonic() - route_started) * 1000, 2)
+                                if hasattr(store, "route_milestone"):
+                                    store.route_milestone(route_id, first_forwarded_delta_ms=first_client_delta_ms)
                             if stream_selected_sequence == selected_sequence:
                                 await downstream(text)
                         selected_body = {**selected_body, "_on_delta": forward_delta}
@@ -1176,23 +1221,25 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     fulfilled_tier = actual_tier if actual_tier and INTELLECT_RANK[actual_tier] > INTELLECT_RANK[candidate_tier] else candidate_tier
                     winner = (output, provider, fulfilled_tier)
 
-            if winner is not None:
-                output, provider, candidate_tier = winner
-                await cancel_active("cancelled")
-                logger.info(
-                    "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
-                    route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
-                )
-                if hasattr(store, "route_finished"):
-                    store.route_finished(route_id, outcome="completed", first_delta_ms=first_client_delta_ms,
-                                         completed_ms=round((time.monotonic() - route_started) * 1000, 2),
-                                         selected_fingerprint=provider.fingerprint, selected_model=output.get("actual_model"),
-                                         selected_site_id=getattr(provider, "site_id", None))
-                return output | {
-                    "provider": provider.name, "attempts": audit.public(),
-                    "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
-                    "route_id": route_id,
-                }
+                if winner is not None:
+                    output, provider, candidate_tier = winner
+                    await cancel_active("cancelled")
+                    logger.info(
+                        "route_completed route_id=%s elapsed_ms=%.2f attempts=%d provider=%s",
+                        route_id, (time.monotonic() - route_started) * 1000, len(audit.rows), provider.name,
+                    )
+                    if hasattr(store, "route_milestone") and structured_schema(body) is not None:
+                        store.route_milestone(route_id, validation_completed_ms=round((time.monotonic() - route_started) * 1000, 2))
+                    if hasattr(store, "route_finished"):
+                        store.route_finished(route_id, outcome="completed", first_delta_ms=first_client_delta_ms,
+                                             completed_ms=round((time.monotonic() - route_started) * 1000, 2),
+                                             selected_fingerprint=provider.fingerprint, selected_model=output.get("actual_model"),
+                                             selected_site_id=getattr(provider, "site_id", None))
+                    return output | {
+                        "provider": provider.name, "attempts": audit.public(),
+                        "fulfilled_intellect": candidate_tier, "fingerprint": provider.fingerprint,
+                        "route_id": route_id,
+                    }
 
             while len(active) < cap and attempts_started < attempt_budget and (repair or priority_retry or primary or recovery or retry):
                 if not launch_one():

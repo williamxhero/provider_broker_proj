@@ -381,7 +381,19 @@ function fitMetricValues() {
 
 function renderQuality(payload) {
   const failures = payload.failures || {};
+  const requestMetrics = Object.hasOwn(payload, "request_success_denominator") ? [
+    metric("\u8bf7\u6c42\u6210\u529f\u7387", formatPercent(payload.request_success_rate)),
+    metric("\u5df2\u77e5\u8bf7\u6c42\u6837\u672c", `${payload.request_success_numerator}/${payload.request_success_denominator}`),
+    metric("\u9065\u6d4b\u8986\u76d6\u7387", formatPercent(payload.request_coverage)),
+  ] : [];
+  const amplification = payload.amplification ? [
+    metric("attempt P95", payload.amplification.attempts_p95),
+    metric("hedge rescue", `${payload.amplification.hedge_rescue_numerator}/${payload.amplification.hedge_rescue_denominator}`),
+    metric("cost coverage", formatPercent(payload.amplification.cost_coverage)),
+  ] : [];
   byId("quality").replaceChildren(
+    ...requestMetrics,
+    ...amplification,
     metric("可路由 API", state.summary.routable_apis),
     metric("技术成功率", formatPercent(payload.technical_success_rate)),
     metric("平均 TTFT", formatMs(payload.avg_ttft_ms)),
@@ -433,6 +445,49 @@ async function loadCalls(cursor = state.cursor) {
   if (requestNumber === state.callsRequest) renderCalls(payload);
 }
 
+function renderRoutes(payload) {
+  const table = byId("routes");
+  const columns = [{ label: "time" }, { label: "outcome" }, { label: "mode" }, { label: "model" }, { label: "site" }, { label: "detail" }];
+  const body = tableHead(table, columns, "routes", () => renderRoutes(payload));
+  payload.items.forEach((item) => {
+    const row = document.createElement("tr");
+    [formatShanghaiTime(item.started_at), displayStatus(item.outcome), item.delivery_mode, item.selected_model, item.selected_site_id].forEach((value) => row.append(cell(value)));
+    const detail = document.createElement("button");
+    detail.type = "button"; detail.className = "text-button"; detail.textContent = "view";
+    detail.addEventListener("click", async () => {
+      const audit = await requestJson(`/admin/v1/routes/${encodeURIComponent(item.route_id)}`);
+      byId("route-detail").textContent = JSON.stringify(audit, null, 2);
+    });
+    const action = document.createElement("td"); action.append(detail); row.append(action); body.append(row);
+  });
+}
+
+async function loadRoutes() {
+  renderRoutes(await requestJson(`/admin/v1/routes?window=${encodeURIComponent(state.qualityWindow)}&limit=25`));
+}
+
+async function loadDataHealth() {
+  const health = await requestJson("/admin/v1/data-health");
+  byId("telemetry-health").textContent = health.in_progress || health.reconciled_unknown || health.legacy_records
+    ? `telemetry warning: in-progress=${health.in_progress}, reconciled-unknown=${health.reconciled_unknown}, legacy=${health.legacy_records}`
+    : "telemetry coverage is complete for collected routes";
+}
+
+function renderAnalytics(payload) {
+  const table = byId("analytics");
+  const body = tableHead(table, [{ label: "cohort" }, { label: "request success" }, { label: "sample" }, { label: "95% CI" }, { label: "status" }], "analytics", () => renderAnalytics(payload));
+  payload.groups.forEach((group) => {
+    const interval = group.confidence_interval_95 ? group.confidence_interval_95.map(formatPercent).join(" - ") : "n/a";
+    const row = document.createElement("tr");
+    [group.group, formatPercent(group.success_rate), group.success_denominator, interval, group.insufficient ? "insufficient" : "ready"].forEach((value) => row.append(cell(value)));
+    body.append(row);
+  });
+}
+
+async function loadAnalytics() {
+  renderAnalytics(await requestJson(`/admin/v1/analytics?window=${encodeURIComponent(state.qualityWindow)}&group_by=site`));
+}
+
 async function load() {
   const [summary, providers, catalog, quality, routing] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
@@ -449,6 +504,9 @@ async function load() {
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
   await loadCalls("");
+  await loadRoutes();
+  await loadDataHealth();
+  await loadAnalytics();
 }
 
 byId("policy").addEventListener("submit", async (event) => {

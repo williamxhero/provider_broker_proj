@@ -2,6 +2,7 @@ import hashlib
 import hmac
 import json
 import sqlite3
+from importlib.metadata import PackageNotFoundError, version
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
@@ -9,6 +10,45 @@ from pathlib import Path
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .catalog import blended_price
+
+
+TELEMETRY_SCHEMA_VERSION = 1
+ROUTING_POLICY_VERSION = "v1"
+DELIVERY_MODES = {"non_stream", "plain_stream", "validated_stream"}
+
+
+def broker_release_version() -> str:
+    """Return an installed release when packaged, with a stable source fallback."""
+    try:
+        return version("provider-broker")
+    except PackageNotFoundError:
+        return "0.2.0-dev"
+
+
+def _bucket(value: object, bounds: tuple[tuple[int, str], ...], unknown: str = "unknown") -> str:
+    if not isinstance(value, (int, float)) or value < 0:
+        return unknown
+    for maximum, label in bounds:
+        if value <= maximum:
+            return label
+    return bounds[-1][1]
+
+
+def request_shape(body: dict | None) -> dict[str, str]:
+    """Return only bounded cohorts.  Request content never leaves this function."""
+    body = body or {}
+    prompt = body.get("prompt")
+    length = len(prompt) if isinstance(prompt, str) else None
+    schema = body.get("output_schema")
+    schema_family = schema.get("type", "unknown") if isinstance(schema, dict) else "none"
+    if not isinstance(schema_family, str) or len(schema_family) > 32:
+        schema_family = "unknown"
+    return {
+        "input_bucket": _bucket(length, ((0, "empty"), (256, "1-256"), (2048, "257-2048"), (8192, "2049-8192"), (10**12, "8193+"))),
+        "output_budget_bucket": _bucket(body.get("output_token_limit"), ((0, "0"), (256, "1-256"), (1024, "257-1024"), (4096, "1025-4096"), (10**12, "4097+"))),
+        "deadline_bucket": _bucket(body.get("deadline_ms"), ((999, "under-1s"), (4999, "1s-5s"), (29999, "5s-30s"), (119999, "30s-120s"), (10**12, "120s+"))),
+        "schema_family": schema_family,
+    }
 
 
 @dataclass(frozen=True)
@@ -96,9 +136,52 @@ class Store:
           route_id TEXT PRIMARY KEY, tier TEXT NOT NULL, effort TEXT, request_id TEXT NOT NULL,
           started_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, completed_at TEXT,
           outcome TEXT, first_delta_ms REAL, completed_ms REAL, selected_fingerprint TEXT,
-          selected_model TEXT, selected_site_id TEXT, terminal_reason TEXT
+          selected_model TEXT, selected_site_id TEXT, terminal_reason TEXT,
+          telemetry_version INTEGER, delivery_mode TEXT, release_version TEXT,
+          routing_policy_version TEXT, configuration_fingerprint TEXT,
+          shape_version INTEGER, input_bucket TEXT, output_budget_bucket TEXT,
+          deadline_bucket TEXT, schema_family TEXT, experiment_id TEXT, experiment_arm TEXT,
+          first_attempt_ms REAL, capacity_wait_ms REAL, first_response_header_ms REAL,
+          first_text_ms REAL, validation_completed_ms REAL
         );
         CREATE INDEX IF NOT EXISTS route_run_started ON route_run(started_at DESC);
+        CREATE TABLE IF NOT EXISTS route_candidate (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), ordinal INTEGER NOT NULL,
+          fingerprint TEXT, model TEXT, site_id TEXT, eligible INTEGER NOT NULL,
+          exclusion_reason TEXT, initial_rank INTEGER, launched INTEGER NOT NULL DEFAULT 0,
+          role TEXT, PRIMARY KEY(route_id, ordinal)
+        );
+        CREATE INDEX IF NOT EXISTS route_candidate_route ON route_candidate(route_id, ordinal);
+        CREATE TABLE IF NOT EXISTS route_attempt (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), attempt_number INTEGER NOT NULL,
+          fingerprint TEXT, model TEXT, site_id TEXT, role TEXT NOT NULL, status TEXT,
+          failure_class TEXT, started_ms REAL, elapsed_ms REAL, PRIMARY KEY(route_id, attempt_number)
+        );
+        CREATE INDEX IF NOT EXISTS route_attempt_route ON route_attempt(route_id, attempt_number);
+        CREATE TABLE IF NOT EXISTS configuration_event (
+          id INTEGER PRIMARY KEY, setting TEXT NOT NULL, before_value TEXT, after_value TEXT NOT NULL,
+          source TEXT NOT NULL, created_at TEXT NOT NULL
+        );
+        CREATE INDEX IF NOT EXISTS configuration_event_time ON configuration_event(created_at DESC);
+        CREATE TABLE IF NOT EXISTS client_telemetry (
+          route_id TEXT NOT NULL REFERENCES route_run(route_id), metric_type TEXT NOT NULL,
+          elapsed_ms REAL NOT NULL, client_family TEXT NOT NULL, client_version TEXT NOT NULL,
+          telemetry_version INTEGER NOT NULL, received_at TEXT NOT NULL,
+          PRIMARY KEY(route_id, metric_type, client_family, client_version)
+        );
+        CREATE TABLE IF NOT EXISTS route_rollup (
+          granularity TEXT NOT NULL, bucket_start TEXT NOT NULL, telemetry_version INTEGER NOT NULL,
+          route_count INTEGER NOT NULL, completed_count INTEGER NOT NULL, known_count INTEGER NOT NULL,
+          payload_json TEXT NOT NULL, built_at TEXT NOT NULL,
+          PRIMARY KEY(granularity, bucket_start, telemetry_version)
+        );
+        CREATE TABLE IF NOT EXISTS telemetry_maintenance (
+          name TEXT PRIMARY KEY, value TEXT NOT NULL, updated_at TEXT NOT NULL
+        );
+        CREATE TABLE IF NOT EXISTS alert_state (
+          rule_name TEXT PRIMARY KEY, status TEXT NOT NULL, last_evaluated_at TEXT,
+          last_triggered_at TEXT, detail_json TEXT NOT NULL DEFAULT '{}'
+        );
         CREATE TABLE IF NOT EXISTS site_policy (
           site_id TEXT PRIMARY KEY, max_parallel INTEGER NOT NULL DEFAULT 8,
           enabled INTEGER NOT NULL DEFAULT 1, note TEXT NOT NULL DEFAULT ''
@@ -146,6 +229,18 @@ class Store:
             self.conn.execute("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", (site,))
         try: self.conn.execute('ALTER TABLE provider_health ADD COLUMN last_route_recovery_at TEXT')
         except sqlite3.OperationalError: pass
+        for name, definition in [
+            ("telemetry_version", "INTEGER"), ("delivery_mode", "TEXT"), ("release_version", "TEXT"),
+            ("routing_policy_version", "TEXT"), ("configuration_fingerprint", "TEXT"),
+            ("shape_version", "INTEGER"), ("input_bucket", "TEXT"), ("output_budget_bucket", "TEXT"),
+            ("deadline_bucket", "TEXT"), ("schema_family", "TEXT"), ("experiment_id", "TEXT"),
+            ("experiment_arm", "TEXT"), ("first_attempt_ms", "REAL"), ("capacity_wait_ms", "REAL"),
+            ("first_response_header_ms", "REAL"), ("first_text_ms", "REAL"), ("validation_completed_ms", "REAL"),
+        ]:
+            try: self.conn.execute(f"ALTER TABLE route_run ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError: pass
+        self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_telemetry_window ON route_run(telemetry_version, started_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_delivery_window ON route_run(delivery_mode, started_at DESC)")
         if not catalog_exists:
             from .catalog import CATALOG
             self.conn.executemany(
@@ -172,7 +267,8 @@ class Store:
         if not value:
             return None
         try:
-            return datetime.fromisoformat(value.replace("Z", "+00:00"))
+            parsed = datetime.fromisoformat(value.replace("Z", "+00:00"))
+            return parsed.replace(tzinfo=UTC) if parsed.tzinfo is None else parsed
         except ValueError:
             return None
 
@@ -350,9 +446,64 @@ class Store:
             ))
         return True
 
-    def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None) -> None:
+    def routing_context(self) -> dict[str, str]:
+        values = {
+            "race_parallel_cap": self.race_parallel_cap(),
+            "hedge_delay_ms": self.hedge_delay_ms(),
+            "global_parallel_cap": self.global_parallel_cap(),
+        }
+        encoded = json.dumps(values, sort_keys=True, separators=(",", ":")).encode()
+        return {
+            "release_version": broker_release_version(),
+            "routing_policy_version": ROUTING_POLICY_VERSION,
+            "configuration_fingerprint": hashlib.sha256(encoded).hexdigest()[:16],
+        }
+
+    def record_configuration_change(self, setting: str, before: object, after: object, *, source: str = "admin") -> None:
+        safe_settings = {"race_parallel_cap", "hedge_delay_ms", "global_parallel_cap", "site_policy"}
+        if setting not in safe_settings or before == after:
+            return
         with self.conn:
-            self.conn.execute("INSERT INTO route_run(route_id,tier,effort,request_id) VALUES(?,?,?,?)", (route_id, tier, effort, request_id))
+            self.conn.execute("INSERT INTO configuration_event(setting,before_value,after_value,source,created_at) VALUES(?,?,?,?,?)",
+                (setting, json.dumps(before, sort_keys=True), json.dumps(after, sort_keys=True), source[:32], self._timestamp()))
+
+    def configuration_events(self, limit: int = 100) -> list[dict]:
+        return [dict(row) for row in self.conn.execute("SELECT setting,before_value,after_value,source,created_at FROM configuration_event ORDER BY id DESC LIMIT ?", (limit,))]
+
+    def record_client_telemetry(self, *, route_id: str, metric_type: str, elapsed_ms: float,
+                                client_family: str, client_version: str, telemetry_version: int) -> bool:
+        if metric_type != "client_first_delta" or not 0 <= elapsed_ms <= 3_600_000 or not client_family or not client_version:
+            raise ValueError("invalid telemetry")
+        route = self.conn.execute("SELECT delivery_mode,outcome,started_at,completed_ms FROM route_run WHERE route_id=?", (route_id,)).fetchone()
+        started = self._parse_timestamp(route["started_at"]) if route else None
+        too_old = started is None or started < datetime.now(UTC) - timedelta(hours=24)
+        impossible = route and route["completed_ms"] is not None and elapsed_ms > float(route["completed_ms"]) + 60_000
+        if route is None or route["delivery_mode"] != "plain_stream" or route["outcome"] not in (None, "completed") or too_old or impossible or telemetry_version != TELEMETRY_SCHEMA_VERSION:
+            raise LookupError("unknown or ineligible route")
+        with self.conn:
+            inserted = self.conn.execute("""INSERT OR IGNORE INTO client_telemetry(route_id,metric_type,elapsed_ms,
+                client_family,client_version,telemetry_version,received_at) VALUES(?,?,?,?,?,?,?)""",
+                (route_id, metric_type, elapsed_ms, client_family[:64], client_version[:64], telemetry_version, self._timestamp())).rowcount
+        return bool(inserted)
+
+    def route_started(self, route_id: str, tier: str, request_id: str, effort: str | None = None,
+                      *, body: dict | None = None, delivery_mode: str = "non_stream",
+                      experiment_id: str | None = None, experiment_arm: str | None = None) -> None:
+        if delivery_mode not in DELIVERY_MODES:
+            delivery_mode = "non_stream"
+        shape = request_shape(body)
+        context = self.routing_context()
+        with self.conn:
+            self.conn.execute("""INSERT INTO route_run(
+                route_id,tier,effort,request_id,telemetry_version,delivery_mode,release_version,
+                routing_policy_version,configuration_fingerprint,shape_version,input_bucket,
+                output_budget_bucket,deadline_bucket,schema_family,experiment_id,experiment_arm
+            ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) ON CONFLICT(route_id) DO NOTHING""", (
+                route_id, tier, effort, request_id, TELEMETRY_SCHEMA_VERSION, delivery_mode,
+                context["release_version"], context["routing_policy_version"], context["configuration_fingerprint"],
+                TELEMETRY_SCHEMA_VERSION, shape["input_bucket"], shape["output_budget_bucket"],
+                shape["deadline_bucket"], shape["schema_family"], experiment_id, experiment_arm,
+            ))
 
     def route_finished(self, route_id: str, *, outcome: str, first_delta_ms: float | None = None,
                        completed_ms: float | None = None, selected_fingerprint: str | None = None,
@@ -360,10 +511,241 @@ class Store:
                        terminal_reason: str | None = None) -> None:
         with self.conn:
             self.conn.execute("""UPDATE route_run SET completed_at=?,outcome=?,first_delta_ms=?,completed_ms=?,
-                selected_fingerprint=?,selected_model=?,selected_site_id=?,terminal_reason=? WHERE route_id=?""", (
+                selected_fingerprint=?,selected_model=?,selected_site_id=?,terminal_reason=? WHERE route_id=? AND outcome IS NULL""", (
                 self._timestamp(), outcome, first_delta_ms, completed_ms, selected_fingerprint,
                 selected_model, selected_site_id, terminal_reason, route_id,
             ))
+
+    def route_milestone(self, route_id: str, **milestones: float | None) -> None:
+        allowed = {"first_attempt_ms", "capacity_wait_ms", "first_response_header_ms", "first_text_ms",
+                   "validation_completed_ms", "first_forwarded_delta_ms"}
+        values = {key: value for key, value in milestones.items() if key in allowed and value is not None}
+        if not values:
+            return
+        if "first_forwarded_delta_ms" in values:
+            values["first_delta_ms"] = values.pop("first_forwarded_delta_ms")
+        assignments = ",".join(f"{key}=coalesce({key},?)" for key in values)
+        with self.conn:
+            self.conn.execute(f"UPDATE route_run SET {assignments} WHERE route_id=?", [*values.values(), route_id])
+
+    def record_candidate(self, route_id: str, *, fingerprint: str | None, model: str | None,
+                         site_id: str | None, eligible: bool, initial_rank: int | None = None,
+                         exclusion_reason: str | None = None, launched: bool = False,
+                         role: str | None = None) -> None:
+        reasons = {"policy_disabled", "inventory_mismatch", "capability_unsupported", "health_open",
+                   "route_blocked", "site_disabled", "key_capacity", "site_capacity", "global_capacity",
+                   "deadline_budget"}
+        if exclusion_reason not in reasons:
+            exclusion_reason = None if eligible else "inventory_mismatch"
+        ordinal = self.conn.execute("SELECT coalesce(max(ordinal), -1)+1 FROM route_candidate WHERE route_id=?", (route_id,)).fetchone()[0]
+        with self.conn:
+            self.conn.execute("""INSERT INTO route_candidate(route_id,ordinal,fingerprint,model,site_id,eligible,
+                exclusion_reason,initial_rank,launched,role) VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                route_id, ordinal, fingerprint, model, site_id, int(eligible), exclusion_reason,
+                initial_rank, int(launched), role,
+            ))
+
+    def record_attempt(self, route_id: str, *, attempt_number: int, fingerprint: str | None,
+                       model: str | None, site_id: str | None, role: str, status: str | None,
+                       failure_class: str | None = None, started_ms: float | None = None,
+                       elapsed_ms: float | None = None) -> None:
+        if role not in {"primary", "hedge", "retry", "repair", "exploration", "recovery"}:
+            role = "retry"
+        with self.conn:
+            self.conn.execute("""INSERT INTO route_attempt(route_id,attempt_number,fingerprint,model,site_id,role,
+                status,failure_class,started_ms,elapsed_ms) VALUES(?,?,?,?,?,?,?,?,?,?)
+                ON CONFLICT(route_id,attempt_number) DO UPDATE SET status=excluded.status,
+                failure_class=excluded.failure_class,elapsed_ms=excluded.elapsed_ms""", (
+                route_id, attempt_number, fingerprint, model, site_id, role, status, failure_class,
+                started_ms, elapsed_ms,
+            ))
+
+    def mark_candidate(self, route_id: str, *, fingerprint: str, model: str, role: str,
+                       exclusion_reason: str | None = None) -> None:
+        with self.conn:
+            self.conn.execute("""UPDATE route_candidate SET launched=?,role=?,exclusion_reason=?
+                WHERE route_id=? AND ordinal=(SELECT ordinal FROM route_candidate WHERE route_id=?
+                AND fingerprint=? AND model=? AND launched=0 ORDER BY ordinal LIMIT 1)""", (
+                int(exclusion_reason is None), role, exclusion_reason, route_id, route_id, fingerprint, model,
+            ))
+
+    def reconcile_open_routes(self, *, grace_seconds: int = 300, now: datetime | None = None) -> int:
+        cutoff = self._timestamp((now or datetime.now(UTC)) - timedelta(seconds=max(0, grace_seconds)))
+        with self.conn:
+            return self.conn.execute("""UPDATE route_run SET outcome='unknown', completed_at=?,
+                terminal_reason='reconciled_after_restart' WHERE outcome IS NULL AND started_at<?""",
+                (self._timestamp(now), cutoff)).rowcount
+
+    def data_health(self) -> dict[str, int]:
+        row = self.conn.execute("""SELECT
+            sum(outcome IS NULL) in_progress,
+            sum(outcome='unknown' AND terminal_reason='reconciled_after_restart') reconciled_unknown,
+            sum(telemetry_version IS NULL) legacy_records,
+            sum(outcome='unknown') unknown
+            FROM route_run""").fetchone()
+        maintenance = {item["name"]: item["value"] for item in self.conn.execute("SELECT name,value FROM telemetry_maintenance")}
+        return {name: int(row[name] or 0) for name in ("in_progress", "reconciled_unknown", "legacy_records", "unknown")} | {
+            "collection_errors": 0, "latest_rollup_at": maintenance.get("latest_rollup_at"),
+            "rollup_watermark": maintenance.get("rollup_watermark"), "retention_watermark": maintenance.get("retention_watermark"),
+        }
+
+    def run_rollups(self, *, now: datetime | None = None) -> dict[str, int | str | None]:
+        now = now or datetime.now(UTC)
+        cutoff = self._timestamp(now.replace(minute=0, second=0, microsecond=0) - timedelta(hours=1))
+        rows = self.conn.execute("""SELECT strftime('%Y-%m-%dT%H:00:00Z', started_at) bucket,
+            telemetry_version,count(*) routes,sum(outcome='completed') completed,
+            sum(outcome IN ('completed','failed','timed_out')) known FROM route_run
+            WHERE started_at<? GROUP BY bucket,telemetry_version""", (cutoff,)).fetchall()
+        built = 0
+        with self.conn:
+            for row in rows:
+                payload = {"success_rate": row["completed"] / row["known"] if row["known"] else None,
+                           "unknown": int(row["routes"] or 0) - int(row["known"] or 0)}
+                self.conn.execute("""INSERT INTO route_rollup(granularity,bucket_start,telemetry_version,route_count,
+                    completed_count,known_count,payload_json,built_at) VALUES('hour',?,?,?,?,?,?,?)
+                    ON CONFLICT(granularity,bucket_start,telemetry_version) DO UPDATE SET route_count=excluded.route_count,
+                    completed_count=excluded.completed_count,known_count=excluded.known_count,payload_json=excluded.payload_json,built_at=excluded.built_at""",
+                    (row["bucket"], row["telemetry_version"] or 0, row["routes"], row["completed"] or 0,
+                     row["known"] or 0, json.dumps(payload, sort_keys=True), self._timestamp(now)))
+                built += 1
+            stamp = self._timestamp(now)
+            for name, value in (("latest_rollup_at", stamp), ("rollup_watermark", cutoff)):
+                self.conn.execute("INSERT INTO telemetry_maintenance(name,value,updated_at) VALUES(?,?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (name, value, stamp))
+        return {"built": built, "watermark": cutoff}
+
+    def apply_retention(self, *, raw_days: int = 90, batch_size: int = 500, now: datetime | None = None) -> int:
+        now = now or datetime.now(UTC)
+        raw_days = min(365, max(7, int(raw_days)))
+        cutoff = self._timestamp(now - timedelta(days=raw_days))
+        watermark = self.conn.execute("SELECT value FROM telemetry_maintenance WHERE name='rollup_watermark'").fetchone()
+        if watermark is None:
+            return 0
+        safe_before = min(cutoff, watermark[0])
+        with self.conn:
+            route_ids = [row[0] for row in self.conn.execute("SELECT route_id FROM route_run WHERE started_at<? LIMIT ?", (safe_before, max(1, batch_size))).fetchall()]
+            if not route_ids:
+                return 0
+            marks = ",".join("?" for _ in route_ids)
+            self.conn.execute(f"DELETE FROM route_candidate WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM route_attempt WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM client_telemetry WHERE route_id IN ({marks})", route_ids)
+            self.conn.execute(f"DELETE FROM observation WHERE route_id IN ({marks})", route_ids)
+            deleted = self.conn.execute(f"DELETE FROM route_run WHERE route_id IN ({marks})", route_ids).rowcount
+            self.conn.execute("INSERT INTO telemetry_maintenance(name,value,updated_at) VALUES('retention_watermark',?,?) ON CONFLICT(name) DO UPDATE SET value=excluded.value,updated_at=excluded.updated_at", (safe_before, self._timestamp(now)))
+        return deleted
+
+    def rollup_status(self) -> dict:
+        return self.data_health() | {"hourly_count": self.conn.execute("SELECT count(*) FROM route_rollup WHERE granularity='hour'").fetchone()[0]}
+
+    def routes(self, *, window: str = "24h", limit: int = 50, cursor: str | None = None) -> list[dict]:
+        modifier = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}[window]
+        clauses, params = ["started_at >= datetime('now', ? )"], [modifier]
+        if cursor:
+            clauses.append("rowid < ?")
+            params.append(int(cursor))
+        rows = self.conn.execute("SELECT rowid,* FROM route_run WHERE " + " AND ".join(clauses) +
+            " ORDER BY rowid DESC LIMIT ?", [*params, limit]).fetchall()
+        return [{
+            "cursor": row["rowid"], "route_id": row["route_id"], "started_at": row["started_at"],
+            "outcome": row["outcome"], "delivery_mode": row["delivery_mode"], "tier": row["tier"],
+            "selected_model": row["selected_model"], "selected_site_id": row["selected_site_id"],
+            "terminal_reason": row["terminal_reason"], "telemetry_version": row["telemetry_version"],
+        } for row in rows]
+
+    def analytics(self, *, window: str = "24h", group_by: str | None = None,
+                  filters: dict[str, str] | None = None) -> dict:
+        columns = {
+            "provider": "selected_fingerprint", "site": "selected_site_id", "actual_model": "selected_model",
+            "intellect": "tier", "effort": "effort", "delivery_mode": "delivery_mode",
+            "outcome": "outcome", "release_version": "release_version", "policy_version": "routing_policy_version",
+            "configuration": "configuration_fingerprint", "experiment_arm": "experiment_arm", "input_bucket": "input_bucket",
+            "output_budget_bucket": "output_budget_bucket", "deadline_bucket": "deadline_bucket", "schema_family": "schema_family",
+        }
+        if group_by and group_by not in columns:
+            raise ValueError("invalid group")
+        filters = filters or {}
+        if any(key not in columns for key in filters):
+            raise ValueError("invalid filter")
+        modifier = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}[window]
+        clauses, params = ["started_at >= datetime('now', ?)"], [modifier]
+        for key, value in filters.items():
+            clauses.append(f"{columns[key]}=?")
+            params.append(value)
+        field = columns.get(group_by or "", "'all'")
+        rows = self.conn.execute(f"""SELECT {field} group_value, count(*) sample_count,
+            sum(outcome='completed') successes, sum(outcome IN ('completed','failed','timed_out')) known,
+            sum(outcome='unknown') unknown, sum(outcome IS NULL) in_progress,
+            avg(completed_ms) completion_mean_ms FROM route_run WHERE {' AND '.join(clauses)}
+            GROUP BY {field} ORDER BY sample_count DESC""", params).fetchall()
+        groups = []
+        for row in rows:
+            known = int(row["known"] or 0)
+            success = int(row["successes"] or 0)
+            # Wilson 95% interval, defined even for an empty denominator as unavailable.
+            if known:
+                z2, center = 1.96 ** 2, success / known
+                delta = 1.96 * ((center * (1 - center) / known + z2 / (4 * known ** 2)) ** .5)
+                denominator = 1 + z2 / known
+                interval = [max(0, (center + z2 / (2 * known) - delta) / denominator), min(1, (center + z2 / (2 * known) + delta) / denominator)]
+            else:
+                interval = None
+            groups.append({
+                "group": row["group_value"] if row["group_value"] is not None else "unknown",
+                "sample_count": int(row["sample_count"]), "success_numerator": success,
+                "success_denominator": known, "success_rate": success / known if known else None,
+                "confidence_interval_95": interval, "unknown_count": int(row["unknown"] or 0),
+                "in_progress_count": int(row["in_progress"] or 0), "completion_mean_ms": row["completion_mean_ms"],
+                "insufficient": known < 200,
+            })
+        return {"metric_version": TELEMETRY_SCHEMA_VERSION, "window": window, "group_by": group_by,
+                "filters": filters, "minimum_sample": 200, "groups": groups}
+
+    def route_detail(self, route_id: str) -> dict | None:
+        row = self.conn.execute("SELECT * FROM route_run WHERE route_id=?", (route_id,)).fetchone()
+        if row is None:
+            return None
+        allowed = (
+            "route_id", "tier", "effort", "started_at", "completed_at", "outcome", "first_delta_ms",
+            "completed_ms", "selected_fingerprint", "selected_model", "selected_site_id", "terminal_reason",
+            "telemetry_version", "delivery_mode", "release_version", "routing_policy_version",
+            "configuration_fingerprint", "shape_version", "input_bucket", "output_budget_bucket",
+            "deadline_bucket", "schema_family", "experiment_id", "experiment_arm",
+        )
+        detail = {name: row[name] for name in allowed}
+        detail["candidates"] = [dict(candidate) for candidate in self.conn.execute("""SELECT fingerprint,model,site_id,
+            eligible,exclusion_reason,initial_rank,launched,role FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
+        detail["attempts"] = [dict(attempt) for attempt in self.conn.execute("""SELECT attempt_number,fingerprint,model,
+            site_id,role,status,failure_class,started_ms,elapsed_ms FROM route_attempt WHERE route_id=? ORDER BY attempt_number""", (route_id,))]
+        detail["client_telemetry"] = [dict(item) for item in self.conn.execute("""SELECT metric_type,elapsed_ms,
+            client_family,client_version,telemetry_version,received_at FROM client_telemetry WHERE route_id=?""", (route_id,))]
+        detail["amplification"] = self.route_amplification(route_id, detail["attempts"])
+        return detail
+
+    def route_amplification(self, route_id: str, attempts: list[dict] | None = None) -> dict:
+        attempts = attempts if attempts is not None else [dict(row) for row in self.conn.execute(
+            "SELECT * FROM route_attempt WHERE route_id=? ORDER BY attempt_number", (route_id,))]
+        usage = self.conn.execute("""SELECT fingerprint,status,input_tokens,output_tokens,cost FROM observation
+            WHERE route_id=? AND attempt_number IS NOT NULL AND attempt_number>0""", (route_id,)).fetchall()
+        known_costs = [row["cost"] for row in usage if row["cost"] is not None]
+        known_tokens = [int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in usage
+                        if row["input_tokens"] is not None and row["output_tokens"] is not None]
+        winner = next((row for row in usage if row["status"] == "completed"), None)
+        roles = {role: sum(item.get("role") == role for item in attempts) for role in ("primary", "hedge", "retry", "repair", "exploration", "recovery")}
+        hedge_winner = any(item.get("role") == "hedge" and item.get("status") == "completed" for item in attempts)
+        primary_delivered = any(item.get("role") == "primary" and item.get("status") == "completed" for item in attempts)
+        return {
+            "attempts_started": len(attempts), "attempts_completed": sum(item.get("status") == "completed" for item in attempts),
+            "attempts_cancelled": sum(item.get("status") == "cancelled" for item in attempts), "roles": roles,
+            "distinct_sites": len({item.get("site_id") for item in attempts if item.get("site_id")}),
+            "total_elapsed_ms": sum(item.get("elapsed_ms") or 0 for item in attempts),
+            "known_cost": sum(known_costs) if known_costs else None,
+            "cost_known_attempts": len(known_costs), "cost_attempts": len(usage),
+            "known_tokens": sum(known_tokens) if known_tokens else None,
+            "winner_cost": winner["cost"] if winner and winner["cost"] is not None else None,
+            "winner_tokens": (int(winner["input_tokens"] or 0) + int(winner["output_tokens"] or 0)) if winner and winner["input_tokens"] is not None and winner["output_tokens"] is not None else None,
+            "hedge_started": roles["hedge"] > 0,
+            "hedge_rescue": hedge_winner and not primary_delivered,
+        }
 
     def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
                           failure_class: str | None = None) -> None:
@@ -783,6 +1165,57 @@ class Store:
         complete = [r[0] for r in self.conn.execute(f"SELECT completed_ms FROM route_run WHERE {route_where} AND completed_ms IS NOT NULL ORDER BY completed_ms", params).fetchall()]
         cancelled = self.conn.execute(f"SELECT count(*) FROM observation WHERE {where} AND status IN ('cancelled','client_cancelled')", params).fetchone()[0]
         percentile = lambda values, fraction: values[max(0, int(len(values) * fraction) - 1)] if values else None
+        route_rows = self.conn.execute(f"SELECT outcome,telemetry_version,delivery_mode,first_delta_ms FROM route_run WHERE {route_where}", params).fetchall()
+        outcomes = {name: 0 for name in ("completed", "failed", "timed_out", "client_cancelled", "validation_rejected", "in_progress", "unknown")}
+        complete_telemetry = []
+        plain_stream_deltas = []
+        plain_stream_applicable = 0
+        for route in route_rows:
+            outcome = route["outcome"]
+            outcomes[outcome if outcome in outcomes else "in_progress" if outcome is None else "unknown"] += 1
+            if route["telemetry_version"] == TELEMETRY_SCHEMA_VERSION:
+                complete_telemetry.append(route)
+            if route["delivery_mode"] == "plain_stream":
+                plain_stream_applicable += 1
+                if route["first_delta_ms"] is not None:
+                    plain_stream_deltas.append(route["first_delta_ms"])
+        known_denominator = outcomes["completed"] + outcomes["failed"] + outcomes["timed_out"]
+        earliest = self.conn.execute("SELECT min(started_at) FROM route_run WHERE telemetry_version=?", (TELEMETRY_SCHEMA_VERSION,)).fetchone()[0]
+        telemetry_total = len(route_rows)
+        first_forwarded = sorted(plain_stream_deltas)
+        client_deltas = [row[0] for row in self.conn.execute(f"""SELECT t.elapsed_ms FROM client_telemetry t
+            JOIN route_run r USING(route_id) WHERE r.{route_where} AND t.metric_type='client_first_delta'
+            ORDER BY t.elapsed_ms""", params).fetchall()]
+        delivery_latency = {}
+        for mode in DELIVERY_MODES:
+            mode_rows = [route for route in route_rows if route["delivery_mode"] == mode]
+            forwarded = sorted(route["first_delta_ms"] for route in mode_rows if route["first_delta_ms"] is not None)
+            completion = sorted(
+                row[0] for row in self.conn.execute(
+                    f"SELECT coalesce(validation_completed_ms,completed_ms) FROM route_run WHERE {route_where} "
+                    "AND delivery_mode=? AND coalesce(validation_completed_ms,completed_ms) IS NOT NULL "
+                    "ORDER BY coalesce(validation_completed_ms,completed_ms)", (*params, mode)
+                ).fetchall()
+            )
+            delivery_latency[mode] = {
+                "first_forwarded_delta": {
+                    "applicable_count": len(mode_rows) if mode == "plain_stream" else 0,
+                    "sample_count": len(forwarded) if mode == "plain_stream" else 0,
+                    "p50_ms": percentile(forwarded, .5) if mode == "plain_stream" else None,
+                    "p95_ms": percentile(forwarded, .95) if mode == "plain_stream" else None,
+                },
+                "valid_completion": {
+                    "applicable_count": len(mode_rows) if mode != "plain_stream" else 0,
+                    "sample_count": len(completion) if mode != "plain_stream" else 0,
+                    "p50_ms": percentile(completion, .5) if mode != "plain_stream" else None,
+                    "p95_ms": percentile(completion, .95) if mode != "plain_stream" else None,
+                },
+            }
+        route_ids = [row[0] for row in self.conn.execute(f"SELECT route_id FROM route_run WHERE {route_where}", params).fetchall()]
+        amplifications = [self.route_amplification(route_id) for route_id in route_ids]
+        attempts = sorted(item["attempts_started"] for item in amplifications)
+        hedges = [item for item in amplifications if item["hedge_started"]]
+        costs_known = [item for item in amplifications if item["cost_attempts"]]
         return {
             'calls': row['calls'], 'technical_success_rate': row['rate'], 'avg_ttft_ms': row['ttft'], 'p95_ttft_ms': p95,
             'total_cost': row['total_cost'], 'model_fulfillment_rate': fulfillment, 'failures': failures,
@@ -791,6 +1224,36 @@ class Store:
             'client_first_delta_p50_ms': percentile(deltas, .5), 'client_first_delta_p95_ms': percentile(deltas, .95),
             'request_completed_avg_ms': route_row['request_completed_avg_ms'],
             'request_completed_p95_ms': percentile(complete, .95), 'cancellation_neutral_attempts': cancelled,
+            'telemetry_schema_version': TELEMETRY_SCHEMA_VERSION,
+            'collection_started_at': earliest,
+            'request_outcomes': outcomes,
+            'request_success_numerator': outcomes['completed'],
+            'request_success_denominator': known_denominator,
+            'request_excluded_count': telemetry_total - known_denominator,
+            'request_coverage': len(complete_telemetry) / telemetry_total if telemetry_total else None,
+            'first_forwarded_delta': {
+                'metric_version': TELEMETRY_SCHEMA_VERSION,
+                'applicable_count': plain_stream_applicable,
+                'sample_count': len(first_forwarded),
+                'excluded_count': telemetry_total - plain_stream_applicable,
+                'p50_ms': percentile(first_forwarded, .5),
+                'p95_ms': percentile(first_forwarded, .95),
+            },
+            'client_first_delta': {
+                'metric_version': TELEMETRY_SCHEMA_VERSION, 'applicable_count': plain_stream_applicable,
+                'sample_count': len(client_deltas), 'coverage': len(client_deltas) / plain_stream_applicable if plain_stream_applicable else None,
+                'p50_ms': percentile(client_deltas, .5), 'p95_ms': percentile(client_deltas, .95),
+            },
+            'delivery_latency': delivery_latency,
+            'amplification': {
+                'sample_count': len(amplifications), 'attempts_p50': percentile(attempts, .5),
+                'attempts_p95': percentile(attempts, .95), 'hedge_started_numerator': len(hedges),
+                'hedge_started_denominator': len(amplifications),
+                'hedge_rescue_numerator': sum(item['hedge_rescue'] for item in hedges),
+                'hedge_rescue_denominator': len(hedges),
+                'cross_site_count': sum(item['distinct_sites'] > 1 for item in amplifications),
+                'cost_coverage': len(costs_known) / len(amplifications) if amplifications else None,
+            },
         }
     def calls(self, limit, cursor=None, provider=None, status=None, window='24h', sort='time', direction='desc', offset=None):
         clauses=["o.created_at >= datetime('now', ?)"]; params=[{'1h':'-1 hour','24h':'-24 hours','7d':'-7 days','30d':'-30 days'}[window]]

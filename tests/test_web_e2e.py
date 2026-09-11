@@ -89,7 +89,15 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
         if path.startswith("/admin/v1/quality"):
-            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
+            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "request_success_rate": 0.9, "request_success_numerator": 9, "request_success_denominator": 10, "request_coverage": 0.8, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
+        if path.startswith("/admin/v1/data-health"):
+            return {"in_progress": 0, "reconciled_unknown": 0, "legacy_records": 0, "unknown": 0, "collection_errors": 0}
+        if path.startswith("/admin/v1/analytics"):
+            return {"groups": [{"group": "alpha", "success_rate": 0.9, "success_denominator": 10, "confidence_interval_95": [0.6, 0.98], "insufficient": True}]}
+        if path.startswith("/admin/v1/routes/route-1"):
+            return {"route_id": "route-1", "outcome": "completed", "candidates": [], "attempts": []}
+        if path.startswith("/admin/v1/routes"):
+            return {"items": [{"route_id": "route-1", "started_at": "2026-08-29T10:00:00Z", "outcome": "completed", "delivery_mode": "plain_stream", "tier": "standard", "selected_model": "luna", "selected_site_id": "alpha", "terminal_reason": None, "telemetry_version": 1}], "next_cursor": None}
         if path.startswith("/admin/v1/calls"):
             if "cursor=2" in path:
                 return {"items": [calls[1]], "next_cursor": None}
@@ -142,7 +150,12 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.locator("#quality").get_by_text("可路由 API", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("技术成功率", exact=True).count() == 1
         assert page.locator("#quality").get_by_text("平均 TTFT", exact=True).count() == 1
-        assert page.locator("#quality > div").count() == 12
+        assert page.locator("#quality > div").count() == 15
+        assert page.locator("#quality").get_by_text("请求成功率", exact=True).count() == 1
+        assert page.locator("#quality").get_by_text("90.0%", exact=True).count() == 1
+        assert page.locator("#analytics").get_by_text("insufficient", exact=True).count() == 1
+        page.locator("#routes").get_by_role("button", name="view").click()
+        page.locator("#route-detail").get_by_text('"route_id": "route-1"').wait_for()
         assert page.locator("#quality > div").filter(has_text="传输失败").locator("strong").inner_text() == "50.0%"
         assert page.locator("#quality > div").filter(has_text="已取消").locator("strong").inner_text() == "0.0%"
         assert "transport_failed" not in page.locator("#quality").inner_text()
@@ -154,7 +167,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
         assert "provider-secret" not in page.content()
         page.get_by_text("1.8 s", exact=True).first.wait_for()
-        page.get_by_text("2026/08/29 18:00", exact=True).wait_for()
+        page.locator("#syncat").get_by_text("2026/08/29 18:00", exact=True).wait_for()
         assert page.locator("#providers #race-parallel-cap").count() == 0
         assert page.locator("#providers").get_by_role("button", name="24h 总 Token 用量").count() == 1
         assert page.locator("#providers").get_by_text("14", exact=True).count() == 1

@@ -151,3 +151,29 @@ Broker 已经开始同时记录 attempt 级调用和 route 级请求终态，能
 - Raw records currently have no automatic pruning in application code, while management windows stop at 30 days. The retention and rollup design must protect the small computer’s disk and SQLite performance without losing long-term baselines.
 - Recommended initial evidence gate is at least seven days of complete telemetry and at least 200 known routes per major reliability cohort; P95 comparisons require at least 200 applicable observations and preferably more. These are initial defaults, not proof thresholds that may be changed after inspecting favorable results.
 - Later optimization examples include lowering weight for persistently unreliable Provider/model/shape cohorts, reducing site concurrency for correlated overload, moving hedge timing based on measured rescue value, and distinguishing connection/TTFB delay from model TTFT. Each such behavior change remains a separate controlled implementation decision.
+
+## Upstream contract summary
+
+# Broker observability and optimization evidence
+
+Source: GitHub parent specification [#20](https://github.com/williamxhero/provider_broker_proj/issues/20), captured for implementation and release evidence.
+
+## Contract
+
+The Broker records privacy-safe route, candidate, attempt and optional client timing facts. It distinguishes request outcomes from raw attempt completion, keeps race-loser cancellations neutral for reliability, and exposes bounded request-shape, Provider/site/model, delivery, release, policy/configuration and experiment cohorts. Collection must not alter routing order, health semantics, hedge delay, retries, concurrency, intellect or response contracts.
+
+Raw prompts, output bodies, tool payloads, credentials, authorization headers, cookies and sensitive URLs are prohibited from telemetry, drill-down and exports. Unknown and inapplicable facts remain unknown rather than becoming zero or reconstructed historical data.
+
+## Evidence requirements
+
+- Request success reports a completed numerator, known terminal denominator, exclusions, coverage and telemetry version/start boundary.
+- Plain stream forwarded delta, client received delta, validated completion and non-stream completion are separate metrics with applicability/sample counts.
+- Candidate exclusions, stable attempt roles, cancellation censoring, amplification, site diversity and cost/usage coverage are auditable per route.
+- Aggregates are allowlisted, return sample gates and binomial confidence intervals, and permit safe route drill-down.
+- Configuration/release/policy context is frozen per route; telemetry cannot automatically promote a policy change.
+- Raw facts are retained for a bounded period only after idempotent rollup watermarks; long-running analytical work remains outside the request path.
+- Export and alert evaluation are aggregate-only and sample-gated. Alert canaries must not send real external notifications.
+
+## Initial production observation gate
+
+Before any later routing optimization, freeze a seven-day window, named cohorts and version context. Require at least 200 known routes for reliability and 200 applicable observations for P95 comparisons. State request-success non-inferiority and latency/amplification/cost limits before inspecting the window; insufficient evidence remains insufficient.
