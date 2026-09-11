@@ -169,7 +169,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_text("1.8 s", exact=True).first.wait_for()
         page.locator("#syncat").get_by_text("2026/08/29 18:00", exact=True).wait_for()
         assert page.locator("#providers #race-parallel-cap").count() == 0
-        assert page.locator("#providers").get_by_role("button", name="24h 总 Token 用量").count() == 1
+        assert page.locator("#providers").get_by_role("button", name="总Token").count() == 1
         assert page.locator("#providers").get_by_text("14", exact=True).count() == 1
         assert page.locator("section:has(#model-view-title) #race-parallel-cap").count() == 1
         assert "价格决定先后" not in page.content()
@@ -234,7 +234,7 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.get_by_role("button", name="7d").click()
         page.get_by_text("7", exact=True).last.wait_for()
         page.locator("#providers").get_by_role("button", name="7d 费用").wait_for()
-        page.locator("#providers").get_by_role("button", name="7d 总 Token 用量").wait_for()
+        page.locator("#providers").get_by_role("button", name="总Token").wait_for()
         page.locator("#providers").get_by_text("70", exact=True).wait_for()
         page.get_by_text("$0.07", exact=True).wait_for()
         page.locator("#callprovider").fill("Alpha")
