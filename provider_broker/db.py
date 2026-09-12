@@ -12,7 +12,7 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .catalog import blended_price, provider_pricing
+from .catalog import blended_price, canonicalize, provider_pricing
 
 
 TELEMETRY_SCHEMA_VERSION = 1
@@ -72,6 +72,11 @@ class Provider:
     site_id: str = "default"
     wire_model: str | None = None
     model_aliases: dict[str, str] | None = None
+    pricing_by_model: dict[str, dict] | None = None
+    price_currency: str | None = None
+    price_comparable: bool = False
+    price_source: str | None = None
+    price_reason: str | None = None
 
 
 class Store:
@@ -218,7 +223,8 @@ class Store:
           route_id TEXT NOT NULL REFERENCES route_run(route_id), ordinal INTEGER NOT NULL,
           fingerprint TEXT, model TEXT, site_id TEXT, eligible INTEGER NOT NULL,
           exclusion_reason TEXT, initial_rank INTEGER, launched INTEGER NOT NULL DEFAULT 0,
-          role TEXT, PRIMARY KEY(route_id, ordinal)
+          role TEXT, stage TEXT, currency TEXT, multiplier REAL, price REAL,
+          price_source TEXT, price_comparable INTEGER, PRIMARY KEY(route_id, ordinal)
         );
         CREATE INDEX IF NOT EXISTS route_candidate_route ON route_candidate(route_id, ordinal);
         CREATE TABLE IF NOT EXISTS route_attempt (
@@ -313,6 +319,12 @@ class Store:
             ("first_response_header_ms", "REAL"), ("first_text_ms", "REAL"), ("validation_completed_ms", "REAL"),
         ]:
             try: self.conn.execute(f"ALTER TABLE route_run ADD COLUMN {name} {definition}")
+            except sqlite3.OperationalError: pass
+        for name, definition in [
+            ("stage", "TEXT"), ("currency", "TEXT"), ("multiplier", "REAL"),
+            ("price", "REAL"), ("price_source", "TEXT"), ("price_comparable", "INTEGER"),
+        ]:
+            try: self.conn.execute(f"ALTER TABLE route_candidate ADD COLUMN {name} {definition}")
             except sqlite3.OperationalError: pass
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_telemetry_window ON route_run(telemetry_version, started_at DESC)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_delivery_window ON route_run(delivery_mode, started_at DESC)")
@@ -567,6 +579,124 @@ class Store:
             " ORDER BY p.id", params
         ).fetchall()
         return [dict(row) | {'active': bool(row['active']), 'legacy': bool(row['legacy']), 'unpriced': bool(row['unpriced'])} for row in rows]
+
+    def effective_pricing(self, provider: int | str, model: str) -> dict:
+        """Resolve final prices for one pricing Provider and canonical Model.
+
+        The returned component prices already include the pricing Provider's
+        multiplier.  A missing or explicitly unpriced row is represented as an
+        unknown result, never as a zero-cost result.
+        """
+        model_id = canonicalize(model)
+        if isinstance(provider, int):
+            provider_row = self.conn.execute(
+                "SELECT * FROM pricing_provider WHERE id=?", (provider,)
+            ).fetchone()
+        else:
+            provider_row = self.conn.execute(
+                "SELECT * FROM pricing_provider WHERE provider_key=?", (provider,)
+            ).fetchone()
+
+        base = {"model": model_id, "stage": None, "currency": None,
+                "input_price": None, "cache_price": None, "output_price": None,
+                "blended_price": None, "multiplier": None, "source": None,
+                "priced": False, "reason": None}
+        model_row = self.conn.execute(
+            "SELECT stage FROM canonical_model WHERE id=? AND active=1", (model_id,)
+        ).fetchone()
+        if model_row:
+            base["stage"] = model_row["stage"]
+        if provider_row is None or not provider_row["active"]:
+            base["reason"] = "pricing provider is missing or inactive"
+            return base
+        if model_row is None:
+            base["reason"] = "canonical model is missing or inactive"
+            return base
+
+        price_provider_id = provider_row["id"]
+        source = provider_row["provider_type"]
+        benchmark_multiplier = 1.0
+        if source == "relay":
+            binding = self.conn.execute(
+                """SELECT benchmark_provider_id,benchmark_model_id
+                   FROM relay_price_binding
+                   WHERE relay_provider_id=? AND relay_model_id=? AND active=1""",
+                (price_provider_id, model_id),
+            ).fetchone()
+            if binding is None:
+                base["reason"] = "relay price binding is missing"
+                return base
+            price_provider_id = binding["benchmark_provider_id"]
+            price_model_id = binding["benchmark_model_id"]
+            benchmark = self.conn.execute(
+                "SELECT active,multiplier FROM pricing_provider WHERE id=?",
+                (price_provider_id,),
+            ).fetchone()
+            if benchmark is None or not benchmark["active"]:
+                base["reason"] = "relay benchmark provider is missing or inactive"
+                return base
+            benchmark_multiplier = float(benchmark["multiplier"])
+        else:
+            price_model_id = model_id
+
+        price = self.conn.execute(
+            """SELECT input_price,cache_price,output_price,currency,source_kind,unpriced
+               FROM provider_model_price
+               WHERE provider_id=? AND model_id=? AND active=1""",
+            (price_provider_id, price_model_id),
+        ).fetchone()
+        if price is None:
+            base["reason"] = "provider model price is missing"
+            return base
+        if price["unpriced"]:
+            base["reason"] = "provider model price is explicitly unpriced"
+            return base
+
+        multiplier = float(provider_row["multiplier"]) * benchmark_multiplier
+        components = [round(float(price[key]) * multiplier, 10)
+                      for key in ("input_price", "cache_price", "output_price")]
+        base.update({
+            "currency": price["currency"], "input_price": components[0],
+            "cache_price": components[1], "output_price": components[2],
+            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
+            "multiplier": multiplier, "source": source, "priced": True,
+        })
+        return base
+
+    def effective_key_pricing(self, fingerprint: str, model: str) -> dict:
+        """Resolve pricing for one configured API key and model."""
+        row = self.conn.execute(
+            """SELECT s.pricing_provider_id,p.multiplier,pp.provider_key,pp.provider_type
+               FROM source_provider s JOIN policy p USING(fingerprint)
+               LEFT JOIN pricing_provider pp ON pp.id=s.pricing_provider_id
+               WHERE s.fingerprint=?""", (fingerprint,)
+        ).fetchone()
+        if row is None or row["pricing_provider_id"] is None:
+            return self.effective_pricing("", model) | {"reason": "pricing provider is not linked to API key"}
+        resolved = self.effective_pricing(row["pricing_provider_id"], model)
+        # Databases upgraded from the pre-provider pricing schema have an
+        # intentionally unpriced legacy direct row.  Keep the old API's
+        # catalog estimate available during migration; all newly configured
+        # direct/relay Providers still require their own effective price row.
+        if (not resolved["priced"] and row["provider_key"] and
+                row["provider_key"].startswith("legacy:direct:")):
+            official = self.conn.execute(
+                "SELECT id FROM pricing_provider WHERE provider_key='official-catalog' AND active=1"
+            ).fetchone()
+            if official:
+                resolved = self.effective_pricing(official["id"], model) | {"source": "legacy-official-fallback"}
+        if not resolved["priced"]:
+            return resolved
+        policy_multiplier = float(row["multiplier"])
+        if policy_multiplier == 1.0:
+            return resolved
+        components = [round(resolved[key] * policy_multiplier, 10)
+                      for key in ("input_price", "cache_price", "output_price")]
+        return resolved | {
+            "input_price": components[0], "cache_price": components[1], "output_price": components[2],
+            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
+            "multiplier": round(resolved["multiplier"] * policy_multiplier, 10),
+        }
 
     def bind_relay_price(self, relay_provider_id: int, relay_model_id: str,
                          benchmark_provider_id: int, benchmark_model_id: str,
@@ -1036,7 +1166,10 @@ class Store:
     def record_candidate(self, route_id: str, *, fingerprint: str | None, model: str | None,
                          site_id: str | None, eligible: bool, initial_rank: int | None = None,
                          exclusion_reason: str | None = None, launched: bool = False,
-                         role: str | None = None) -> None:
+                         role: str | None = None, stage: str | None = None,
+                         currency: str | None = None, multiplier: float | None = None,
+                         price: float | None = None, price_source: str | None = None,
+                         price_comparable: bool | None = None) -> None:
         reasons = {"policy_disabled", "inventory_mismatch", "capability_unsupported", "health_open",
                    "route_blocked", "site_disabled", "key_capacity", "site_capacity", "global_capacity",
                    "deadline_budget"}
@@ -1045,9 +1178,11 @@ class Store:
         ordinal = self.conn.execute("SELECT coalesce(max(ordinal), -1)+1 FROM route_candidate WHERE route_id=?", (route_id,)).fetchone()[0]
         with self.conn:
             self.conn.execute("""INSERT INTO route_candidate(route_id,ordinal,fingerprint,model,site_id,eligible,
-                exclusion_reason,initial_rank,launched,role) VALUES(?,?,?,?,?,?,?,?,?,?)""", (
+                exclusion_reason,initial_rank,launched,role,stage,currency,multiplier,price,price_source,price_comparable)
+                VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (
                 route_id, ordinal, fingerprint, model, site_id, int(eligible), exclusion_reason,
-                initial_rank, int(launched), role,
+                initial_rank, int(launched), role, stage, currency, multiplier, price, price_source,
+                None if price_comparable is None else int(price_comparable),
             ))
 
     def record_attempt(self, route_id: str, *, attempt_number: int, fingerprint: str | None,
@@ -1220,7 +1355,8 @@ class Store:
         )
         detail = {name: row[name] for name in allowed}
         detail["candidates"] = [dict(candidate) for candidate in self.conn.execute("""SELECT fingerprint,model,site_id,
-            eligible,exclusion_reason,initial_rank,launched,role FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
+            eligible,exclusion_reason,initial_rank,launched,role,stage,currency,multiplier,price,price_source,
+            price_comparable FROM route_candidate WHERE route_id=? ORDER BY ordinal""", (route_id,))]
         detail["attempts"] = [dict(attempt) for attempt in self.conn.execute("""SELECT attempt_number,fingerprint,model,
             site_id,role,status,failure_class,started_ms,elapsed_ms FROM route_attempt WHERE route_id=? ORDER BY attempt_number""", (route_id,))]
         detail["client_telemetry"] = [dict(item) for item in self.conn.execute("""SELECT metric_type,elapsed_ms,
@@ -1233,7 +1369,8 @@ class Store:
         """Return bounded, deterministic audit facts for a route subresource."""
         if kind == "candidates":
             table, key, columns = "route_candidate", "ordinal", (
-                "ordinal,fingerprint,model,site_id,eligible,exclusion_reason,initial_rank,launched,role")
+                "ordinal,fingerprint,model,site_id,eligible,exclusion_reason,initial_rank,launched,role,stage,"
+                "currency,multiplier,price,price_source,price_comparable")
         elif kind == "attempts":
             table, key, columns = "route_attempt", "attempt_number", (
                 "attempt_number,fingerprint,model,site_id,role,status,failure_class,started_ms,elapsed_ms")
@@ -1513,6 +1650,38 @@ class Store:
         ).fetchone()
         return row is None or row["state"] != "unsupported"
 
+    def _provider_from_row(self, row, model: str, catalog: dict) -> Provider:
+        headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
+        source = json.loads(row['source_json']) if row['source_json'] else {}
+        model_aliases = source.get('model_aliases') or {}
+        wire_model = model_aliases.get(model)
+        reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
+        source_models = [canonicalize(item) for item in json.loads(row['models_json'])]
+        pricing_by_model = {
+            candidate: self.effective_key_pricing(row['fingerprint'], candidate)
+            for candidate in source_models
+            if candidate in catalog
+        }
+        pricing = pricing_by_model.get(model) or self.effective_key_pricing(row['fingerprint'], model)
+        pricing = pricing | {
+            # Preserve the historical pricing dictionary keys for embedders;
+            # these values are now final Provider prices, not global catalog
+            # guesses.  Unknown values remain None.
+            'official_input_price': pricing['input_price'],
+            'official_cache_price': pricing['cache_price'],
+            'official_output_price': pricing['output_price'],
+        }
+        pricing_by_model = pricing_by_model | {model: pricing}
+        price_group = int(pricing['blended_price'] * 100000) if pricing['priced'] else None
+        return Provider(
+            row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
+            row['provider_type'], headers, [model], pricing, price_group, int(row['max_parallel']),
+            bool(row['enabled']), float(row['multiplier']), row['site_id'], wire_model, reverse_aliases,
+            pricing_by_model=pricing_by_model, price_currency=pricing['currency'],
+            price_comparable=bool(pricing['priced']), price_source=pricing['source'],
+            price_reason=pricing['reason'],
+        )
+
     def providers(self, tier: str, *, contract: str | None = None) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
         WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
@@ -1522,8 +1691,6 @@ class Store:
             blocked={row[0] for row in self.conn.execute('SELECT model FROM route_block WHERE fingerprint=?',(r['fingerprint'],))}
             models=[m for m in json.loads(r['models_json']) if m in catalog and catalog[m]['intellect'] == tier and m not in blocked]
             if models and tier in json.loads(r['tiers_json']):
-                header_blob = r['request_headers']
-                headers = json.loads(self._decrypt(header_blob)) if header_blob else {}
                 # A key can expose several catalog models in the same stage.  Health is
                 # per model, so make each routing candidate explicit rather than letting
                 # an open model hide behind the first item in a shared list.
@@ -1532,12 +1699,7 @@ class Store:
                         continue
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
-                    pricing = provider_pricing(r['base_url'], model, catalog[model])
-                    source = json.loads(r['source_json']) if r['source_json'] else {}
-                    model_aliases = source.get('model_aliases') or {}
-                    wire_model = model_aliases.get(model)
-                    reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
-                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier']),r['site_id'],wire_model,reverse_aliases))
+                    result.append(self._provider_from_row(r, model, catalog))
         return result
 
     def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
@@ -1590,13 +1752,7 @@ class Store:
         tier = catalog[model]['intellect']
         if tier not in json.loads(row['tiers_json']):
             return None
-        headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
-        pricing = provider_pricing(row['base_url'], model, catalog[model])
-        source = json.loads(row['source_json']) if row['source_json'] else {}
-        model_aliases = source.get('model_aliases') or {}
-        wire_model = model_aliases.get(model)
-        reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
-        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'], wire_model, reverse_aliases)
+        return self._provider_from_row(row, model, catalog)
 
     def key_test_providers(self) -> list[Provider]:
         """Return every enabled, calibrated API-key/model probe target.
@@ -1611,24 +1767,13 @@ class Store:
         catalog = self.catalog()
         result = []
         for row in rows:
-            headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
             if not row['enabled'] or not row['calibrated']:
                 continue
             tiers = set(json.loads(row['tiers_json']))
             for model in json.loads(row['models_json']):
                 if model not in catalog or catalog[model]['intellect'] not in tiers:
                     continue
-                pricing = provider_pricing(row['base_url'], model, catalog[model])
-                source = json.loads(row['source_json']) if row['source_json'] else {}
-                model_aliases = source.get('model_aliases') or {}
-                wire_model = model_aliases.get(model)
-                reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
-                result.append(Provider(
-                    row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
-                    row['provider_type'], headers, [model], pricing,
-                    int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']),
-                    bool(row['enabled']), float(row['multiplier']), row['site_id'], wire_model, reverse_aliases,
-                ))
+                result.append(self._provider_from_row(row, model, catalog))
         return result
 
     def try_acquire(self, provider: Provider) -> bool:
@@ -1720,6 +1865,11 @@ class Store:
         rows = self.conn.execute("SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.note,p.max_parallel,p.tiers_json FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id").fetchall()
         inventory = []
         for row in rows:
+            models = json.loads(row['models_json'])
+            model_pricing = {
+                model: self.effective_key_pricing(row['fingerprint'], model)
+                for model in models
+            }
             stats = self.conn.execute(
                 "SELECT avg(success) rate, avg(latency_ms) ttft, sum(cost) cost, sum(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL THEN input_tokens + output_tokens END) total_tokens FROM observation WHERE fingerprint=? AND created_at>=datetime('now',?)",
                 (row['fingerprint'], modifier),
@@ -1735,7 +1885,8 @@ class Store:
             ).fetchone()
             inventory.append({
                 'fingerprint': row['fingerprint'], 'name': row['name'], 'base_url': row['base_url'], 'family': row['provider_type'],
-                'api_key_mask': row['api_key_mask'] or '***', 'models': json.loads(row['models_json']),
+                'api_key_mask': row['api_key_mask'] or '***', 'models': models,
+                'model_pricing': model_pricing,
                 'inventory_status': json.loads(row['source_json']).get('inventory_status'), 'enabled': bool(row['enabled']),
                 'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
                 'multiplier': row['multiplier'], 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],

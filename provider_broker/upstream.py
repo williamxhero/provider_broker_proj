@@ -53,6 +53,18 @@ def model_fulfills(requested_model: str, actual_model: str | None) -> bool:
     return requested is not None and actual is not None and INTELLECT_RANK[actual] >= INTELLECT_RANK[requested]
 
 
+def pricing_audit_fields(provider) -> dict:
+    pricing = getattr(provider, "pricing", None) or {}
+    return {
+        "stage": pricing.get("stage"),
+        "currency": getattr(provider, "price_currency", None),
+        "multiplier": pricing.get("multiplier", getattr(provider, "multiplier", None)),
+        "price": pricing.get("blended_price"),
+        "price_source": getattr(provider, "price_source", None),
+        "price_comparable": getattr(provider, "price_comparable", None),
+    }
+
+
 class AttemptFailure(Exception):
     def __init__(self, status: str, *, diagnostic: dict | None = None, repair_note: str | None = None):
         super().__init__(status)
@@ -283,16 +295,38 @@ def normalize_usage(data: dict) -> dict:
     return normalized
 
 
-def estimate_cost(model: str, usage: dict, multiplier: float, pricing=None) -> float | None:
+def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pricing=None) -> dict:
     pricing = pricing or CATALOG.get(canonicalize(model))
     input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-    if pricing is None or not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
-        return None
+    if pricing is None:
+        return {"cost": None, "reason": "canonical model price is missing"}
+    if "priced" in pricing:
+        priced = bool(pricing["priced"])
+    else:
+        priced = any(
+            isinstance(pricing.get(key), (int, float)) and pricing[key] > 0
+            for key in ("input_price", "cache_price", "output_price",
+                        "official_input_price", "official_cache_price", "official_output_price")
+        )
+    if not priced:
+        return {"cost": None, "reason": pricing.get("reason") or "model price is unknown"}
+    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+        return {"cost": None, "reason": "token usage is incomplete"}
     details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
     cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
+    cached = max(0, min(input_tokens, cached))
     uncached = max(0, input_tokens - cached)
-    cost = (uncached * pricing["official_input_price"] + cached * pricing["official_cache_price"] + output_tokens * pricing["official_output_price"]) / 1_000_000
-    return round(cost * multiplier, 10)
+    input_price = pricing.get("input_price", pricing.get("official_input_price"))
+    cache_price = pricing.get("cache_price", pricing.get("official_cache_price"))
+    output_price = pricing.get("output_price", pricing.get("official_output_price"))
+    if not all(isinstance(value, (int, float)) for value in (input_price, cache_price, output_price)):
+        return {"cost": None, "reason": "provider model price is incomplete"}
+    cost = (uncached * input_price + cached * cache_price + output_tokens * output_price) / 1_000_000
+    return {"cost": round(cost * multiplier, 10), "reason": None}
+
+
+def estimate_cost(model: str, usage: dict, multiplier: float, pricing=None) -> float | None:
+    return estimate_cost_details(model, usage, multiplier, pricing)["cost"]
 
 
 def structured_schema(body: dict) -> dict | None:
@@ -830,11 +864,17 @@ async def invoke_stream(provider, body: dict) -> dict:
     usage = normalize_usage(metadata)
     actual_name = str(metadata.get("model") or requested_model)
     actual_model = canonicalize((getattr(provider, "model_aliases", None) or {}).get(actual_name.casefold(), actual_name))
+    pricing_by_model = getattr(provider, "pricing_by_model", None) or {}
+    effective_pricing = pricing_by_model.get(actual_model)
+    if effective_pricing is None and actual_model == model:
+        effective_pricing = getattr(provider, "pricing", None)
+    pricing_multiplier = 1.0 if isinstance(effective_pricing, dict) and effective_pricing.get("priced") else getattr(provider, "multiplier", 1.0)
+    cost_details = estimate_cost_details(actual_model, usage, pricing_multiplier, effective_pricing)
     return {
         "text": text, "chunks": chunks, "actual_model": actual_model,
         "latency_ms": ttft_ms, "usage": usage,
         "request_id": str(metadata.get("id") or uuid.uuid4()),
-        "cost": estimate_cost(actual_model, usage, provider.multiplier, provider.pricing if actual_model == model else None),
+        "cost": cost_details["cost"], "cost_reason": cost_details["reason"],
         "diagnostic": diagnostic(),
     }
 
@@ -1066,6 +1106,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 store.record_candidate(
                     route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
                     site_id=getattr(provider, "site_id", None), eligible=True, initial_rank=rank,
+                    **pricing_audit_fields(provider),
                 )
         primary.extend((provider, candidate_tier, None, candidate_score(provider, candidate_tier)) for provider in ranked)
         normal_endpoints.update((provider.provider_type, provider.base_url.rstrip("/")) for provider in ranked)
@@ -1090,6 +1131,7 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                 store.record_candidate(
                     route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
                     site_id=getattr(provider, "site_id", None), eligible=True, role="recovery",
+                    **pricing_audit_fields(provider),
                 )
             recovery.append((provider, candidate_tier, None, candidate_score(provider, candidate_tier)))
 
@@ -1387,12 +1429,43 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 
 
 def price_bands(providers):
-    """Split all Key prices at their median, ordered from lower to higher price."""
-    ordered = sorted(providers, key=lambda provider: (provider.price_group, provider.id))
-    if not ordered:
-        return []
-    midpoint = len(ordered) // 2
-    median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
-    lower = [provider for provider in ordered if provider.price_group <= median]
-    higher = [provider for provider in ordered if provider.price_group > median]
-    return [lower] + ([higher] if higher else [])
+    """Split comparable prices at their per-currency medians.
+
+    Legacy provider doubles only expose ``price_group`` and retain the old
+    single-band behavior.  Real candidates carry explicit pricing metadata;
+    those candidates are never compared across currencies, and unpriced
+    candidates are kept in a separate non-price band.
+    """
+    providers = list(providers)
+    has_effective_metadata = any(hasattr(provider, "price_currency") for provider in providers)
+    if not has_effective_metadata:
+        ordered = sorted(providers, key=lambda provider: (provider.price_group, provider.id))
+        if not ordered:
+            return []
+        midpoint = len(ordered) // 2
+        median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
+        lower = [provider for provider in ordered if provider.price_group <= median]
+        higher = [provider for provider in ordered if provider.price_group > median]
+        return [lower] + ([higher] if higher else [])
+
+    groups = {}
+    unknown = []
+    for provider in providers:
+        currency = getattr(provider, "price_currency", None)
+        price_group = getattr(provider, "price_group", None)
+        if not getattr(provider, "price_comparable", False) or not currency or price_group is None:
+            unknown.append(provider)
+        else:
+            groups.setdefault(currency, []).append(provider)
+
+    bands = []
+    for currency, items in groups.items():
+        ordered = sorted(items, key=lambda provider: (provider.price_group, provider.id))
+        midpoint = len(ordered) // 2
+        median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
+        lower = [provider for provider in ordered if provider.price_group <= median]
+        higher = [provider for provider in ordered if provider.price_group > median]
+        bands.extend([lower] + ([higher] if higher else []))
+    if unknown:
+        bands.append(sorted(unknown, key=lambda provider: provider.id))
+    return bands

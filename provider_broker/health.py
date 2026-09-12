@@ -69,8 +69,28 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
     candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("intellect") == tier)
                   and (not fingerprint or candidate.fingerprint == fingerprint) and (not model or candidate.models[0] == model)]
     if mode == "race":
-        bands = price_bands(candidates)
-        candidates = bands[0] if bands else []
+        if any(hasattr(candidate, "price_currency") for candidate in candidates):
+            # Price is only an ordering signal inside one currency.  Keep the
+            # lowest band from every currency, plus unknown-price candidates,
+            # so a currency boundary never silently excludes a healthy route.
+            by_currency = {}
+            unknown = []
+            for candidate in candidates:
+                currency = getattr(candidate, "price_currency", None)
+                if getattr(candidate, "price_comparable", False) and currency:
+                    by_currency.setdefault(currency, []).append(candidate)
+                else:
+                    unknown.append(candidate)
+            lowest = []
+            for currency_candidates in by_currency.values():
+                bands = price_bands(currency_candidates)
+                if bands:
+                    lowest.extend(bands[0])
+            candidates = lowest
+            candidates.extend(unknown)
+        else:
+            bands = price_bands(candidates)
+            candidates = bands[0] if bands else []
         # Match production's uniformly sampled global race set.
         cap = min(len(candidates), max(1, store.race_parallel_cap()))
         candidates = random.sample(candidates, cap) if candidates else []

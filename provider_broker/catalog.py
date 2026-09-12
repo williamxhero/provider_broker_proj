@@ -148,7 +148,7 @@ def classify(model: str):
 
 
 def blended_price(pricing: dict) -> float:
-    """Blended USD/1M estimate: 20% input (80% cached) and 80% output."""
+    """Blended per-currency/1M estimate: 4% input, 16% cached, 80% output."""
     return round(
         pricing["official_input_price"] * 0.04
         + pricing["official_cache_price"] * 0.16

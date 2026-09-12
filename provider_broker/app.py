@@ -50,14 +50,17 @@ async def generate(request):
             "status": "failed", "error": "all eligible providers failed", "attempts": exc.attempts,
             "request_id": exc.request_id, "route_id": exc.route_id,
         }, status=503)
-    return web.json_response({
+    response = {
         "status": "completed", "intellect": tier, "fulfilled_intellect": result["fulfilled_intellect"],
         "effort": body.get("effort"), "deadline_ms": body.get("deadline_ms"), "output_token_limit": body.get("output_token_limit"),
         "actual_model": result["actual_model"], "output_text": result["text"], "provider": result["provider"],
         "request_id": result["request_id"], "usage": result["usage"],
         "ttft_ms": result["latency_ms"], "attempts": result["attempts"], "cost_estimate": result["cost"],
         "route_id": result["route_id"],
-    })
+    }
+    if result.get("cost_reason"):
+        response["cost_reason"] = result["cost_reason"]
+    return web.json_response(response)
 
 
 async def stream(request):
@@ -128,6 +131,8 @@ async def stream(request):
         "cost_estimate": result["cost"], "ttft_ms": result["latency_ms"],
         "route_id": result["route_id"],
     }
+    if result.get("cost_reason"):
+        final["cost_reason"] = result["cost_reason"]
     await sse.write(f"event: final\ndata: {json.dumps(final)}\n\n".encode())
     await sse.write_eof()
     return sse
