@@ -351,6 +351,9 @@ class Store:
                     int(not any(item[key] > 0 for key in ('official_input_price', 'official_cache_price', 'official_output_price'))),
                 ) for model, item in CATALOG.items()],
             )
+            self.conn.execute(
+                "INSERT OR IGNORE INTO broker_setting(name,value) VALUES('pricing_domain_seed_version','1')"
+            )
         if seed_version < 4:
             self.conn.executemany("DELETE FROM model_catalog WHERE model=?", [("deepseek-v4-flash-0731",), ("deepseek-v4.1-flash",)])
         self.conn.execute(
@@ -366,7 +369,21 @@ class Store:
                VALUES(?,?,?,?,?,?)""",
             [(site.id, site.name, site.adapter, site.base_url, site.currency, site.default_threshold) for site in SITES],
         )
-        if catalog_exists:
+        pricing_seeded = self.conn.execute(
+            "SELECT 1 FROM broker_setting WHERE name='pricing_domain_seed_version'"
+        ).fetchone()
+        if pricing_seeded:
+            # A pre-domain operator may have edited the compatibility catalog
+            # directly.  Reconcile only observable drift; normal admin writes
+            # update both projections together and remain canonical-domain
+            # authoritative thereafter.
+            self.conn.execute(
+                """UPDATE canonical_model SET stage=(SELECT intellect FROM model_catalog WHERE model=canonical_model.id),
+                          family=(SELECT family FROM model_catalog WHERE model=canonical_model.id)
+                   WHERE id IN (SELECT m.model FROM model_catalog m JOIN canonical_model c ON c.id=m.model
+                                WHERE c.stage != m.intellect OR c.family != m.family)"""
+            )
+        if catalog_exists and not pricing_seeded:
             self.migrate_pricing()
         self.conn.commit()
 
