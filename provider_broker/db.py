@@ -919,9 +919,11 @@ class Store:
             from .catalog import PUBLIC_MODEL_IDS, canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             host = (urlsplit(base_url).hostname or "").lower()
+            public_provider = False
             for domain, public_models in PUBLIC_MODEL_IDS.items():
                 if host == domain or host.endswith("." + domain):
                     source_models = list(dict.fromkeys(source_models + list(public_models)))
+                    public_provider = True
                     break
             models = [model for model in source_models if model in catalog]
             # Stable fingerprints avoid decrypting credentials during ordinary
@@ -941,7 +943,7 @@ class Store:
             unavailable = entry.get("inventory_status") == "unavailable" or source_models == ["unavailable"]
             # Model discovery is auxiliary evidence.  Never erase a known-good
             # route merely because a CPA /models refresh transiently fails.
-            if unavailable and prior is not None:
+            if unavailable and prior is not None and not public_provider:
                 prior_models = json.loads(prior["models_json"])
                 if prior_models:
                     source_models = prior_models
