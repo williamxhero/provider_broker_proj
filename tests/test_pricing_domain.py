@@ -38,11 +38,10 @@ def test_pricing_entities_keep_model_metadata_separate_from_provider_prices(tmp_
         "family": "Family A",
         "active": True,
     }
-    assert db.provider_model_prices()[0] | {"provider_id": provider_id, "model_id": "model-a"} | {
-        "source_kind": "relay",
-        "currency": "USD",
-        "active": True,
-    }
+    price = next(row for row in db.provider_model_prices() if row["id"] == price_id)
+    assert (price["provider_id"], price["model_id"], price["source_kind"], price["currency"], price["active"]) == (
+        provider_id, "model-a", "relay", "USD", True,
+    )
     db.upsert_provider_model_price(
         provider_id=provider_id, model_id="model-a", source_kind="relay",
         input_price=1.1, cache_price=0.2, output_price=4.0, currency="USD",
@@ -125,4 +124,27 @@ def test_legacy_migration_is_idempotent_lossless_and_does_not_reprice_observatio
     assert any(row["source_kind"] == "legacy-migration" and row["unpriced"] is True for row in prices)
     assert db.conn.execute("SELECT cost FROM observation").fetchone()[0] == 123.45
     assert db.conn.execute("SELECT multiplier FROM pricing_provider WHERE provider_type='relay'").fetchone()[0] == 1.0
+    assert db.conn.execute("SELECT pricing_provider_id FROM source_provider WHERE fingerprint='legacy-fp'").fetchone()[0]
     assert db.conn.execute("SELECT count(*) FROM pricing_migration").fetchone()[0] == 1
+
+
+def test_legacy_migration_rolls_back_every_domain_write_on_partial_failure(tmp_path):
+    db = store(tmp_path)
+    db.conn.execute(
+        "INSERT INTO model_catalog(model,family,intellect,input_price,cache_price,output_price,currency) VALUES(?,?,?,?,?,?,?)",
+        ("boom", "Failure", "standard", 1.0, 0.1, 2.0, "USD"),
+    )
+    db.conn.execute(
+        "CREATE TRIGGER fail_pricing_migration BEFORE INSERT ON canonical_model "
+        "WHEN NEW.id='boom' BEGIN SELECT RAISE(ABORT, 'forced failure'); END"
+    )
+    before_prices = db.conn.execute("SELECT count(*) FROM provider_model_price").fetchone()[0]
+    db.conn.commit()
+
+    with pytest.raises(sqlite3.IntegrityError, match="forced failure"):
+        db.migrate_pricing()
+
+    assert db.conn.execute("SELECT count(*) FROM provider_model_price").fetchone()[0] == before_prices
+    assert db.conn.execute("SELECT 1 FROM canonical_model WHERE id='boom'").fetchone() is None
+    status = db.conn.execute("SELECT status,error FROM pricing_migration WHERE version=1").fetchone()
+    assert status["status"] == "failed" and "forced failure" in status["error"]

@@ -1,7 +1,9 @@
 import hashlib
 import hmac
 import json
+import math
 import sqlite3
+from contextlib import nullcontext
 from importlib.metadata import PackageNotFoundError, version
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
@@ -120,7 +122,7 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS canonical_model (
           id TEXT PRIMARY KEY,
-          stage TEXT NOT NULL,
+          stage TEXT NOT NULL CHECK(stage IN ('standard','smart','expert')),
           family TEXT NOT NULL,
           active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
         );
@@ -381,7 +383,7 @@ class Store:
         }
 
     def create_canonical_model(self, model_id: str, *, stage: str, family: str) -> bool:
-        if not model_id or not stage or not family:
+        if not model_id or stage not in {'standard', 'smart', 'expert'} or not family:
             raise ValueError('canonical model requires id, stage, and family')
         try:
             with self.conn:
@@ -414,7 +416,7 @@ class Store:
                                 name: str | None = None, multiplier: float = 1.0) -> int:
         if provider_type not in {'official', 'direct', 'relay', 'legacy-migration'}:
             raise ValueError('invalid pricing provider type')
-        if multiplier <= 0:
+        if not provider_key or not math.isfinite(multiplier) or multiplier <= 0:
             raise ValueError('pricing provider multiplier must be positive')
         with self.conn:
             cursor = self.conn.execute(
@@ -461,8 +463,10 @@ class Store:
         if source_kind not in {'official', 'direct', 'relay', 'legacy-migration'}:
             raise ValueError('invalid price source kind')
         values = (input_price, cache_price, output_price)
-        if any(value < 0 for value in values):
+        if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError('prices must be non-negative')
+        if not currency or not isinstance(currency, str):
+            raise ValueError('price currency is required')
         if unpriced is None:
             unpriced = not any(value > 0 for value in values)
         if not unpriced and not any(value > 0 for value in values):
@@ -475,7 +479,8 @@ class Store:
         ).fetchone()
         if not provider or not provider['active'] or not model or not model['active']:
             raise sqlite3.IntegrityError('price requires active provider and model')
-        with self.conn:
+        transaction = nullcontext() if self.conn.in_transaction else self.conn
+        with transaction:
             cursor = self.conn.execute(
                 """INSERT INTO provider_model_price(
                    provider_id,model_id,source_kind,input_price,cache_price,output_price,currency,
@@ -492,6 +497,13 @@ class Store:
             (kwargs['provider_id'], kwargs['model_id']),
         ).fetchone()
         if existing:
+            if kwargs['source_kind'] not in {'official', 'direct', 'relay', 'legacy-migration'}:
+                raise ValueError('invalid price source kind')
+            prices = [kwargs['input_price'], kwargs['cache_price'], kwargs['output_price']]
+            if any(not math.isfinite(price) or price < 0 for price in prices):
+                raise ValueError('prices must be non-negative')
+            if not kwargs['currency'] or not isinstance(kwargs['currency'], str):
+                raise ValueError('price currency is required')
             before = self.conn.execute(
                 "SELECT source_kind,input_price,cache_price,output_price,currency,verified_at,legacy,unpriced FROM provider_model_price WHERE id=?",
                 (existing['id'],),
@@ -499,9 +511,9 @@ class Store:
             values = kwargs.copy()
             values.pop('provider_id'); values.pop('model_id')
             values.setdefault('unpriced', None)
-            prices = [values['input_price'], values['cache_price'], values['output_price']]
             values['unpriced'] = int(values['unpriced'] if values['unpriced'] is not None else not any(price > 0 for price in prices))
-            with self.conn:
+            transaction = nullcontext() if self.conn.in_transaction else self.conn
+            with transaction:
                 self.conn.execute(
                     """UPDATE provider_model_price SET source_kind=?,input_price=?,cache_price=?,output_price=?,
                        currency=?,source_url=?,source_evidence=?,verified_at=?,legacy=?,unpriced=? WHERE id=?""",
@@ -581,6 +593,13 @@ class Store:
             " ORDER BY b.id", params
         ).fetchall()
         return [dict(row) | {'active': bool(row['active'])} for row in rows]
+
+    def deactivate_relay_price_binding(self, relay_provider_id: int, relay_model_id: str) -> bool:
+        with self.conn:
+            return bool(self.conn.execute(
+                "UPDATE relay_price_binding SET active=0 WHERE relay_provider_id=? AND relay_model_id=? AND active=1",
+                (relay_provider_id, relay_model_id),
+            ).rowcount)
 
     def migrate_pricing(self) -> dict:
         version = 1
@@ -679,8 +698,8 @@ class Store:
         except Exception as exc:
             with self.conn:
                 self.conn.execute(
-                    "UPDATE pricing_migration SET status='failed',completed_at=?,error=? WHERE version=?",
-                    (self._timestamp(), str(exc)[:500], version),
+                    "INSERT OR REPLACE INTO pricing_migration(version,status,started_at,completed_at,error) VALUES(?,?,?,?,?)",
+                    (version, 'failed', started, self._timestamp(), str(exc)[:500]),
                 )
             raise
         return {'version': version, 'migrated': True, 'conflicts': conflicts}
@@ -909,9 +928,10 @@ class Store:
 
     def record_configuration_change(self, setting: str, before: object, after: object, *, source: str = "admin") -> None:
         safe_settings = {"race_parallel_cap", "hedge_delay_ms", "global_parallel_cap", "site_policy"}
-        if setting not in safe_settings and not setting.startswith("pricing:") or before == after:
+        if (setting not in safe_settings and not setting.startswith("pricing:")) or before == after:
             return
-        with self.conn:
+        transaction = nullcontext() if self.conn.in_transaction else self.conn
+        with transaction:
             self.conn.execute("INSERT INTO configuration_event(setting,before_value,after_value,source,created_at) VALUES(?,?,?,?,?)",
                 (setting, json.dumps(before, sort_keys=True), json.dumps(after, sort_keys=True), source[:32], self._timestamp()))
 
