@@ -27,6 +27,29 @@ _CPA_CONFIG_SECTIONS = {
     "claude": "claude-api-key",
 }
 
+# Public model IDs do not require a user-created Ark Endpoint. The catalog
+# name remains stable for routing while this table supplies the vendor wire
+# name when Ark does not expose a useful /models inventory.
+_PUBLIC_MODEL_IDS = {
+    "deepseek.com": {
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+    },
+    "volces.com": {
+        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
+        "doubao-seed-2.1-turbo": "doubao-seed-2.1-turbo",
+        "doubao-seed-2.1-pro": "doubao-seed-2.1-pro",
+    },
+}
+
+
+def _public_model_ids(base_url: str, models: list[str] | None = None) -> dict[str, str]:
+    host = (_url_parts(base_url).hostname or "").lower()
+    for domain, mapping in _PUBLIC_MODEL_IDS.items():
+        if host == domain or host.endswith("." + domain):
+            return {model: wire for model, wire in mapping.items() if models is None or model in models}
+    return {}
+
 
 def _management_headers(token: str) -> dict[str, str]:
     """Authenticate every CPA management request without putting the key in logs."""
@@ -398,6 +421,12 @@ async def sync_cpa(store, url: str, token: str) -> dict:
                     discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
                     aliases=entry.get('aliases',{})
                     models=list(dict.fromkeys(canonicalize(aliases.get(model.casefold(), model)) for model in discovered))
+                    configured_models = list(aliases.values()) or models
+                    public_catalog = _public_model_ids(entry['base_url'])
+                    public_ids = public_catalog or _public_model_ids(entry['base_url'], [canonicalize(model) for model in configured_models])
+                    if public_ids and (not models or entry.get('provider_type') == 'openai_chat'):
+                        models = list(public_ids)
+                        entry['model_aliases'] = public_ids
                     entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
                     if aliases and entry.get('provider_type') == 'openai_chat':
                         entry['model_aliases'] = {

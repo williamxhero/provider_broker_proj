@@ -4,12 +4,12 @@ from provider_broker.upstream import model_fulfills
 
 
 APPROVED_STAGES = {
-    "standard": {"deepseek-v4-flash-0731", "doubao-seed-2.0-lite"},
+    "standard": {"doubao-seed-2.0-lite"},
     "smart": {
-        "glm-5.3-flash", "deepseek-v4.1-flash", "qwen3.8-flash-next",
+        "glm-5.3-flash", "deepseek-v4-flash", "qwen3.8-flash-next",
         "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro",
     },
-    "expert": {"glm-5.3"},
+    "expert": {"glm-5.3", "deepseek-v4-pro"},
 }
 
 
@@ -30,8 +30,9 @@ def test_approved_catalog_entries_have_explicit_stage_and_valid_blended_price():
 
 def test_approved_aliases_canonicalize_deterministically():
     aliases = {
-        "DeepSeek_V4_Flash": "deepseek-v4-flash-0731",
-        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "DeepSeek_V4_Flash": "deepseek-v4-flash",
+        "deepseek-v4-1-flash": "deepseek-v4-flash",
+        "deepseek-reasoner": "deepseek-v4-flash",
         "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
         "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
         "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
@@ -52,8 +53,8 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
         "inventory_status": "available",
     }], "2026-09-12T00:00:00+00:00")
 
-    assert {provider.models[0] for provider in store.providers("standard")} == {"deepseek-v4-flash-0731"}
-    assert {provider.models[0] for provider in store.providers("smart")} == set()
+    assert {provider.models[0] for provider in store.providers("standard")} == set()
+    assert {provider.models[0] for provider in store.providers("smart")} == {"deepseek-v4-flash"}
     assert {provider.models[0] for provider in store.providers("expert")} == {"glm-5.3"}
     assert "unknown-provider-model" not in store.inventory()[0]["models"]
 
@@ -80,8 +81,8 @@ def test_catalog_migration_adds_missing_seeds_without_overwriting_existing_entri
 
 
 def test_model_fulfillment_requires_known_model_and_never_downgrades():
-    assert model_fulfills("deepseek-v4-flash-0731", "glm-5.3-flash")
-    assert model_fulfills("deepseek-v4.1-flash", "glm-5.3")
+    assert model_fulfills("deepseek-v4-flash", "glm-5.3-flash")
+    assert model_fulfills("deepseek-v4-pro", "glm-5.3")
     assert model_fulfills("glm-5.3", "glm-5.3")
     assert not model_fulfills("glm-5.3", "glm-5.3-flash")
     assert not model_fulfills("deepseek-v4-flash-0731", "unrecognized-model")

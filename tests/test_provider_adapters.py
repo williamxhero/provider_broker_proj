@@ -4,7 +4,7 @@ from types import SimpleNamespace
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from provider_broker.source import _api_url, expand_config
+from provider_broker.source import _api_url, _public_model_ids, expand_config
 from provider_broker.upstream import api_url, invoke_stream, provider_headers
 
 
@@ -197,3 +197,13 @@ def test_cpa_openai_compatibility_key_entries_and_model_aliases_are_supported():
     assert entries[0]["api_key"] == "secret"
     assert entries[0]["aliases"] == {"deepseek-ai/deepseek-v4-flash-0731": "deepseek-v4-flash-0731"}
     assert entries[0]["provider_type"] == "openai_chat"
+
+
+def test_public_provider_inventory_uses_builtin_model_ids_without_endpoint_ids():
+    assert _public_model_ids("https://api.deepseek.com/v1", ["deepseek-v4-flash", "deepseek-v4-pro"]) == {
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+    }
+    assert _public_model_ids("https://ark.cn-beijing.volces.com/api/v3", ["doubao-seed-2.0-lite"]) == {
+        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
+    }

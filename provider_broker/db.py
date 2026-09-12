@@ -6,6 +6,7 @@ from importlib.metadata import PackageNotFoundError, version
 from datetime import UTC, datetime, timedelta
 from dataclasses import dataclass
 from pathlib import Path
+from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
@@ -913,8 +914,13 @@ class Store:
         existing_policies = {row[0] for row in self.conn.execute("SELECT fingerprint FROM policy")}
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
-            from .catalog import canonicalize
+            from .catalog import PUBLIC_MODEL_IDS, canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
+            host = (urlsplit(base_url).hostname or "").lower()
+            for domain, public_models in PUBLIC_MODEL_IDS.items():
+                if host == domain or host.endswith("." + domain):
+                    source_models = list(dict.fromkeys(source_models + list(public_models)))
+                    break
             models = [model for model in source_models if model in catalog]
             # Stable fingerprints avoid decrypting credentials during ordinary
             # refreshes.  The fallback only supports one-time adoption of old

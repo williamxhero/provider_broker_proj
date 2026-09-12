@@ -33,8 +33,12 @@ CATALOG = {
     # approval attachment, so zero is an explicit unverified placeholder until
     # live price verification supplies billable rates; it is never copied from
     # another model.
-    "deepseek-v4-flash-0731": {
-        "family": "DeepSeek", "intellect": "standard",
+    "deepseek-v4-flash": {
+        "family": "DeepSeek", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "deepseek-v4-pro": {
+        "family": "DeepSeek", "intellect": "expert",
         "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
     },
     "doubao-seed-2.0-lite": {
@@ -43,10 +47,6 @@ CATALOG = {
     },
     "glm-5.3-flash": {
         "family": "GLM", "intellect": "smart",
-        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
-    },
-    "deepseek-v4.1-flash": {
-        "family": "DeepSeek", "intellect": "smart",
         "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
     },
     "qwen3.8-flash-next": {
@@ -69,8 +69,10 @@ CATALOG = {
 
 ALIASES = {
     "gpt-5.6": "gpt-5.6-sol", "claude-opus-4.8": "claude-opus-4-8",
-    "deepseek-v4-flash": "deepseek-v4-flash-0731",
-    "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+    "deepseek-chat": "deepseek-v4-flash",
+    "deepseek-reasoner": "deepseek-v4-flash",
+    "deepseek-v4-flash-0731": "deepseek-v4-flash",
+    "deepseek-v4-1-flash": "deepseek-v4-flash",
     "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
     "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
     "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
@@ -79,12 +81,24 @@ ALIASES = {
     "qwen3-8-flash-next": "qwen3.8-flash-next",
 }
 
-CATALOG_SEED_VERSION = 2
+CATALOG_SEED_VERSION = 3
 CATALOG_V2_MODELS = frozenset({
-    "deepseek-v4-flash-0731", "doubao-seed-2.0-lite", "glm-5.3-flash",
-    "deepseek-v4.1-flash", "qwen3.8-flash-next", "doubao-seed-2.1-turbo",
+    "deepseek-v4-flash", "deepseek-v4-pro", "doubao-seed-2.0-lite", "glm-5.3-flash",
+    "qwen3.8-flash-next", "doubao-seed-2.1-turbo",
     "doubao-seed-2.1-pro", "glm-5.3",
 })
+
+PUBLIC_MODEL_IDS = {
+    "deepseek.com": {
+        "deepseek-v4-flash": "deepseek-v4-flash",
+        "deepseek-v4-pro": "deepseek-v4-pro",
+    },
+    "volces.com": {
+        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
+        "doubao-seed-2.1-turbo": "doubao-seed-2.1-turbo",
+        "doubao-seed-2.1-pro": "doubao-seed-2.1-pro",
+    },
+}
 
 
 def canonicalize(model: str) -> str:

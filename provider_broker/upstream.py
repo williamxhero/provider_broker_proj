@@ -588,6 +588,9 @@ async def invoke_stream(provider, body: dict) -> dict:
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
     if provider.provider_type in ("anthropic", "claude", "openai_chat"):
         payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
+        host = (urlsplit(provider.base_url).hostname or "").lower()
+        if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
+            payload["thinking"] = {"type": "enabled"}
         if outbound_schema is not None:
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": outbound_schema}}
         endpoint = "/chat/completions"
