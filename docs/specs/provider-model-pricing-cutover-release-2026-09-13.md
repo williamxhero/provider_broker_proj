@@ -1,6 +1,6 @@
 # Provider+Model pricing cutover release record
 
-- Implementation revision: `a91176b31cd359e19081f4ad875ff086a6338d7e`
+- Implementation revision: `29bb8ce7a9d69f144b51ff31c7d55736c35e2932`
 - Scope: SPEC #59, TICKET #66, TICKET #67
 - Pricing migration version: `1`
 - Runtime rate authority: active Provider+Model rows; Model remains stage/family metadata and Provider remains inventory identity.
