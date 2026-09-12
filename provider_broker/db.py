@@ -215,6 +215,8 @@ class Store:
         ]:
             try: self.conn.execute(f'ALTER TABLE observation ADD COLUMN {name} {definition}')
             except sqlite3.OperationalError: pass
+        self.conn.execute("CREATE INDEX IF NOT EXISTS observation_created_at ON observation(created_at DESC)")
+        self.conn.execute("CREATE INDEX IF NOT EXISTS observation_route_attempt ON observation(route_id, attempt_number)")
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN api_key_mask TEXT NOT NULL DEFAULT '***'")
@@ -767,11 +769,8 @@ class Store:
         rows = rows[:limit]
         return [dict(row) for row in rows], (rows[-1][key] if has_more and rows else None)
 
-    def route_amplification(self, route_id: str, attempts: list[dict] | None = None) -> dict:
-        attempts = attempts if attempts is not None else [dict(row) for row in self.conn.execute(
-            "SELECT * FROM route_attempt WHERE route_id=? ORDER BY attempt_number", (route_id,))]
-        usage = self.conn.execute("""SELECT fingerprint,status,input_tokens,output_tokens,cost FROM observation
-            WHERE route_id=? AND attempt_number IS NOT NULL AND attempt_number>0""", (route_id,)).fetchall()
+    @staticmethod
+    def _amplification_from_rows(attempts: list[dict], usage: list[dict]) -> dict:
         known_costs = [row["cost"] for row in usage if row["cost"] is not None]
         known_tokens = [int(row["input_tokens"] or 0) + int(row["output_tokens"] or 0) for row in usage
                         if row["input_tokens"] is not None and row["output_tokens"] is not None]
@@ -792,6 +791,13 @@ class Store:
             "hedge_started": roles["hedge"] > 0,
             "hedge_rescue": hedge_winner and not primary_delivered,
         }
+
+    def route_amplification(self, route_id: str, attempts: list[dict] | None = None) -> dict:
+        attempts = attempts if attempts is not None else [dict(row) for row in self.conn.execute(
+            "SELECT * FROM route_attempt WHERE route_id=? ORDER BY attempt_number", (route_id,))]
+        usage = [dict(row) for row in self.conn.execute("""SELECT fingerprint,status,input_tokens,output_tokens,cost FROM observation
+            WHERE route_id=? AND attempt_number IS NOT NULL AND attempt_number>0""", (route_id,)).fetchall()]
+        return self._amplification_from_rows(attempts, usage)
 
     def record_capability(self, fingerprint: str, model: str, contract: str, state: str,
                           failure_class: str | None = None) -> None:
@@ -1334,7 +1340,23 @@ class Store:
                 },
             }
         route_ids = [row[0] for row in self.conn.execute(f"SELECT route_id FROM route_run WHERE {route_where}", params).fetchall()]
-        amplifications = [self.route_amplification(route_id) for route_id in route_ids]
+        attempts_by_route: dict[str, list[dict]] = {}
+        usage_by_route: dict[str, list[dict]] = {}
+        for offset in range(0, len(route_ids), 500):
+            batch = route_ids[offset:offset + 500]
+            placeholders = ",".join("?" for _ in batch)
+            for item in self.conn.execute(
+                f"SELECT route_id,site_id,role,status,elapsed_ms FROM route_attempt WHERE route_id IN ({placeholders}) ORDER BY route_id,attempt_number",
+                batch,
+            ).fetchall():
+                attempts_by_route.setdefault(item["route_id"], []).append(dict(item))
+            for item in self.conn.execute(
+                f"""SELECT route_id,fingerprint,status,input_tokens,output_tokens,cost FROM observation
+                    WHERE route_id IN ({placeholders}) AND attempt_number IS NOT NULL AND attempt_number>0""",
+                batch,
+            ).fetchall():
+                usage_by_route.setdefault(item["route_id"], []).append(dict(item))
+        amplifications = [self._amplification_from_rows(attempts_by_route.get(route_id, []), usage_by_route.get(route_id, [])) for route_id in route_ids]
         attempts = sorted(item["attempts_started"] for item in amplifications)
         hedges = [item for item in amplifications if item["hedge_started"]]
         costs_known = [item for item in amplifications if item["cost_attempts"]]

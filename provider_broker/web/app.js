@@ -489,24 +489,27 @@ async function loadAnalytics() {
 }
 
 async function load() {
-  const [summary, providers, catalog, quality, routing] = await Promise.all([
+  const [summary, providers, catalog, routing] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/catalog"),
-    requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
   ]);
   renderSummary(summary);
   renderProviders(providers);
   renderCatalog(catalog);
   renderModelView();
-  renderQuality(quality);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
-  await loadCalls("");
-  await loadRoutes();
-  await loadDataHealth();
-  await loadAnalytics();
+  // Secondary panels must not delay the primary dashboard. Fetch them in
+  // parallel after the core data has been rendered.
+  void Promise.allSettled([
+    requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`).then(renderQuality),
+    loadCalls(""),
+    loadRoutes(),
+    loadDataHealth(),
+    loadAnalytics(),
+  ]);
 }
 
 byId("policy").addEventListener("submit", async (event) => {
