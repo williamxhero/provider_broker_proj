@@ -626,7 +626,8 @@ class Store:
                 catalog_rows = self.conn.execute("SELECT * FROM model_catalog ORDER BY model").fetchall()
                 for row in catalog_rows:
                     self.conn.execute(
-                        "INSERT OR IGNORE INTO canonical_model(id,stage,family,active) VALUES(?,?,?,1)",
+                        """INSERT INTO canonical_model(id,stage,family,active) VALUES(?,?,?,1)
+                           ON CONFLICT(id) DO UPDATE SET stage=excluded.stage,family=excluded.family""",
                         (row['model'], row['intellect'], row['family']),
                     )
                     self.insert_provider_model_price(
@@ -818,7 +819,26 @@ class Store:
         return [{"fingerprint": r["fingerprint"], "provider": r["name"], "note": r["note"], "model": r["model"], "state": r["state"], "consecutive_failures": r["consecutive_failures"], "backoff_level": r["backoff_level"], "last_real_attempt": r["last_real_attempt"], "last_real_success": r["last_real_success"], "last_probe_at": r["probe_at"] or r["last_probe_at"], "next_probe_at": r["next_probe_at"], "ttft_ms": r["probe_ttft_ms"], "error_type": r["probe_error_type"]} for r in rows]
 
     def catalog(self):
-        return {r['model']:{'family':r['family'],'intellect':r['intellect'],'currency':r['currency'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price']} for r in self.conn.execute('SELECT * FROM model_catalog ORDER BY model')}
+        rows = self.conn.execute(
+            """SELECT m.id model,m.family,m.stage intellect,
+                      COALESCE(p.currency,'USD') currency,
+                      COALESCE(p.input_price,0) input_price,
+                      COALESCE(p.cache_price,0) cache_price,
+                      COALESCE(p.output_price,0) output_price
+               FROM canonical_model m
+               LEFT JOIN pricing_provider pp ON pp.provider_key='official-catalog' AND pp.active=1
+               LEFT JOIN provider_model_price p
+                 ON p.provider_id=pp.id AND p.model_id=m.id AND p.active=1
+               WHERE m.active=1 ORDER BY m.id"""
+        ).fetchall()
+        return {
+            r['model']:{
+                'family':r['family'], 'intellect':r['intellect'], 'currency':r['currency'],
+                'official_input_price':r['input_price'], 'official_cache_price':r['cache_price'],
+                'official_output_price':r['output_price'],
+            }
+            for r in rows
+        }
     def create_catalog(self, model, body):
         try:
             with self.conn:
