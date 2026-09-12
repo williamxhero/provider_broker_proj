@@ -121,6 +121,7 @@ class FakeStore:
         self.inflight = {}
         self.observations = []
         self.route_scores = {}
+        self.blocked = []
 
     def providers(self, tier):
         return self.items if tier == self.tier else []
@@ -141,7 +142,7 @@ class FakeStore:
         self.observations.append(data)
 
     def block_route(self, *_):
-        pass
+        self.blocked.append(_)
 
     def route_score(self, item, _model, _body):
         return self.route_scores.get(item.id, 0)
@@ -950,6 +951,33 @@ async def test_json_decode_repair_precedes_untried_unhealthy_candidates():
     assert result["text"] == '{"answer":"recovered"}'
     assert order == [0, 0]
     assert [row["status"] for row in result["attempts"]] == ["structured_output_invalid", "completed"]
+
+
+async def test_model_not_found_blocks_only_bad_provider_model_and_falls_back():
+    bad = provider(0, secret="bad-model-alias")
+    good = provider(1, secret="viable-key")
+    store = FakeStore([bad, good])
+    order = []
+
+    async def invoke(item, _body):
+        order.append(item.id)
+        if item.id == 0:
+            raise AttemptFailure("unavailable", diagnostic={
+                "http_status": 404, "upstream_error_code": "model_not_found",
+            })
+        return completed("fallback")
+
+    with patch("provider_broker.upstream.random.sample", side_effect=lambda values, k: list(values)):
+        result = await route(
+            store, "standard", {"prompt": "alias repair", "deadline_ms": 500},
+            parallel_cap=1, invoker=invoke, hedge_delay_ms=0,
+            route_attempt_budget=2, response_reserve_ms=0,
+        )
+
+    assert result["text"] == "fallback"
+    assert order == [0, 1]
+    assert store.blocked == [(bad.fingerprint, "gpt-5.6-luna")]
+    assert [row["status"] for row in result["attempts"]] == ["unavailable", "completed"]
 
 
 async def test_recent_exact_winner_is_ranked_before_random_same_band_candidates():

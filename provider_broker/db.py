@@ -710,6 +710,8 @@ class Store:
             "telemetry_version", "delivery_mode", "release_version", "routing_policy_version",
             "configuration_fingerprint", "shape_version", "input_bucket", "output_budget_bucket",
             "deadline_bucket", "schema_family", "experiment_id", "experiment_arm",
+            "first_attempt_ms", "capacity_wait_ms", "first_response_header_ms", "first_text_ms",
+            "validation_completed_ms",
         )
         detail = {name: row[name] for name in allowed}
         detail["candidates"] = [dict(candidate) for candidate in self.conn.execute("""SELECT fingerprint,model,site_id,
@@ -720,6 +722,31 @@ class Store:
             client_family,client_version,telemetry_version,received_at FROM client_telemetry WHERE route_id=?""", (route_id,))]
         detail["amplification"] = self.route_amplification(route_id, detail["attempts"])
         return detail
+
+    def route_audit_items(self, route_id: str, kind: str, *, limit: int = 100,
+                          cursor: int | None = None) -> tuple[list[dict], int | None]:
+        """Return bounded, deterministic audit facts for a route subresource."""
+        if kind == "candidates":
+            table, key, columns = "route_candidate", "ordinal", (
+                "ordinal,fingerprint,model,site_id,eligible,exclusion_reason,initial_rank,launched,role")
+        elif kind == "attempts":
+            table, key, columns = "route_attempt", "attempt_number", (
+                "attempt_number,fingerprint,model,site_id,role,status,failure_class,started_ms,elapsed_ms")
+        else:
+            raise ValueError("invalid audit resource")
+        limit = max(1, min(100, int(limit)))
+        clauses = ["route_id=?"]
+        params: list[object] = [route_id]
+        if cursor is not None:
+            clauses.append(f"{key} > ?")
+            params.append(cursor)
+        rows = self.conn.execute(
+            f"SELECT {columns} FROM {table} WHERE {' AND '.join(clauses)} ORDER BY {key} LIMIT ?",
+            [*params, limit + 1],
+        ).fetchall()
+        has_more = len(rows) > limit
+        rows = rows[:limit]
+        return [dict(row) for row in rows], (rows[-1][key] if has_more and rows else None)
 
     def route_amplification(self, route_id: str, attempts: list[dict] | None = None) -> dict:
         attempts = attempts if attempts is not None else [dict(row) for row in self.conn.execute(
@@ -913,7 +940,15 @@ class Store:
             value = urlsplit(base_url).hostname or base_url
         return "".join(char if char.isalnum() or char in "._-" else "-" for char in value)[:80] or "default"
 
-    def providers(self, tier: str) -> list[Provider]:
+    def capability_allows_route(self, fingerprint: str, model: str, contract: str) -> bool:
+        """Gate only the contract known to be unsupported for this key/model."""
+        row = self.conn.execute(
+            "SELECT state FROM provider_capability WHERE fingerprint=? AND model=? AND contract=?",
+            (fingerprint, model, contract),
+        ).fetchone()
+        return row is None or row["state"] != "unsupported"
+
+    def providers(self, tier: str, *, contract: str | None = None) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.price_group,p.multiplier,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
         WHERE p.enabled=1 AND p.calibrated=1 ORDER BY p.price_group, s.id""").fetchall()
         catalog = self.catalog()
@@ -928,6 +963,8 @@ class Store:
                 # per model, so make each routing candidate explicit rather than letting
                 # an open model hide behind the first item in a shared list.
                 for model in models:
+                    if contract and not self.capability_allows_route(r['fingerprint'], model, contract):
+                        continue
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
                     pricing = catalog[model]
@@ -989,23 +1026,32 @@ class Store:
         return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'])
 
     def key_test_providers(self) -> list[Provider]:
-        """Return one representative model for every API key in inventory."""
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.multiplier,p.max_parallel
+        """Return every enabled, calibrated API-key/model probe target.
+
+        A key can expose several Codex models, and a successful probe of one
+        model does not establish that the other models work.  Keep each model
+        as its own Provider value so health and structured-contract evidence
+        remains scoped to the provider/model pair.
+        """
+        rows = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.multiplier,p.max_parallel
             FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id""").fetchall()
         catalog = self.catalog()
         result = []
         for row in rows:
-            model = next((item for item in json.loads(row['models_json']) if item in catalog), None)
-            if model is None:
-                continue
             headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
-            pricing = catalog[model]
-            result.append(Provider(
-                row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
-                row['provider_type'], headers, [model], pricing,
-                int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']),
-                bool(row['enabled']), float(row['multiplier']), row['site_id'],
-            ))
+            if not row['enabled'] or not row['calibrated']:
+                continue
+            tiers = set(json.loads(row['tiers_json']))
+            for model in json.loads(row['models_json']):
+                if model not in catalog or catalog[model]['intellect'] not in tiers:
+                    continue
+                pricing = catalog[model]
+                result.append(Provider(
+                    row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
+                    row['provider_type'], headers, [model], pricing,
+                    int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']),
+                    bool(row['enabled']), float(row['multiplier']), row['site_id'],
+                ))
         return result
 
     def try_acquire(self, provider: Provider) -> bool:

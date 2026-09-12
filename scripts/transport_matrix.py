@@ -69,25 +69,41 @@ def cpa_cell(cpa_url: str, cpa_key: str, model: str, contract: str) -> dict:
     }
 
 
-def broker_cell(broker_url: str, model: str, contract: str) -> dict:
+def broker_cell(broker_url: str, model: str, contract: str, *, runs: int = 1) -> dict:
     status, inventory = request(broker_url.rstrip("/") + "/admin/v1/providers?window=24h")
     providers = (inventory or {}).get("providers") if status == 200 else None
     target = next((item for item in providers or [] if item.get("enabled") and item.get("calibrated") and model in item.get("models", [])), None)
     if not target:
-        return {"path": "broker_direct", "contract": contract, "model": model, "state": "skipped", "reason": "no_enabled_target"}
+        return {"path": "broker_direct", "contract": contract, "model": model, "state": "failed", "reason": "no_enabled_target", "runs": 0, "passed_runs": 0}
     payload = {
         "stage": TIERS.get(model, "smart"), "mode": "all", "fingerprint": target["fingerprint"], "model": model,
         "timeout_ms": 60_000, "concurrency": 1, "contract": contract, "record": False,
     }
     started = time.monotonic()
-    status, data = request(broker_url.rstrip("/") + "/admin/v1/probes", payload=payload)
-    item = ((data or {}).get("items") or [{}])[0]
+    items = []
+    for _ in range(runs):
+        status, data = request(broker_url.rstrip("/") + "/admin/v1/probes", payload=payload)
+        item = ((data or {}).get("items") or [{}])[0]
+        items.append((status, item))
+    status, item = items[-1]
+    passed_runs = sum(1 for cell_status, cell in items if cell_status == 200 and cell.get("state") == "succeeded")
     return {
         "path": "broker_direct", "contract": contract, "model": model, "http_status": status,
-        "state": item.get("state", "failed") if status == 200 else "failed",
+        "state": "succeeded" if passed_runs == runs else "failed",
         "error_type": item.get("error_type"), "ttfb_ms": item.get("ttfb_ms"), "ttft_ms": item.get("ttft_ms"),
+        "runs": runs, "passed_runs": passed_runs,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
     }
+
+
+def structured_gate_passes(outcomes: list[dict]) -> bool:
+    """Require one real fixed target to pass all of its consecutive runs."""
+    return any(
+        item.get("path") == "broker_direct"
+        and item.get("contract") == "structured"
+        and item.get("state") == "succeeded"
+        for item in outcomes
+    )
 
 
 def main() -> int:
@@ -96,15 +112,20 @@ def main() -> int:
     parser.add_argument("--gate", action="store_true", help="Fail only when Broker structured canaries fail")
     parser.add_argument("--broker-only", action="store_true", help="Do not call CPA")
     parser.add_argument("--structured-only", action="store_true", help="Skip plain-text control cells")
+    parser.add_argument("--runs", type=int, default=1, help="Consecutive probes per fixed Broker target")
     args = parser.parse_args()
+    if args.runs < 1:
+        parser.error("runs must be positive")
     broker_url = os.getenv("BROKER_URL", "http://192.168.50.2:8817")
     cpa_url = os.getenv("CPA_URL", "http://127.0.0.1:8317")
     cpa_key = os.getenv("CPA_INFERENCE_KEY", "")
-    models = args.models or ["gpt-5.6-luna", "claude-sonnet-5", "gpt-5.6-sol"]
+    # Include the smart fallback tier in the release gate.  A flaky expert
+    # model must not hide a healthy smart target from the any-provider gate.
+    models = args.models or ["gpt-5.6-luna", "gpt-5.6-terra", "claude-sonnet-5", "gpt-5.6-sol"]
     outcomes = []
     for model in models:
         for contract in (("structured",) if args.structured_only else ("plain", "structured")):
-            outcomes.append(broker_cell(broker_url, model, contract))
+            outcomes.append(broker_cell(broker_url, model, contract, runs=args.runs))
             if not args.broker_only:
                 outcomes.append(cpa_cell(cpa_url, cpa_key, model, contract) if cpa_key else {
                     "path": "cpa", "contract": contract, "model": model, "state": "skipped", "reason": "CPA_INFERENCE_KEY_missing",
@@ -112,8 +133,7 @@ def main() -> int:
     for outcome in outcomes:
         print(json.dumps(outcome, ensure_ascii=False, sort_keys=True))
     if args.gate:
-        failed = [item for item in outcomes if item["path"] == "broker_direct" and item["contract"] == "structured" and item["state"] != "succeeded"]
-        return 1 if failed else 0
+        return 0 if structured_gate_passes(outcomes) else 1
     return 0
 
 

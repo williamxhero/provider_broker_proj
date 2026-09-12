@@ -211,6 +211,23 @@ async def route_detail(request):
     return web.json_response(detail)
 
 
+async def route_audit_resource(request):
+    resource = request.match_info["resource"]
+    try:
+        limit = int(request.query.get("limit", 100))
+        cursor = request.query.get("cursor")
+        cursor = int(cursor) if cursor is not None else None
+        if not 1 <= limit <= 100 or cursor is not None and cursor < 0:
+            raise ValueError
+    except (TypeError, ValueError):
+        return web.json_response({"error": "invalid pagination"}, status=400)
+    if request.app["store"].route_detail(request.match_info["route_id"]) is None:
+        return web.json_response({"error": "route not found"}, status=404)
+    items, next_cursor = request.app["store"].route_audit_items(
+        request.match_info["route_id"], resource, limit=limit, cursor=cursor)
+    return web.json_response({"items": items, "next_cursor": str(next_cursor) if next_cursor is not None else None})
+
+
 async def analytics(request):
     window = request.query.get("window", "24h")
     if window not in ("1h", "24h", "7d", "30d"):
@@ -660,7 +677,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
         web.patch("/admin/v1/policy/{fingerprint}", update_policy),

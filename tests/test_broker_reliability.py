@@ -1,8 +1,12 @@
 from datetime import UTC, datetime, timedelta
 from pathlib import Path
+from unittest.mock import patch
 
+import pytest
 from provider_broker.db import Store
-from provider_broker.upstream import classify_failure
+from provider_broker.health import run_probe
+from provider_broker.source import expand_config
+from provider_broker.upstream import AttemptFailure, classify_failure
 
 
 def store(tmp_path: Path) -> Store:
@@ -64,6 +68,24 @@ def test_versioned_route_telemetry_reports_safe_cohorts_and_request_coverage(tmp
     assert quality["first_forwarded_delta"]["p95_ms"] is None
 
 
+def test_structured_capability_gate_is_scoped_to_one_key_and_model(tmp_path):
+    db = store(tmp_path)
+    db.replace_source_snapshot([
+        {"name": "Claude A", "base_url": "https://claude-a.test", "api_key": "key-a",
+         "provider_type": "claude", "models": ["claude-sonnet-5"], "inventory_status": "available"},
+        {"name": "Claude B", "base_url": "https://claude-b.test", "api_key": "key-b",
+         "provider_type": "claude", "models": ["claude-sonnet-5"], "inventory_status": "available"},
+    ], datetime.now(UTC).isoformat())
+    first = db.providers("smart")
+    assert {item.api_key for item in first} == {"key-a", "key-b"}
+
+    fingerprint = first[0].fingerprint
+    db.record_capability(fingerprint, "claude-sonnet-5", "structured", "unsupported", "contract")
+
+    assert [item.api_key for item in db.providers("smart", contract="structured")] == ["key-b"]
+    assert {item.api_key for item in db.providers("smart", contract="plain")} == {"key-a", "key-b"}
+
+
 def test_route_reconciliation_and_audit_detail_are_idempotent_and_private(tmp_path):
     db = store(tmp_path)
     db.route_started("route-open", "standard", "request-open", body={"prompt": "secret prompt"})
@@ -85,6 +107,29 @@ def test_route_reconciliation_and_audit_detail_are_idempotent_and_private(tmp_pa
     assert "secret prompt" not in str(detail)
     assert health["reconciled_unknown"] == 1
     assert health["in_progress"] == 0
+
+
+def test_route_audit_subresources_are_bounded_ordered_and_include_milestones(tmp_path):
+    db = store(tmp_path)
+    db.route_started("route-api", "standard", "request-api")
+    db.route_milestone("route-api", first_attempt_ms=3, first_text_ms=9, validation_completed_ms=12)
+    for ordinal in range(3):
+        db.record_candidate("route-api", fingerprint=f"key-{ordinal}", model="luna", site_id="site-a",
+                            eligible=True, initial_rank=ordinal + 1)
+    for attempt in range(1, 3):
+        db.record_attempt("route-api", attempt_number=attempt, fingerprint=f"key-{attempt}", model="luna",
+                          site_id="site-a", role="primary" if attempt == 1 else "retry", status="completed")
+
+    detail = db.route_detail("route-api")
+    assert detail["first_attempt_ms"] == 3
+    assert detail["validation_completed_ms"] == 12
+    candidates, next_cursor = db.route_audit_items("route-api", "candidates", limit=2)
+    assert [item["ordinal"] for item in candidates] == [0, 1]
+    assert next_cursor == 1
+    attempts, next_attempt_cursor = db.route_audit_items("route-api", "attempts", limit=1, cursor=1)
+    assert [item["attempt_number"] for item in attempts] == [2]
+    assert next_attempt_cursor is None
+    assert "prompt" not in str(detail)
 
 
 def test_delivery_latency_uses_applicable_modes_and_never_turns_unknown_into_zero(tmp_path):
@@ -181,3 +226,42 @@ def test_fault_classification_does_not_open_circuit_for_contract_rejection():
     assert classify_failure("cancelled", {}) == "neutral"
     assert classify_failure("unavailable", {"http_status": 429}) == "provider_overload"
     assert classify_failure("transport_failed", {}) == "transport"
+
+
+def test_model_not_found_isolated_from_provider_health_and_detected_from_404():
+    assert classify_failure("unavailable", {"http_status": 404}) == "model_not_found"
+    assert classify_failure("unavailable", {"upstream_error_code": "MODEL_NOT_FOUND"}) == "model_not_found"
+    assert classify_failure("unavailable", {"http_status": 401}) == "credential"
+
+
+@pytest.mark.asyncio
+async def test_structured_probe_contract_failure_records_capability_without_opening_circuit(tmp_path):
+    db = store(tmp_path)
+    db.replace_source_snapshot([{
+        "name": "Claude", "base_url": "https://claude.test", "api_key": "key",
+        "provider_type": "claude", "models": ["claude-sonnet-5"], "inventory_status": "available",
+    }], datetime.now(UTC).isoformat())
+    target = db.providers("smart")[0]
+
+    async def reject_contract(_provider, _body):
+        raise AttemptFailure("unavailable", diagnostic={"http_status": 400, "schema_hash": "schema"})
+
+    with patch("provider_broker.health._invoke_stream", reject_contract):
+        for _ in range(3):
+            result = await run_probe(db, tier="smart", mode="all", fingerprint=target.fingerprint,
+                                     model=target.models[0], contract="structured")
+            assert result[0]["state"] == "failed"
+
+    assert db.health(target.fingerprint, target.models[0])["state"] != "open"
+    assert not db.capability_allows_route(target.fingerprint, target.models[0], "structured")
+    assert db.capability_allows_route(target.fingerprint, target.models[0], "plain")
+
+
+def test_cpa_aliases_are_normalized_for_discovered_model_repair():
+    entries = expand_config({
+        "codex-api-key": [{
+            "base_url": "https://provider.example/v1", "api_key": "secret",
+            "models": [{"name": "gpt-5.6-terra", "alias": " GPT-5.6-LUNA "}],
+        }],
+    })
+    assert entries[0]["aliases"] == {"gpt-5.6-luna": "gpt-5.6-terra"}

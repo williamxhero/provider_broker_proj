@@ -904,7 +904,22 @@ def classify_failure(status: str, diagnostic: dict) -> str:
         return "neutral"
     if status in {"structured_output_invalid", "structured_schema_invalid", "output_truncated", "model_mismatch"}:
         return "contract"
+    # A model rejection belongs to this provider/model pair.  Treating it as
+    # a provider outage opens the key's circuit and can hide otherwise viable
+    # models on the same key.
+    upstream_code = str(diagnostic.get("upstream_error_code") or "").casefold()
+    upstream_type = str(diagnostic.get("upstream_error_type") or "").casefold()
+    if (
+        upstream_code in {"model_not_found", "model-not-found", "invalid_model", "invalid-model"}
+        or upstream_type in {"model_not_found", "model-not-found", "invalid_model", "invalid-model"}
+        or diagnostic.get("http_status") == 404
+    ):
+        return "model_not_found"
+    # A structured request rejected at the provider boundary is capability
+    # evidence for this key/model.  Keep it out of the shared outage circuit.
     code = diagnostic.get("http_status")
+    if code == 400 and diagnostic.get("schema_hash"):
+        return "contract"
     if code in {401, 403}:
         return "credential"
     if code in {408, 409, 425, 429}:
@@ -987,7 +1002,13 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         return route_scores[key]
 
     for candidate_tier in tiers[tiers.index(tier):]:
-        candidates = store.providers(candidate_tier)
+        contract = "structured" if structured_schema(body) is not None else "plain"
+        # Keep the routing seam compatible with lightweight Store doubles and
+        # older embedders while using the capability gate on the real Store.
+        if "contract" in inspect.signature(store.providers).parameters:
+            candidates = store.providers(candidate_tier, contract=contract)
+        else:
+            candidates = store.providers(candidate_tier)
         eligible_candidates += len(candidates)
         available = [provider for provider in candidates if store.has_capacity(provider)]
         randomized = random.sample(available, k=len(available)) if available else []
@@ -1019,11 +1040,15 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
         selector = getattr(store, "recovery_providers", None)
         if not callable(selector):
             return
+        contract = "structured" if structured_schema(body) is not None else "plain"
         for provider in selector(
             candidate_tier, excluded_endpoints=normal_endpoints, limit=open_recovery_candidate_limit,
             cooldown_seconds=open_recovery_cooldown_seconds,
             allow_before_due=allow_before_due,
         ):
+            allows = getattr(store, "capability_allows_route", None)
+            if callable(allows) and not allows(provider.fingerprint, canonicalize(provider.models[0]), contract):
+                continue
             if hasattr(store, "record_candidate"):
                 store.record_candidate(
                     route_id, fingerprint=provider.fingerprint, model=canonicalize(provider.models[0]),
@@ -1190,6 +1215,10 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
                     output = task.result()
                 except AttemptFailure as exc:
                     audit.finish(sequence, exc.status, diagnostic=exc.diagnostic)
+                    # Keep a bad alias/model from being selected again while
+                    # leaving the provider's other models and API keys usable.
+                    if classify_failure(exc.status, exc.diagnostic) == "model_not_found":
+                        store.block_route(provider.fingerprint, requested_model)
                     health = observe(
                         store, provider, requested_model, candidate_tier, body, exc.status,
                         attempt=audit.row(sequence), route_id=route_id,

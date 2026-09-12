@@ -674,6 +674,21 @@ async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it
     assert failed_latest['last_test_at'] == '2100-01-01T00:00:00+00:00'
 
 
+async def test_one_click_key_test_probes_every_enabled_model(client, cpa):
+    cpa.app['config'] = {'providers': [{'name': 'Multi-model key', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
+        {'key': 'multi-model-key', 'models': ['gpt-5.6-luna', 'gpt-5.6-terra']},
+    ]}]}
+    cpa.app['upstream_app']['models'] = ['gpt-5.6-luna', 'gpt-5.6-terra']
+
+    await client.post('/admin/v1/sync')
+    tested = await client.post('/admin/v1/providers/test')
+    result = await tested.json()
+
+    assert tested.status == 200
+    assert result['total_keys'] == 1
+    assert [item['model'] for item in result['items']] == ['gpt-5.6-luna', 'gpt-5.6-terra']
+    assert all(item['state'] == 'succeeded' for item in result['items'])
+
 async def test_web_console_is_direct_and_management_api_needs_no_session(client):
     response=await client.get('/')
     assert response.status == 200

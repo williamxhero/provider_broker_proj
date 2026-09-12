@@ -8,7 +8,7 @@ import json
 import random
 from datetime import UTC, datetime
 
-from .upstream import AttemptFailure, invoke_stream as _invoke_stream, model_fulfills, price_bands
+from .upstream import AttemptFailure, classify_failure, invoke_stream as _invoke_stream, model_fulfills, price_bands
 
 PROBE_SCHEMA = {
     "type": "object",
@@ -103,18 +103,27 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
                                    reachable=True, responded=True, first_token=True, model_matched=matched,
                                    ttfb_ms=output.get("ttfb_ms"), ttft_ms=output.get("latency_ms"), duration_ms=output.get("duration_ms"),
                                    error_type=result["error_type"], error=result["error_type"], now=started)
-                store.record_health(provider.fingerprint, requested_model, success=matched, real=False,
-                                    ttft_ms=output.get("latency_ms"), now=started)
+                if hasattr(store, "record_capability"):
+                    store.record_capability(provider.fingerprint, requested_model, contract,
+                                            "supported" if matched else "unsupported",
+                                            None if matched else "contract")
+                if matched:
+                    store.record_health(provider.fingerprint, requested_model, success=True, real=False,
+                                        ttft_ms=output.get("latency_ms"), now=started)
         except AttemptFailure as exc:
             status = sanitize_error(exc.status)
             result["error_type"] = status
             result["duration_ms"] = round(((clock or (lambda: datetime.now(UTC)))() - started).total_seconds() * 1000, 2)
             if record:
+                failure_class = classify_failure(exc.status, exc.diagnostic)
                 store.record_probe(fingerprint=provider.fingerprint, model=requested_model, tier=candidate_tier, mode=mode,
                                    reachable=status not in {"transport_failed", "timed_out"}, responded=False, first_token=False,
                                    model_matched=False, ttfb_ms=None, ttft_ms=None, duration_ms=result["duration_ms"],
                                    error_type=status, error=status, now=started)
-                store.record_health(provider.fingerprint, requested_model, success=False, real=False, now=started)
+                if failure_class == "contract" and hasattr(store, "record_capability"):
+                    store.record_capability(provider.fingerprint, requested_model, contract, "unsupported", failure_class)
+                elif failure_class not in {"neutral", "contract", "model_not_found", "credential", "unknown"}:
+                    store.record_health(provider.fingerprint, requested_model, success=False, real=False, now=started)
         finally:
             store.release(provider)
             semaphore.release()

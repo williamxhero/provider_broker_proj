@@ -45,7 +45,7 @@ def expand_config(payload: object) -> list[dict]:
                 if base and secret:
                     site_name = _site_name(key)
                     configured=key.get('models') or []
-                    aliases={str(model.get('alias')):str(model.get('name')) for model in configured if isinstance(model,dict) and model.get('alias') and model.get('name')}
+                    aliases={str(model.get('alias')).strip().casefold():str(model.get('name')).strip() for model in configured if isinstance(model,dict) and isinstance(model.get('alias'), str) and isinstance(model.get('name'), str) and model.get('alias').strip() and model.get('name').strip()}
                     result.append({'name':site_name or section,'site_name':site_name,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':family,'request_headers':defaults,'source':{'section':section,'site_name':site_name}})
         return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
@@ -84,7 +84,7 @@ async def sync_cpa(store, url: str, token: str) -> dict:
                     raw=await response.json(content_type=None)
                     discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
                     aliases=entry.get('aliases',{})
-                    models=list(dict.fromkeys(canonicalize(aliases.get(model,model)) for model in discovered))
+                    models=list(dict.fromkeys(canonicalize(aliases.get(model.casefold(), model)) for model in discovered))
                     entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
             except Exception:
                 entry['models']=['unavailable']; entry['inventory_status']='unavailable'

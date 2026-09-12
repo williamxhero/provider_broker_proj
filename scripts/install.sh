@@ -124,6 +124,19 @@ if ! "$RELEASE/venv/bin/python" "$RELEASE/production_shape_smoke.py" --runs 1 --
   exit 1
 fi
 
+# Hold the release until one fixed enabled Provider/model proves the direct
+# structured contract three times in a row.  The matrix gate treats missing
+# targets and any failed run as failures; output contains no prompt or body.
+if ! "$RELEASE/venv/bin/python" "$RELEASE/transport_matrix.py" --broker-only --structured-only --gate --runs 3; then
+  if [[ -n "$previous_target" ]]; then
+    ln -sfn "$previous_target" "$APP_ROOT/current.rollback"
+    mv -Tf "$APP_ROOT/current.rollback" "$APP_ROOT/current"
+    systemctl restart provider-broker.service
+  fi
+  echo "New release failed consecutive structured Provider canary and was rolled back" >&2
+  exit 1
+fi
+
 systemctl enable --now provider-broker-browser.service provider-broker-browser-web.service >/dev/null
 systemctl restart provider-broker-browser.service provider-broker-browser-web.service
 browser_ready=false
