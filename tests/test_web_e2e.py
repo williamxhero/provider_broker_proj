@@ -46,21 +46,21 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         "fingerprint": "provider-a", "name": "Alpha <img src=x onerror=window.__injected=1>",
         "note": "initial note <script>window.__injected=2</script>", "enabled": True,
         "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
-        "models": ["luna"], "inventory_status": "available", "technical_success_rate": 0.98,
+        "models": ["luna"], "model_pricing": {"luna": {"blended_price": 1.656, "priced": True}}, "inventory_status": "available", "technical_success_rate": 0.98,
         "avg_ttft_ms": 1800, "cost_24h": 0.02, "total_tokens": 14, "multiplier": 1.0, "max_parallel": 3,
         "last_test_at": "2026-08-29T10:00:00Z", "last_test_ttft_ms": 180,
     }
     same_site_provider = provider | {
         "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
-        "base_url": "https://alpha.invalid/v1", "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "total_tokens": 12, "multiplier": 1.5,
+        "base_url": "https://alpha.invalid/v1", "model_pricing": {"luna": {"blended_price": 2.484, "priced": True}}, "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "total_tokens": 12, "multiplier": 1.5,
     }
     cheapest_provider = provider | {
         "fingerprint": "provider-c", "note": "cheapest note", "api_key_mask": "ghi***rst",
-        "base_url": "https://alpha.invalid/api", "models": ["nova"], "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "total_tokens": 8, "multiplier": 0.5,
+        "base_url": "https://alpha.invalid/api", "models": ["nova"], "model_pricing": {"nova": {"blended_price": 0.828, "priced": True}}, "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "total_tokens": 8, "multiplier": 0.5,
     }
     disabled_provider = provider | {
         "fingerprint": "provider-d", "note": "disabled note", "api_key_mask": "jkl***mno", "enabled": False,
-        "base_url": "https://alpha.invalid/disabled", "technical_success_rate": None, "avg_ttft_ms": None, "cost_24h": None, "total_tokens": None, "multiplier": 2.0,
+        "base_url": "https://alpha.invalid/disabled", "model_pricing": {"luna": {"blended_price": 3.312, "priced": True}}, "technical_success_rate": None, "avg_ttft_ms": None, "cost_24h": None, "total_tokens": None, "multiplier": 2.0,
     }
     calls = [
         {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},

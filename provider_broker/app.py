@@ -365,11 +365,21 @@ async def catalog(request):
     counts = request.app["store"].catalog_counts()
     # Preserve the legacy admin response shape while the Store catalog seam
     # retains currency for normalized pricing and migration consumers.
-    built = {
-        name: {key: item for key, item in value.items() if key != "currency"}
-        | {"blended_price": blended_price(value), "available_provider_count": counts.get(name, 0)}
-        for name, value in request.app["store"].catalog().items()
-    }
+    built = {}
+    for name, value in request.app["store"].catalog().items():
+        projection = request.app["store"].legacy_catalog_projection(name)
+        item = {key: field for key, field in value.items() if key != "currency"}
+        if projection["status"] != "unique_official":
+            item.update({
+                "official_input_price": None, "official_cache_price": None,
+                "official_output_price": None, "blended_price": None,
+                "pricing_status": projection["status"],
+                "pricing_provider_count": projection["provider_count"],
+            })
+        else:
+            item["blended_price"] = blended_price(value)
+        item["available_provider_count"] = counts.get(name, 0)
+        built[name] = item
     return web.json_response({"catalog": built})
 
 
@@ -394,7 +404,11 @@ async def create_catalog(request):
     from .catalog import canonicalize
     model = canonicalize(body['model'])
     entry = body | {'model': model}
-    if not request.app['store'].create_catalog(model, entry):
+    try:
+        created = request.app['store'].create_catalog(model, entry)
+    except ValueError as exc:
+        return web.json_response({'error': str(exc)}, status=409)
+    if not created:
         return web.json_response({'error': 'model already exists'}, status=409)
     return web.json_response({'model': model}, status=201)
 
@@ -405,7 +419,11 @@ async def update_catalog(request):
         return web.json_response({'error': 'invalid model catalog entry'}, status=400)
     from .catalog import canonicalize
     model = canonicalize(request.match_info['model'])
-    if not request.app['store'].update_catalog(model, body):
+    try:
+        updated = request.app['store'].update_catalog(model, body)
+    except ValueError as exc:
+        return web.json_response({'error': str(exc)}, status=409)
+    if not updated:
         return web.json_response({'error': 'model not found'}, status=404)
     return web.json_response({'model': model, 'updated': True})
 
@@ -547,12 +565,13 @@ async def deactivate_pricing_provider_api(request):
 
 def _valid_price_body(body):
     required = {'source_kind', 'input_price', 'cache_price', 'output_price', 'currency'}
-    optional = {'source_name', 'source_url', 'source_evidence', 'verified_at', 'unpriced'}
+    optional = {'multiplier', 'source_name', 'source_url', 'source_evidence', 'verified_at', 'unpriced'}
     numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
     return (
         isinstance(body, dict) and required <= set(body) and set(body) <= required | optional
         and body['source_kind'] in ('official', 'direct', 'relay')
         and all(numeric(body[name]) for name in ('input_price', 'cache_price', 'output_price'))
+        and ('multiplier' not in body or type(body['multiplier']) in (int, float) and math.isfinite(body['multiplier']) and body['multiplier'] > 0)
         and isinstance(body['currency'], str) and re.fullmatch(r'[A-Za-z]{3,8}', body['currency'].strip())
         and all(name not in body or body[name] is None or isinstance(body[name], str) for name in ('source_name', 'source_url', 'source_evidence', 'verified_at'))
         and all(name not in body or body[name] is None or len(body[name]) <= limit for name, limit in (('source_name', 256), ('source_url', 2048), ('source_evidence', 4096), ('verified_at', 64)))
@@ -591,7 +610,14 @@ async def pricing_api(request):
         return web.json_response({'error': 'invalid provider model price'}, status=400)
     body = body | {'model_id': canonicalize(body['model_id']), 'currency': body['currency'].strip().upper()}
     try:
-        price_id = store.insert_provider_model_price(**body)
+        existing = store.conn.execute(
+            "SELECT legacy FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
+            (body['provider_id'], body['model_id']),
+        ).fetchone()
+        if existing and existing['legacy']:
+            price_id = store.upsert_provider_model_price(**body)
+        else:
+            price_id = store.insert_provider_model_price(**body)
     except ValueError as exc:
         return web.json_response({'error': str(exc)}, status=400)
     except sqlite3.IntegrityError as exc:

@@ -824,7 +824,7 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
 
     provider_response = await client.post('/admin/v1/pricing/providers', headers=headers, json={
         'provider_key': 'api-direct', 'name': 'API Direct', 'provider_type': 'direct',
-        'multiplier': 1.25,
+        'multiplier': 9.0,
     })
     assert provider_response.status == 201
     provider = await provider_response.json()
@@ -832,6 +832,7 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     price_response = await client.post('/admin/v1/pricing', headers=headers, json={
         'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
         'input_price': 1, 'cache_price': 0.2, 'output_price': 4, 'currency': 'USD',
+        'multiplier': 1.25,
         'source_name': 'Public price table',
         'source_url': 'https://prices.example/api-direct',
         'source_evidence': 'published pricing table',

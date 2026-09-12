@@ -251,6 +251,7 @@ function openPricingEditor(item) {
   form.elements.input_price.value = item?.base_price?.input ?? "";
   form.elements.cache_price.value = item?.base_price?.cache ?? "";
   form.elements.output_price.value = item?.base_price?.output ?? "";
+  form.elements.multiplier.value = item?.final_price?.multiplier ?? 1;
   form.elements.currency.value = item?.base_price?.currency || "USD";
   form.elements.source_name.value = item?.source?.name || "";
   form.elements.source_url.value = item?.source?.url || "";
@@ -450,9 +451,10 @@ function renderModelView() {
     providers: state.providers.flatMap((provider) => {
       const model = provider.models.find((candidate) => state.catalog[candidate]?.intellect === intellect);
       if (!model) return [];
-      const price = Number(state.catalog[model].blended_price) * Number(provider.multiplier);
+      const resolved = provider.model_pricing?.[model];
+      const price = resolved?.priced ? Number(resolved.blended_price) : null;
       const routable = provider.enabled !== false && provider.calibrated !== false && (!provider.tiers || provider.tiers.includes(intellect));
-      return [{ note: provider.note || "n/a", model, price, priceGroup: Math.trunc(price * 100000), fingerprint: provider.fingerprint, routable }];
+      return [{ note: provider.note || "n/a", model, price, priceGroup: price == null ? Number.POSITIVE_INFINITY : Math.trunc(price * 100000), fingerprint: provider.fingerprint, routable }];
     }),
   })).filter((group) => group.providers.length), "modelView", (group, key) => {
     if (key === "intellect") return stageOrder(group.intellect);
@@ -752,6 +754,7 @@ byId("pricing-form").addEventListener("submit", async (event) => {
     source_kind: form.elements.source_kind.value,
     input_price: Number(form.elements.input_price.value), cache_price: Number(form.elements.cache_price.value),
     output_price: Number(form.elements.output_price.value), currency: form.elements.currency.value,
+    multiplier: Number(form.elements.multiplier.value),
     source_name: form.elements.source_name.value || null, source_url: form.elements.source_url.value || null, source_evidence: form.elements.source_evidence.value || null,
     verified_at: form.elements.verified_at.value || null,
   };

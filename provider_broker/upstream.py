@@ -868,7 +868,11 @@ async def invoke_stream(provider, body: dict) -> dict:
     effective_pricing = pricing_by_model.get(actual_model)
     if effective_pricing is None and actual_model == model:
         effective_pricing = getattr(provider, "pricing", None)
-    pricing_multiplier = 1.0 if isinstance(effective_pricing, dict) and effective_pricing.get("priced") else getattr(provider, "multiplier", 1.0)
+    if effective_pricing is None:
+        # An upstream model alias without a Provider+Model row is unknown;
+        # never let estimate_cost_details revive the global catalog fallback.
+        effective_pricing = {"priced": False, "reason": "provider model price is missing"}
+    pricing_multiplier = 1.0
     cost_details = estimate_cost_details(actual_model, usage, pricing_multiplier, effective_pricing)
     return {
         "text": text, "chunks": chunks, "actual_model": actual_model,
