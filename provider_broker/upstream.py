@@ -15,6 +15,28 @@ from jsonschema import Draft202012Validator, SchemaError, ValidationError
 from .catalog import CATALOG, canonicalize
 
 
+_CHAT_API_ROOTS = (
+    "/v1",
+    "/v1/openai",
+    "/api/v3",
+    "/openai",
+    "/compatible-mode/v1",
+    "/api/paas/v4",
+)
+_BLOCKED_REQUEST_HEADERS = {
+    "authorization", "content-type", "content-length", "host",
+    "cookie", "proxy-authorization", "set-cookie", "x-api-key",
+    "x-management-key",
+}
+
+
+def _url_path(value: object) -> str:
+    try:
+        return urlsplit(str(value).strip().rstrip("/")).path.rstrip("/").lower()
+    except (TypeError, ValueError):
+        return ""
+
+
 logger = logging.getLogger("provider_broker.route")
 
 INTELLECT_RANK = {"standard": 0, "smart": 1, "expert": 2}
@@ -208,12 +230,22 @@ def research_plan_context_audit(body: dict) -> dict | None:
 
 
 def api_url(base_url: str, suffix: str) -> str:
-    base = base_url.rstrip("/")
-    return base + suffix if base.endswith("/v1") else base + "/v1" + suffix
+    base = str(base_url).strip().rstrip("/")
+    path = _url_path(base)
+    return base + suffix if path.endswith(_CHAT_API_ROOTS) else base + "/v1" + suffix
 
 
 def provider_headers(provider) -> dict[str, str]:
-    return {str(name): str(value) for name, value in provider.request_headers.items()} | {
+    safe_headers = {
+        str(name): str(value)
+        for name, value in (provider.request_headers or {}).items()
+        if isinstance(name, str)
+        and name.strip()
+        and "\r" not in name and "\n" not in name
+        and name.casefold() not in _BLOCKED_REQUEST_HEADERS
+        and "\r" not in str(value) and "\n" not in str(value)
+    }
+    return safe_headers | {
         "Authorization": f"Bearer {provider.api_key}", "Content-Type": "application/json",
     }
 
@@ -547,13 +579,14 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
 
 
 async def invoke_stream(provider, body: dict) -> dict:
-    model = canonicalize(provider.models[0])
+    requested_model = canonicalize(provider.models[0])
+    model = canonicalize(getattr(provider, "wire_model", None) or requested_model)
     schema = structured_schema(body)
     outbound_schema = provider_native_schema(schema, provider.provider_type)
     effort = body.get("effort")
     repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
-    if provider.provider_type in ("anthropic", "claude"):
+    if provider.provider_type in ("anthropic", "claude", "openai_chat"):
         payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
         if outbound_schema is not None:
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": outbound_schema}}
@@ -792,7 +825,8 @@ async def invoke_stream(provider, body: dict) -> dict:
             chunks = [text]
     plan_audit = research_plan_output_audit(body, text)
     usage = normalize_usage(metadata)
-    actual_model = canonicalize(str(metadata.get("model") or model))
+    actual_name = str(metadata.get("model") or requested_model)
+    actual_model = canonicalize((getattr(provider, "model_aliases", None) or {}).get(actual_name.casefold(), actual_name))
     return {
         "text": text, "chunks": chunks, "actual_model": actual_model,
         "latency_ms": ttft_ms, "usage": usage,

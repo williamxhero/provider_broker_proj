@@ -29,9 +29,62 @@ CATALOG = {
         "family": "Anthropic Claude", "intellect": "smart",
         "official_input_price": 2.0, "official_cache_price": 0.2, "official_output_price": 10.0,
     },
+    # Approved vendor identities.  Provider pricing was not included in the
+    # approval attachment, so zero is an explicit unverified placeholder until
+    # live price verification supplies billable rates; it is never copied from
+    # another model.
+    "deepseek-v4-flash-0731": {
+        "family": "DeepSeek", "intellect": "standard",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "doubao-seed-2.0-lite": {
+        "family": "Doubao Seed", "intellect": "standard",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "glm-5.3-flash": {
+        "family": "GLM", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "deepseek-v4.1-flash": {
+        "family": "DeepSeek", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "qwen3.8-flash-next": {
+        "family": "Qwen", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "doubao-seed-2.1-turbo": {
+        "family": "Doubao Seed", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "doubao-seed-2.1-pro": {
+        "family": "Doubao Seed", "intellect": "smart",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
+    "glm-5.3": {
+        "family": "GLM", "intellect": "expert",
+        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+    },
 }
 
-ALIASES = {"gpt-5.6": "gpt-5.6-sol", "claude-opus-4.8": "claude-opus-4-8"}
+ALIASES = {
+    "gpt-5.6": "gpt-5.6-sol", "claude-opus-4.8": "claude-opus-4-8",
+    "deepseek-v4-flash": "deepseek-v4-flash-0731",
+    "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+    "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
+    "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
+    "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
+    "glm-5-3-flash": "glm-5.3-flash",
+    "glm-5-3": "glm-5.3",
+    "qwen3-8-flash-next": "qwen3.8-flash-next",
+}
+
+CATALOG_SEED_VERSION = 2
+CATALOG_V2_MODELS = frozenset({
+    "deepseek-v4-flash-0731", "doubao-seed-2.0-lite", "glm-5.3-flash",
+    "deepseek-v4.1-flash", "qwen3.8-flash-next", "doubao-seed-2.1-turbo",
+    "doubao-seed-2.1-pro", "glm-5.3",
+})
 
 
 def canonicalize(model: str) -> str:

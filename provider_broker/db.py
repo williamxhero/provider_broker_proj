@@ -67,6 +67,8 @@ class Provider:
     enabled: bool
     multiplier: float
     site_id: str = "default"
+    wire_model: str | None = None
+    model_aliases: dict[str, str] | None = None
 
 
 class Store:
@@ -88,7 +90,8 @@ class Store:
         CREATE TABLE IF NOT EXISTS source_provider (
           id INTEGER PRIMARY KEY, fingerprint TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
           base_url TEXT NOT NULL, api_key BLOB NOT NULL, provider_type TEXT NOT NULL,
-          request_headers BLOB, models_json TEXT NOT NULL, source_json TEXT NOT NULL, synced_at TEXT NOT NULL
+          request_headers BLOB, api_key_mask TEXT NOT NULL DEFAULT '***',
+          models_json TEXT NOT NULL, source_json TEXT NOT NULL, synced_at TEXT NOT NULL
         );
         CREATE TABLE IF NOT EXISTS policy (
           fingerprint TEXT PRIMARY KEY, enabled INTEGER NOT NULL DEFAULT 1,
@@ -212,6 +215,8 @@ class Store:
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE source_provider ADD COLUMN request_headers BLOB')
         except sqlite3.OperationalError: pass
+        try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN api_key_mask TEXT NOT NULL DEFAULT '***'")
+        except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN site_id TEXT NOT NULL DEFAULT 'default'")
         except sqlite3.OperationalError: pass
         # Existing inventories predate explicit site fault domains.  Derive a
@@ -241,12 +246,20 @@ class Store:
             except sqlite3.OperationalError: pass
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_telemetry_window ON route_run(telemetry_version, started_at DESC)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_delivery_window ON route_run(delivery_mode, started_at DESC)")
-        if not catalog_exists:
-            from .catalog import CATALOG
-            self.conn.executemany(
-                "INSERT INTO model_catalog VALUES(?,?,?,?,?,?)",
-                [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in CATALOG.items()],
-            )
+        from .catalog import CATALOG, CATALOG_SEED_VERSION, CATALOG_V2_MODELS
+        seed_row = self.conn.execute("SELECT value FROM broker_setting WHERE name='catalog_seed_version'").fetchone()
+        seed_version = int(seed_row[0]) if seed_row else (1 if catalog_exists else 0)
+        seed_models = CATALOG if not catalog_exists else {
+            model: CATALOG[model] for model in CATALOG_V2_MODELS
+        } if seed_version < CATALOG_SEED_VERSION else {}
+        self.conn.executemany(
+            "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?)",
+            [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in seed_models.items()],
+        )
+        self.conn.execute(
+            "INSERT INTO broker_setting(name,value) VALUES('catalog_seed_version',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
+            (str(CATALOG_SEED_VERSION),),
+        )
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('race_parallel_cap',?)", (str(self.default_race_parallel_cap),))
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('hedge_delay_ms','750')")
         self.conn.execute("INSERT OR IGNORE INTO broker_setting(name,value) VALUES('global_parallel_cap',?)", (str(max(4, self.default_race_parallel_cap * 4)),))
@@ -880,25 +893,43 @@ class Store:
             self.conn.execute("UPDATE balance_site SET notification_error=? WHERE id=?", (error[:200], site_id))
 
     @staticmethod
-    def fingerprint(base_url: str, api_key: str, model: str) -> str:
-        return hmac.new(b"provider-broker-source-v1", f"{base_url}\0{api_key}".encode(), hashlib.sha256).hexdigest()
+    def fingerprint(base_url: str, api_key: str, model: str | None = None) -> str:
+        """Stable identity for one endpoint/key; model inventory is mutable evidence."""
+        del model
+        return hmac.new(b"provider-broker-source-v1", f"{base_url.rstrip('/')}\0{api_key}".encode(), hashlib.sha256).hexdigest()
+
+    @staticmethod
+    def api_key_mask(api_key: str) -> str:
+        if not isinstance(api_key, str) or len(api_key) < 7:
+            return "***"
+        return api_key[:3] + "***" + api_key[-3:]
 
     def replace_source_snapshot(self, entries: list[dict], synced_at: str):
         rows = []
         site_notes = []
         catalog = self.catalog()
-        existing = {}
-        for row in self.conn.execute("SELECT fingerprint,base_url,api_key,models_json FROM source_provider"):
-            try:
-                existing[(row["base_url"], self._decrypt(row["api_key"]))] = row
-            except Exception:
-                continue
+        existing_rows = self.conn.execute("SELECT fingerprint,base_url,api_key,models_json FROM source_provider").fetchall()
+        existing = {row["fingerprint"]: row for row in existing_rows}
+        existing_policies = {row[0] for row in self.conn.execute("SELECT fingerprint FROM policy")}
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             from .catalog import canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             models = [model for model in source_models if model in catalog]
-            prior = existing.get((base_url, api_key))
+            # Stable fingerprints avoid decrypting credentials during ordinary
+            # refreshes.  The fallback only supports one-time adoption of old
+            # databases whose fingerprint included the previous model list.
+            prior = existing.get(self.fingerprint(base_url, api_key))
+            if prior is None:
+                for candidate in existing_rows:
+                    if candidate["base_url"].rstrip("/") != base_url:
+                        continue
+                    try:
+                        if self._decrypt(candidate["api_key"]) == api_key:
+                            prior = candidate
+                            break
+                    except Exception:
+                        continue
             unavailable = entry.get("inventory_status") == "unavailable" or source_models == ["unavailable"]
             # Model discovery is auxiliary evidence.  Never erase a known-good
             # route merely because a CPA /models refresh transiently fails.
@@ -910,26 +941,47 @@ class Store:
                     entry = entry | {"inventory_status": "stale"}
                     fp = prior["fingerprint"]
                 else:
-                    fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
+                    fp = self.fingerprint(base_url, api_key)
             else:
-                fp = self.fingerprint(base_url, api_key, "\0".join(source_models))
+                fp = self.fingerprint(base_url, api_key)
             site_id = self.site_id(entry.get("site_name"), base_url)
             if isinstance(entry.get('site_name'), str) and entry['site_name'].strip():
-                site_notes.append((entry['site_name'].strip(), fp))
-            source = entry.get("source", {}) | {"inventory_status":entry.get("inventory_status","unavailable")}
+                note = entry['site_name'].strip()
+                if api_key not in note:
+                    site_notes.append((note, fp))
+            source = {
+                key: str(entry.get("source", {}).get(key))[:160]
+                for key in ("section", "site_name", "provider_type")
+                if isinstance(entry.get("source"), dict) and isinstance(entry["source"].get(key), (str, int, float, bool))
+            } | {"inventory_status": entry.get("inventory_status", "unavailable")}
+            model_aliases = entry.get("model_aliases")
+            if isinstance(model_aliases, dict):
+                source["model_aliases"] = {
+                    str(alias)[:160]: str(wire)[:240]
+                    for alias, wire in model_aliases.items()
+                    if isinstance(alias, str) and isinstance(wire, str)
+                }
             request_headers = json.dumps(entry.get('request_headers') or {}, sort_keys=True)
-            rows.append((fp, entry.get("name") or (models[0] if models else "unavailable"), base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), json.dumps(models), json.dumps(source), synced_at, site_id))
+            name = str(entry.get("name") or (models[0] if models else "unavailable"))[:160]
+            if api_key in name:
+                name = entry.get("provider_type", "openai")
+            rows.append((fp, name, base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
         with self.conn:
             self.conn.execute("CREATE TEMP TABLE incoming AS SELECT * FROM source_provider WHERE 0")
-            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id) VALUES(?,?,?,?,?,?,?,?,?,?)", rows)
+            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
             self.conn.execute("DELETE FROM source_provider")
-            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id) SELECT fingerprint,name,base_url,api_key,provider_type,request_headers,models_json,source_json,synced_at,site_id FROM incoming")
+            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) SELECT fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id FROM incoming")
             self.conn.execute("DELETE FROM route_block WHERE fingerprint NOT IN (SELECT fingerprint FROM incoming)")
             self.conn.execute("DROP TABLE incoming")
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
-            self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[9],) for r in rows])
-            self.conn.executemany("UPDATE policy SET calibrated=? WHERE fingerprint=?", [(int(any(model in catalog for model in json.loads(r[6]))), r[0]) for r in rows])
-            self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=?", site_notes)
+            self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[10],) for r in rows])
+            self.conn.executemany(
+                "UPDATE policy SET calibrated=? WHERE fingerprint=?",
+                [(int(any(model in catalog for model in json.loads(r[7]))), r[0]) for r in rows if r[0] not in existing_policies],
+            )
+            # A site name is a useful first-run label, but never overwrite an
+            # operator's policy note during a later CPA refresh.
+            self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=? AND note=''", site_notes)
 
     @staticmethod
     def site_id(site_name: object, base_url: str) -> str:
@@ -968,7 +1020,11 @@ class Store:
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
                     pricing = catalog[model]
-                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier']),r['site_id']))
+                    source = json.loads(r['source_json']) if r['source_json'] else {}
+                    model_aliases = source.get('model_aliases') or {}
+                    wire_model = model_aliases.get(model)
+                    reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
+                    result.append(Provider(r['id'],r['fingerprint'],r['name'],r['base_url'],self._decrypt(r['api_key']),r['provider_type'],headers,[model],pricing,int(blended_price(pricing)*r['multiplier']*100000),int(r['max_parallel']),bool(r['enabled']),float(r['multiplier']),r['site_id'],wire_model,reverse_aliases))
         return result
 
     def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
@@ -1023,7 +1079,11 @@ class Store:
             return None
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
         pricing = catalog[model]
-        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'])
+        source = json.loads(row['source_json']) if row['source_json'] else {}
+        model_aliases = source.get('model_aliases') or {}
+        wire_model = model_aliases.get(model)
+        reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
+        return Provider(row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']), row['provider_type'], headers, [model], pricing, int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']), bool(row['enabled']), float(row['multiplier']), row['site_id'], wire_model, reverse_aliases)
 
     def key_test_providers(self) -> list[Provider]:
         """Return every enabled, calibrated API-key/model probe target.
@@ -1046,11 +1106,15 @@ class Store:
                 if model not in catalog or catalog[model]['intellect'] not in tiers:
                     continue
                 pricing = catalog[model]
+                source = json.loads(row['source_json']) if row['source_json'] else {}
+                model_aliases = source.get('model_aliases') or {}
+                wire_model = model_aliases.get(model)
+                reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
                 result.append(Provider(
                     row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
                     row['provider_type'], headers, [model], pricing,
                     int(blended_price(pricing) * row['multiplier'] * 100000), int(row['max_parallel']),
-                    bool(row['enabled']), float(row['multiplier']), row['site_id'],
+                    bool(row['enabled']), float(row['multiplier']), row['site_id'], wire_model, reverse_aliases,
                 ))
         return result
 
@@ -1156,10 +1220,9 @@ class Store:
                 ) ORDER BY julianday(evidence_at) DESC,source_priority DESC LIMIT 1""",
                 (row['fingerprint'], row['fingerprint']),
             ).fetchone()
-            api_key = self._decrypt(row['api_key'])
             inventory.append({
                 'fingerprint': row['fingerprint'], 'name': row['name'], 'base_url': row['base_url'], 'family': row['provider_type'],
-                'api_key_mask': api_key[:3] + '***' + api_key[-3:], 'models': json.loads(row['models_json']),
+                'api_key_mask': row['api_key_mask'] or '***', 'models': json.loads(row['models_json']),
                 'inventory_status': json.loads(row['source_json']).get('inventory_status'), 'enabled': bool(row['enabled']),
                 'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
                 'multiplier': row['multiplier'], 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],

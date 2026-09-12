@@ -11,7 +11,7 @@ from aiohttp import TCPConnector, web
 from .db import Store
 from .catalog import blended_price
 from .settings import Settings
-from .source import sync_cpa, scheduler as source_scheduler
+from .source import register_cpa, sync_cpa, scheduler as source_scheduler
 from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route, structured_schema
 from .health import run_probe, scheduler
 from .balances import BalanceFailure, login as balance_login, login_with_cookie as balance_cookie_login, notify_low_balance, scheduler as balance_scheduler, sync_one as sync_balance
@@ -143,6 +143,34 @@ async def sync(request):
     request.app["store"].ensure_health_targets(request.app["clock"]())
     after = {provider["fingerprint"] for provider in providers_now}
     return web.json_response({"added": len(after - before), "updated": len(after & before), "offlined": len(before - after), "inventory_failures": sync_result["inventory_failures"], "last_successful_sync": max((provider["synced_at"] for provider in providers_now), default=None)})
+
+
+async def register_providers(request):
+    """Forward provider registration only through CPA's protected management hop."""
+    try:
+        body = await request.json()
+    except Exception:
+        body = None
+    if not isinstance(body, dict) or set(body) != {"providers"}:
+        return web.json_response({"error": "providers are required"}, status=400)
+    try:
+        registration = await register_cpa(
+            request.app["settings"].cpa_url,
+            request.app["settings"].cpa_token,
+            body["providers"],
+        )
+    except ValueError:
+        return web.json_response({"error": "invalid provider registration"}, status=400)
+    except Exception:
+        return web.json_response({"error": "CPA registration failed"}, status=502)
+    try:
+        inventory_result = await sync_cpa(
+            request.app["store"], request.app["settings"].cpa_url, request.app["settings"].cpa_token,
+        )
+        request.app["store"].ensure_health_targets(request.app["clock"]())
+    except Exception:
+        return web.json_response({"error": "registration succeeded but inventory sync failed", "registered": registration["registered"]}, status=502)
+    return web.json_response({"registered": registration["registered"], "added": registration["added"], "updated": registration["updated"], "inventory_failures": inventory_result["inventory_failures"]})
 
 
 async def inventory(request):
@@ -674,7 +702,7 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/admin/v1/balances", balance_sites), web.post("/admin/v1/balances/sync", sync_balance_sites),
         web.patch("/admin/v1/balances/configuration", balance_configuration), web.get("/admin/v1/balances/configuration", balance_configuration),
         web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
-        web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync),
+        web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync), web.post("/admin/v1/providers/register", register_providers),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
