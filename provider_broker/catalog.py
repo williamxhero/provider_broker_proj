@@ -81,7 +81,7 @@ ALIASES = {
     "qwen3-8-flash-next": "qwen3.8-flash-next",
 }
 
-CATALOG_SEED_VERSION = 3
+CATALOG_SEED_VERSION = 4
 CATALOG_V2_MODELS = frozenset({
     "deepseek-v4-flash", "deepseek-v4-pro", "doubao-seed-2.0-lite", "glm-5.3-flash",
     "qwen3.8-flash-next", "doubao-seed-2.1-turbo",

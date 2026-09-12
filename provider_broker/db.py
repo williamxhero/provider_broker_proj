@@ -257,6 +257,8 @@ class Store:
             "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?)",
             [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in seed_models.items()],
         )
+        if seed_version < 4:
+            self.conn.executemany("DELETE FROM model_catalog WHERE model=?", [("deepseek-v4-flash-0731",), ("deepseek-v4.1-flash",)])
         self.conn.execute(
             "INSERT INTO broker_setting(name,value) VALUES('catalog_seed_version',?) ON CONFLICT(name) DO UPDATE SET value=excluded.value",
             (str(CATALOG_SEED_VERSION),),
