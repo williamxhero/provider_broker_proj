@@ -58,7 +58,7 @@ def pricing_audit_fields(provider) -> dict:
     return {
         "stage": pricing.get("stage"),
         "currency": getattr(provider, "price_currency", None),
-        "multiplier": pricing.get("multiplier", getattr(provider, "multiplier", None)),
+        "multiplier": pricing.get("multiplier"),
         "price": pricing.get("blended_price"),
         "price_source": getattr(provider, "price_source", None),
         "price_comparable": getattr(provider, "price_comparable", None),
