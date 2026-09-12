@@ -357,7 +357,13 @@ async def calls(request):
 
 async def catalog(request):
     counts = request.app["store"].catalog_counts()
-    built = {name: value | {"blended_price": blended_price(value), "available_provider_count": counts.get(name, 0)} for name, value in request.app["store"].catalog().items()}
+    # Preserve the legacy admin response shape while the Store catalog seam
+    # retains currency for normalized pricing and migration consumers.
+    built = {
+        name: {key: item for key, item in value.items() if key != "currency"}
+        | {"blended_price": blended_price(value), "available_provider_count": counts.get(name, 0)}
+        for name, value in request.app["store"].catalog().items()
+    }
     return web.json_response({"catalog": built})
 
 
