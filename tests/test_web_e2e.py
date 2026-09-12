@@ -86,6 +86,23 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
             return {"providers": [provider, same_site_provider, cheapest_provider, disabled_provider]}
         if path == "/admin/v1/catalog":
             return {"catalog": catalog}
+        if path.startswith("/admin/v1/models"):
+            return {"items": [
+                {"id": "luna", "stage": "standard", "family": "openai", "active": True, "pricing_count": 1, "inventory_provider_count": 1},
+                {"id": "nova", "stage": "standard", "family": "openai", "active": True, "pricing_count": 1, "inventory_provider_count": 1},
+            ]}
+        if path.startswith("/admin/v1/pricing/bindings"):
+            return {"items": []}
+        if path.startswith("/admin/v1/pricing"):
+            return {"items": [{
+                "id": 1, "active": True, "unpriced": False, "status": "priced",
+                "provider": {"id": 1, "name": "Alpha", "provider_key": "alpha", "provider_type": "direct", "type": "direct", "multiplier": 1, "active": True, "inventory_models": ["luna"]},
+                "model": {"id": "luna", "stage": "standard", "family": "openai", "active": True},
+                "base_price": {"input": 1, "cache": .1, "output": 2, "currency": "USD"},
+                "final_price": {"input": 1, "cache": .1, "output": 2, "blended": 1.656, "currency": "USD", "multiplier": 1},
+                "source": {"kind": "direct", "url": "https://prices.invalid", "evidence": "table", "verified_at": "2026-08-29T10:00:00Z", "legacy": False},
+                "binding": None, "reason": None,
+            }]}
         if path == "/admin/v1/routing":
             return {"race_parallel_cap": 3}
         if path.startswith("/admin/v1/quality"):
@@ -143,6 +160,8 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         page.goto(broker.url)
         assert page.evaluate("window.__injected") is None
         assert page.locator("#providers img, #providers svg, #providers script").count() == 0
+        assert page.locator("#model-directory").get_by_text("luna", exact=True).count() == 1
+        assert "https://prices.invalid" in page.locator("#pricing").inner_text()
         assert page.locator(".masthead").count() == 0
         assert page.locator("main > section").first.locator("h2").inner_text() == "调用质量"
         assert page.locator("main > section").first.locator(".index").inner_text() == "01 / QUALITY"
@@ -265,4 +284,58 @@ def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
         assert any(method == "PATCH" and path == "/admin/v1/routing" and '"race_parallel_cap":2' in (body or "") for method, path, body in seen)
         assert any(method == "PUT" and path.endswith("/gpt-console-route") for method, path, _ in seen)
         assert any(method == "DELETE" and path.endswith("/gpt-console-route") for method, path, _ in seen)
+        browser.close()
+
+
+def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_path):
+    with LiveBroker(tmp_path / "pricing-console.sqlite3") as broker, sync_playwright() as playwright:
+        seeded = threading.Event()
+        def seed():
+            store = broker.app["store"]
+            store.create_canonical_model("console-model", stage="smart", family="Console family")
+            provider_id = store.create_pricing_provider(
+                "console-direct", provider_type="direct",
+                name="Console <img src=x onerror=window.__injected=1>", multiplier=1.5,
+            )
+            store.insert_provider_model_price(
+                provider_id=provider_id, model_id="console-model", source_kind="direct",
+                input_price=1, cache_price=.2, output_price=4, currency="USD",
+                source_name="Console price list", source_url="https://prices.invalid/console",
+                source_evidence="Evidence <script>window.__injected=2</script>",
+                verified_at="2026-09-12T00:00:00Z",
+            )
+            relay_id = store.create_pricing_provider("console-relay", provider_type="relay", name="Console Relay", multiplier=1.0)
+            benchmark_id = store.create_pricing_provider("console-benchmark", provider_type="direct", name="Console Benchmark", multiplier=1.0)
+            store.insert_provider_model_price(
+                provider_id=benchmark_id, model_id="console-model", source_kind="direct",
+                input_price=1, cache_price=.2, output_price=4, currency="USD",
+                source_url="https://prices.invalid/benchmark", source_evidence="Benchmark table",
+            )
+            store.bind_relay_price(
+                relay_id, "console-model", benchmark_id, "console-model",
+                source_name="Relay terms", source_url="https://prices.invalid/binding", source_evidence="Initial binding",
+            )
+            seeded.set()
+        broker.loop.call_soon_threadsafe(seed)
+        assert seeded.wait(5)
+
+        browser = playwright.chromium.launch()
+        page = browser.new_page()
+        page.goto(broker.url)
+        page.locator("#model-directory").get_by_text("console-model", exact=True).wait_for()
+        page.locator("#pricing").get_by_text("console-model", exact=True).first.wait_for()
+        assert page.evaluate("window.__injected") is None
+        assert page.locator("#pricing img, #pricing svg, #pricing script").count() == 0
+        assert "Console price list" in page.locator("#pricing").inner_text()
+        assert "Evidence <script>window.__injected=2</script>" in page.locator("#pricing").inner_text()
+        assert page.locator("#model-directory").get_by_text("1", exact=True).count() >= 1
+        assert page.locator("#model-directory-section input[name=official_input_price]").count() == 0
+        page.locator("#pricing-bindings").get_by_text("Initial binding", exact=False).wait_for()
+        page.locator("#pricing-bindings").get_by_role("button", name="编辑").click()
+        page.locator("#binding-form input[name=source_evidence]").fill("Updated binding")
+        page.locator("#binding-form").get_by_role("button", name="保存").click()
+        page.locator("#pricing-bindings").get_by_text("Updated binding", exact=False).wait_for()
+        page.locator("#pricing-bindings").get_by_role("button", name="编辑").click()
+        page.locator("#binding-deactivate").click()
+        expect(page.locator("#pricing-bindings").get_by_text("Updated binding", exact=False)).to_have_count(0)
         browser.close()

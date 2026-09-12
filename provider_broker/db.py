@@ -140,6 +140,7 @@ class Store:
           cache_price REAL NOT NULL DEFAULT 0 CHECK(cache_price >= 0),
           output_price REAL NOT NULL DEFAULT 0 CHECK(output_price >= 0),
           currency TEXT NOT NULL,
+          source_name TEXT,
           source_url TEXT,
           source_evidence TEXT,
           verified_at TEXT,
@@ -156,6 +157,7 @@ class Store:
           relay_model_id TEXT NOT NULL REFERENCES canonical_model(id),
           benchmark_provider_id INTEGER NOT NULL REFERENCES pricing_provider(id),
           benchmark_model_id TEXT NOT NULL REFERENCES canonical_model(id),
+          source_name TEXT,
           source_url TEXT,
           source_evidence TEXT,
           active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
@@ -295,6 +297,9 @@ class Store:
         except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN pricing_provider_id INTEGER REFERENCES pricing_provider(id)")
         except sqlite3.OperationalError: pass
+        for table in ('provider_model_price', 'relay_price_binding'):
+            try: self.conn.execute(f'ALTER TABLE {table} ADD COLUMN source_name TEXT')
+            except sqlite3.OperationalError: pass
         # Existing inventories predate explicit site fault domains.  Derive a
         # stable non-secret domain before routing starts so upgrade does not
         # collapse every old key into the synthetic "default" site.
@@ -420,15 +425,48 @@ class Store:
                     "INSERT INTO canonical_model(id,stage,family,active) VALUES(?,?,?,1)",
                     (model_id, stage, family),
                 )
+                self.record_configuration_change(
+                    f'model:{model_id}', None,
+                    {'stage': stage, 'family': family, 'active': True}, source='pricing',
+                )
         except sqlite3.IntegrityError:
             return False
         return True
 
-    def deactivate_canonical_model(self, model_id: str) -> bool:
+    def update_canonical_model(self, model_id: str, *, stage: str, family: str,
+                               active: bool | None = None) -> bool:
+        if not model_id or stage not in {'standard', 'smart', 'expert'} or not isinstance(family, str) or not family.strip():
+            raise ValueError('canonical model requires id, stage, and family')
+        row = self.conn.execute(
+            "SELECT stage,family,active FROM canonical_model WHERE id=?", (model_id,)
+        ).fetchone()
+        if row is None:
+            return False
+        next_active = bool(row['active']) if active is None else active
+        before = {'stage': row['stage'], 'family': row['family'], 'active': bool(row['active'])}
+        after = {'stage': stage, 'family': family, 'active': next_active}
         with self.conn:
-            return bool(self.conn.execute(
+            self.conn.execute(
+                "UPDATE canonical_model SET stage=?,family=?,active=? WHERE id=?",
+                (stage, family, int(next_active), model_id),
+            )
+            self.record_configuration_change(f'model:{model_id}', before, after, source='pricing')
+        return True
+
+    def deactivate_canonical_model(self, model_id: str) -> bool:
+        row = self.conn.execute("SELECT stage,family,active FROM canonical_model WHERE id=?", (model_id,)).fetchone()
+        if row is None:
+            return False
+        with self.conn:
+            changed = bool(self.conn.execute(
                 "UPDATE canonical_model SET active=0 WHERE id=?", (model_id,)
             ).rowcount)
+            if changed:
+                self.record_configuration_change(
+                    f'model:{model_id}', dict(row) | {'active': bool(row['active'])},
+                    {'stage': row['stage'], 'family': row['family'], 'active': False}, source='pricing',
+                )
+            return changed
 
     def delete_canonical_model(self, model_id: str) -> bool:
         referenced = self.conn.execute(
@@ -453,6 +491,11 @@ class Store:
                    VALUES(?,?,?,?,1)""",
                 (provider_key, name or provider_key, provider_type, multiplier),
             )
+            self.record_configuration_change(
+                f'pricing-provider:{cursor.lastrowid}', None,
+                {'provider_key': provider_key, 'name': name or provider_key,
+                 'provider_type': provider_type, 'multiplier': multiplier, 'active': True}, source='pricing',
+            )
         return int(cursor.lastrowid)
 
     def pricing_providers(self, *, active: bool | None = None) -> list[dict]:
@@ -464,11 +507,44 @@ class Store:
         ).fetchall()
         return [dict(row) | {'active': bool(row['active'])} for row in rows]
 
-    def deactivate_pricing_provider(self, provider_id: int) -> bool:
+    def update_pricing_provider(self, provider_id: int, *, name: str, provider_type: str,
+                                multiplier: float, active: bool | None = None) -> bool:
+        if provider_type not in {'official', 'direct', 'relay', 'legacy-migration'}:
+            raise ValueError('invalid pricing provider type')
+        if not isinstance(name, str) or not name.strip() or not math.isfinite(multiplier) or multiplier <= 0:
+            raise ValueError('pricing provider requires name and positive multiplier')
+        row = self.conn.execute(
+            "SELECT provider_key,name,provider_type,multiplier,active FROM pricing_provider WHERE id=?",
+            (provider_id,),
+        ).fetchone()
+        if row is None:
+            return False
+        next_active = bool(row['active']) if active is None else active
+        before = dict(row) | {'active': bool(row['active'])}
+        after = {'provider_key': row['provider_key'], 'name': name, 'provider_type': provider_type,
+                 'multiplier': multiplier, 'active': next_active}
         with self.conn:
-            return bool(self.conn.execute(
+            self.conn.execute(
+                "UPDATE pricing_provider SET name=?,provider_type=?,multiplier=?,active=? WHERE id=?",
+                (name, provider_type, multiplier, int(next_active), provider_id),
+            )
+            self.record_configuration_change(f'pricing-provider:{provider_id}', before, after, source='pricing')
+        return True
+
+    def deactivate_pricing_provider(self, provider_id: int) -> bool:
+        row = self.conn.execute("SELECT * FROM pricing_provider WHERE id=?", (provider_id,)).fetchone()
+        if row is None:
+            return False
+        with self.conn:
+            changed = bool(self.conn.execute(
                 "UPDATE pricing_provider SET active=0 WHERE id=?", (provider_id,)
             ).rowcount)
+            if changed:
+                self.record_configuration_change(
+                    f'pricing-provider:{provider_id}', dict(row) | {'active': bool(row['active'])},
+                    dict(row) | {'active': False}, source='pricing',
+                )
+            return changed
 
     def delete_pricing_provider(self, provider_id: int) -> bool:
         referenced = self.conn.execute(
@@ -485,7 +561,8 @@ class Store:
     def insert_provider_model_price(self, *, provider_id: int, model_id: str,
                                     source_kind: str, input_price: float,
                                     cache_price: float, output_price: float,
-                                    currency: str, source_url: str | None = None,
+                                    currency: str, source_name: str | None = None,
+                                    source_url: str | None = None,
                                     source_evidence: str | None = None,
                                     verified_at: str | None = None,
                                     legacy: bool = False, unpriced: bool | None = None) -> int:
@@ -513,10 +590,17 @@ class Store:
             cursor = self.conn.execute(
                 """INSERT INTO provider_model_price(
                    provider_id,model_id,source_kind,input_price,cache_price,output_price,currency,
-                   source_url,source_evidence,verified_at,legacy,unpriced,active
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                   source_name,source_url,source_evidence,verified_at,legacy,unpriced,active
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
                 (provider_id, model_id, source_kind, input_price, cache_price, output_price,
-                 currency, source_url, source_evidence, verified_at, int(legacy), int(unpriced)),
+                 currency, source_name, source_url, source_evidence, verified_at, int(legacy), int(unpriced)),
+            )
+            self.record_configuration_change(
+                f"pricing:{provider_id}:{model_id}", None,
+                {'source_kind': source_kind, 'input_price': input_price, 'cache_price': cache_price,
+                 'output_price': output_price, 'currency': currency, 'source_name': source_name,
+                 'source_url': source_url, 'source_evidence': source_evidence, 'verified_at': verified_at,
+                 'legacy': bool(legacy), 'unpriced': bool(unpriced)}, source='pricing',
             )
         return int(cursor.lastrowid)
 
@@ -534,7 +618,7 @@ class Store:
             if not kwargs['currency'] or not isinstance(kwargs['currency'], str):
                 raise ValueError('price currency is required')
             before = self.conn.execute(
-                "SELECT source_kind,input_price,cache_price,output_price,currency,verified_at,legacy,unpriced FROM provider_model_price WHERE id=?",
+                "SELECT source_kind,input_price,cache_price,output_price,currency,source_name,source_url,source_evidence,verified_at,legacy,unpriced FROM provider_model_price WHERE id=?",
                 (existing['id'],),
             ).fetchone()
             values = kwargs.copy()
@@ -545,15 +629,16 @@ class Store:
             with transaction:
                 self.conn.execute(
                     """UPDATE provider_model_price SET source_kind=?,input_price=?,cache_price=?,output_price=?,
-                       currency=?,source_url=?,source_evidence=?,verified_at=?,legacy=?,unpriced=? WHERE id=?""",
+                       currency=?,source_name=?,source_url=?,source_evidence=?,verified_at=?,legacy=?,unpriced=? WHERE id=?""",
                     (values['source_kind'], values['input_price'], values['cache_price'], values['output_price'],
-                     values['currency'], values.get('source_url'), values.get('source_evidence'), values.get('verified_at'),
+                     values['currency'], values.get('source_name'), values.get('source_url'), values.get('source_evidence'), values.get('verified_at'),
                      int(values.get('legacy', False)), values['unpriced'], existing['id']),
                 )
             after = {
                 'source_kind': values['source_kind'], 'input_price': values['input_price'],
                 'cache_price': values['cache_price'], 'output_price': values['output_price'],
-                'currency': values['currency'], 'verified_at': values.get('verified_at'),
+                'currency': values['currency'], 'source_name': values.get('source_name'), 'source_url': values.get('source_url'),
+                'source_evidence': values.get('source_evidence'), 'verified_at': values.get('verified_at'),
                 'legacy': bool(values.get('legacy', False)), 'unpriced': bool(values['unpriced']),
             }
             self.record_configuration_change(
@@ -564,11 +649,23 @@ class Store:
         return self.insert_provider_model_price(**kwargs)
 
     def deactivate_provider_model_price(self, provider_id: int, model_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT * FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
+            (provider_id, model_id),
+        ).fetchone()
+        if row is None:
+            return False
         with self.conn:
-            return bool(self.conn.execute(
+            changed = bool(self.conn.execute(
                 "UPDATE provider_model_price SET active=0 WHERE provider_id=? AND model_id=? AND active=1",
                 (provider_id, model_id),
             ).rowcount)
+            if changed:
+                self.record_configuration_change(
+                    f"pricing:{provider_id}:{model_id}", dict(row),
+                    dict(row) | {'active': 0}, source='pricing',
+                )
+            return changed
 
     def provider_model_prices(self, *, active: bool | None = None) -> list[dict]:
         clause = '' if active is None else ' WHERE p.active=?'
@@ -579,6 +676,116 @@ class Store:
             " ORDER BY p.id", params
         ).fetchall()
         return [dict(row) | {'active': bool(row['active']), 'legacy': bool(row['legacy']), 'unpriced': bool(row['unpriced'])} for row in rows]
+
+    def pricing_models(self, *, stage: str | None = None, active: bool | None = None) -> list[dict]:
+        clauses = []
+        params = []
+        if stage is not None:
+            clauses.append('m.stage=?')
+            params.append(stage)
+        if active is not None:
+            clauses.append('m.active=?')
+            params.append(int(active))
+        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
+        rows = self.conn.execute(
+            f"""SELECT m.id,m.stage,m.family,m.active,
+                       (SELECT count(*) FROM provider_model_price p WHERE p.model_id=m.id AND p.active=1) pricing_count
+                  FROM canonical_model m{where} ORDER BY m.id""", params,
+        ).fetchall()
+        result = []
+        for row in rows:
+            provider_ids = set()
+            for inventory in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
+                try:
+                    models = json.loads(inventory['models_json'])
+                except (TypeError, ValueError):
+                    models = []
+                if row['id'] in models:
+                    provider_ids.add(inventory['pricing_provider_id'])
+            result.append(dict(row) | {'active': bool(row['active']), 'inventory_provider_count': len(provider_ids)})
+        return result
+
+    def pricing_entries(self, *, provider: str | None = None, model: str | None = None,
+                        stage: str | None = None, currency: str | None = None,
+                        include_inactive: bool = False, status: str | None = None) -> list[dict]:
+        providers = self.pricing_providers(active=None if include_inactive else True)
+        provider_ids = {item['id'] for item in providers}
+        if provider:
+            provider_ids = {item['id'] for item in providers if provider in {str(item['id']), item['provider_key'], item['name']}}
+        models = self.pricing_models(stage=stage, active=None if include_inactive else True)
+        model_map = {item['id']: item for item in models}
+        if model:
+            model_id = canonicalize(model)
+            model_map = {key: value for key, value in model_map.items() if key == model_id}
+        raw_prices = self.provider_model_prices(active=None if include_inactive else True)
+        by_key = {(row['provider_id'], row['model_id']): row for row in raw_prices if row['provider_id'] in provider_ids and row['model_id'] in model_map}
+        candidates = set(by_key)
+        for row in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
+            if row['pricing_provider_id'] not in provider_ids:
+                continue
+            try:
+                inventory_models = json.loads(row['models_json'])
+            except (TypeError, ValueError):
+                inventory_models = []
+            candidates.update((row['pricing_provider_id'], item) for item in inventory_models if item in model_map)
+        for binding in self.relay_price_bindings(active=None if include_inactive else True):
+            if binding['relay_provider_id'] in provider_ids and binding['relay_model_id'] in model_map:
+                candidates.add((binding['relay_provider_id'], binding['relay_model_id']))
+        provider_map = {item['id']: item for item in providers}
+        inventory_map = {}
+        for row in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
+            try:
+                listed = json.loads(row['models_json'])
+            except (TypeError, ValueError):
+                listed = []
+            inventory_map.setdefault(row['pricing_provider_id'], set()).update(listed)
+        bindings = {(item['relay_provider_id'], item['relay_model_id']): item for item in self.relay_price_bindings(active=None if include_inactive else True)}
+        result = []
+        for provider_id, model_id in sorted(candidates, key=lambda item: (item[0], item[1])):
+            price = by_key.get((provider_id, model_id))
+            provider_item = provider_map[provider_id]
+            model_item = model_map[model_id]
+            resolved = self.effective_pricing(provider_id, model_id)
+            binding = bindings.get((provider_id, model_id))
+            benchmark_price = None
+            if price is None and binding:
+                benchmark_price = self.conn.execute(
+                    """SELECT * FROM provider_model_price
+                       WHERE provider_id=? AND model_id=? AND active=1""",
+                    (binding['benchmark_provider_id'], binding['benchmark_model_id']),
+                ).fetchone()
+            display_price = price or benchmark_price
+            if currency and (display_price or resolved.get('currency')) and str((display_price or resolved)['currency']).upper() != currency.upper():
+                continue
+            active = bool(price['active']) if price else bool(provider_item['active'] and model_item['active'])
+            priced = bool(resolved['priced'])
+            row_status = 'priced' if priced else 'unpriced'
+            if status and status != row_status:
+                continue
+            source = {
+                'kind': price['source_kind'] if price else ('relay' if binding else None),
+                'type': price['source_kind'] if price else ('relay' if binding else None),
+                'name': price['source_name'] if price else (binding['source_name'] if binding else None),
+                'url': price['source_url'] if price else (binding['source_url'] if binding else None),
+                'evidence': price['source_evidence'] if price else (binding['source_evidence'] if binding else None),
+                'verified_at': price['verified_at'] if price else None,
+                'legacy': bool(price['legacy']) if price else False,
+            }
+            base = ({'input': price['input_price'], 'cache': price['cache_price'], 'output': price['output_price'], 'currency': price['currency']}
+                    if price else ({'input': benchmark_price['input_price'], 'cache': benchmark_price['cache_price'], 'output': benchmark_price['output_price'], 'currency': benchmark_price['currency']}
+                                   if benchmark_price else {'input': None, 'cache': None, 'output': None, 'currency': None}))
+            final = ({'input': resolved['input_price'], 'cache': resolved['cache_price'], 'output': resolved['output_price'],
+                      'blended': resolved['blended_price'], 'currency': resolved['currency'], 'multiplier': resolved['multiplier']}
+                     if resolved['priced'] else None)
+            result.append({
+                'id': price['id'] if price else None, 'active': active, 'unpriced': not priced,
+                'status': row_status, 'provider': provider_item | {'type': provider_item['provider_type'],
+                    'inventory_models': sorted(inventory_map.get(provider_id, set()))},
+                'model': {key: model_item[key] for key in ('id', 'stage', 'family', 'active')},
+                'base_price': base, 'final_price': final, 'source': source,
+                'binding': binding, 'reason': resolved['reason'],
+            })
+        return result
 
     def effective_pricing(self, provider: int | str, model: str) -> dict:
         """Resolve final prices for one pricing Provider and canonical Model.
@@ -700,7 +907,7 @@ class Store:
 
     def bind_relay_price(self, relay_provider_id: int, relay_model_id: str,
                          benchmark_provider_id: int, benchmark_model_id: str,
-                         *, source_url: str | None = None,
+                         *, source_name: str | None = None, source_url: str | None = None,
                          source_evidence: str | None = None) -> int:
         relay = self.conn.execute(
             "SELECT provider_type,active FROM pricing_provider WHERE id=?", (relay_provider_id,)
@@ -723,11 +930,50 @@ class Store:
         with self.conn:
             cursor = self.conn.execute(
                 """INSERT INTO relay_price_binding(
-                   relay_provider_id,relay_model_id,benchmark_provider_id,benchmark_model_id,source_url,source_evidence,active
-                ) VALUES(?,?,?,?,?,?,1)""",
-                (relay_provider_id, relay_model_id, benchmark_provider_id, benchmark_model_id, source_url, source_evidence),
+                   relay_provider_id,relay_model_id,benchmark_provider_id,benchmark_model_id,source_name,source_url,source_evidence,active
+                ) VALUES(?,?,?,?,?,?,?,1)""",
+                (relay_provider_id, relay_model_id, benchmark_provider_id, benchmark_model_id, source_name, source_url, source_evidence),
+            )
+            self.record_configuration_change(
+                f'relay-binding:{cursor.lastrowid}', None,
+                {'relay_provider_id': relay_provider_id, 'relay_model_id': relay_model_id,
+                 'benchmark_provider_id': benchmark_provider_id, 'benchmark_model_id': benchmark_model_id,
+                 'source_name': source_name, 'source_url': source_url, 'source_evidence': source_evidence,
+                 'active': True}, source='pricing',
             )
         return int(cursor.lastrowid)
+
+    def update_relay_price_binding(self, binding_id: int, *, benchmark_provider_id: int,
+                                   benchmark_model_id: str, source_name: str | None = None,
+                                   source_url: str | None = None,
+                                   source_evidence: str | None = None) -> bool:
+        current = self.conn.execute(
+            "SELECT relay_provider_id,relay_model_id,active FROM relay_price_binding WHERE id=?",
+            (binding_id,),
+        ).fetchone()
+        if current is None:
+            return False
+        benchmark = self.conn.execute(
+            "SELECT active FROM pricing_provider WHERE id=?", (benchmark_provider_id,)
+        ).fetchone()
+        benchmark_model = self.conn.execute(
+            "SELECT active FROM canonical_model WHERE id=?", (benchmark_model_id,)
+        ).fetchone()
+        price = self.conn.execute(
+            "SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
+            (benchmark_provider_id, benchmark_model_id),
+        ).fetchone()
+        if not benchmark or not benchmark['active'] or not benchmark_model or not benchmark_model['active'] or not price:
+            raise sqlite3.IntegrityError('relay binding requires active benchmark provider, model, and price')
+        before = dict(self.conn.execute("SELECT * FROM relay_price_binding WHERE id=?", (binding_id,)).fetchone())
+        with self.conn:
+            self.conn.execute(
+                "UPDATE relay_price_binding SET benchmark_provider_id=?,benchmark_model_id=?,source_name=?,source_url=?,source_evidence=?,active=1 WHERE id=?",
+                (benchmark_provider_id, benchmark_model_id, source_name, source_url, source_evidence, binding_id),
+            )
+            after = dict(self.conn.execute("SELECT * FROM relay_price_binding WHERE id=?", (binding_id,)).fetchone())
+            self.record_configuration_change(f'relay-binding:{binding_id}', before, after, source='pricing')
+        return True
 
     def relay_price_bindings(self, *, active: bool | None = None) -> list[dict]:
         clause = '' if active is None else ' WHERE b.active=?'
@@ -742,11 +988,22 @@ class Store:
         return [dict(row) | {'active': bool(row['active'])} for row in rows]
 
     def deactivate_relay_price_binding(self, relay_provider_id: int, relay_model_id: str) -> bool:
+        row = self.conn.execute(
+            "SELECT * FROM relay_price_binding WHERE relay_provider_id=? AND relay_model_id=? AND active=1",
+            (relay_provider_id, relay_model_id),
+        ).fetchone()
+        if row is None:
+            return False
         with self.conn:
-            return bool(self.conn.execute(
+            changed = bool(self.conn.execute(
                 "UPDATE relay_price_binding SET active=0 WHERE relay_provider_id=? AND relay_model_id=? AND active=1",
                 (relay_provider_id, relay_model_id),
             ).rowcount)
+            if changed:
+                self.record_configuration_change(
+                    f'relay-binding:{row["id"]}', dict(row), dict(row) | {'active': 0}, source='pricing',
+                )
+            return changed
 
     def migrate_pricing(self) -> dict:
         version = 1
@@ -1095,7 +1352,8 @@ class Store:
 
     def record_configuration_change(self, setting: str, before: object, after: object, *, source: str = "admin") -> None:
         safe_settings = {"race_parallel_cap", "hedge_delay_ms", "global_parallel_cap", "site_policy"}
-        if (setting not in safe_settings and not setting.startswith("pricing:")) or before == after:
+        pricing_settings = ("pricing:", "pricing-provider:", "model:", "relay-binding:")
+        if (setting not in safe_settings and not setting.startswith(pricing_settings)) or before == after:
             return
         transaction = nullcontext() if self.conn.in_transaction else self.conn
         with transaction:
