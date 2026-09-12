@@ -64,6 +64,7 @@ def test_catalog_migration_adds_missing_seeds_without_overwriting_existing_entri
     first = Store(path, b"0123456789abcdef")
     custom = {
         "family": "Operator managed", "intellect": "smart",
+        "currency": "USD",
         "official_input_price": 1.0, "official_cache_price": 0.1, "official_output_price": 3.0,
     }
     assert first.create_catalog("operator-model", custom)

@@ -10,7 +10,7 @@ from urllib.parse import urlsplit
 
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
-from .catalog import blended_price
+from .catalog import blended_price, provider_pricing
 
 
 TELEMETRY_SCHEMA_VERSION = 1
@@ -105,7 +105,8 @@ class Store:
         );
         CREATE TABLE IF NOT EXISTS model_catalog (
           model TEXT PRIMARY KEY, family TEXT NOT NULL, intellect TEXT NOT NULL,
-          input_price REAL NOT NULL, cache_price REAL NOT NULL, output_price REAL NOT NULL
+          input_price REAL NOT NULL, cache_price REAL NOT NULL, output_price REAL NOT NULL,
+          currency TEXT NOT NULL DEFAULT 'USD'
         );
         CREATE TABLE IF NOT EXISTS route_block (fingerprint TEXT NOT NULL, model TEXT NOT NULL, blocked_at TEXT NOT NULL DEFAULT CURRENT_TIMESTAMP, PRIMARY KEY(fingerprint,model));
         CREATE TABLE IF NOT EXISTS broker_setting (name TEXT PRIMARY KEY, value TEXT NOT NULL);
@@ -248,14 +249,16 @@ class Store:
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_telemetry_window ON route_run(telemetry_version, started_at DESC)")
         self.conn.execute("CREATE INDEX IF NOT EXISTS route_run_delivery_window ON route_run(delivery_mode, started_at DESC)")
         from .catalog import CATALOG, CATALOG_SEED_VERSION, CATALOG_V2_MODELS
+        try: self.conn.execute("ALTER TABLE model_catalog ADD COLUMN currency TEXT NOT NULL DEFAULT 'USD'")
+        except sqlite3.OperationalError: pass
         seed_row = self.conn.execute("SELECT value FROM broker_setting WHERE name='catalog_seed_version'").fetchone()
         seed_version = int(seed_row[0]) if seed_row else (1 if catalog_exists else 0)
         seed_models = CATALOG if not catalog_exists else {
             model: CATALOG[model] for model in CATALOG_V2_MODELS
         } if seed_version < CATALOG_SEED_VERSION else {}
         self.conn.executemany(
-            "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?)",
-            [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price']) for model, item in seed_models.items()],
+            "INSERT OR IGNORE INTO model_catalog VALUES(?,?,?,?,?,?,?)",
+            [(model, item['family'], item['intellect'], item['official_input_price'], item['official_cache_price'], item['official_output_price'], item.get('currency', 'USD')) for model, item in seed_models.items()],
         )
         if seed_version < 4:
             self.conn.executemany("DELETE FROM model_catalog WHERE model=?", [("deepseek-v4-flash-0731",), ("deepseek-v4.1-flash",)])
@@ -388,19 +391,19 @@ class Store:
         return [{"fingerprint": r["fingerprint"], "provider": r["name"], "note": r["note"], "model": r["model"], "state": r["state"], "consecutive_failures": r["consecutive_failures"], "backoff_level": r["backoff_level"], "last_real_attempt": r["last_real_attempt"], "last_real_success": r["last_real_success"], "last_probe_at": r["probe_at"] or r["last_probe_at"], "next_probe_at": r["next_probe_at"], "ttft_ms": r["probe_ttft_ms"], "error_type": r["probe_error_type"]} for r in rows]
 
     def catalog(self):
-        return {r['model']:{'family':r['family'],'intellect':r['intellect'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price']} for r in self.conn.execute('SELECT * FROM model_catalog ORDER BY model')}
+        return {r['model']:{'family':r['family'],'intellect':r['intellect'],'currency':r['currency'],'official_input_price':r['input_price'],'official_cache_price':r['cache_price'],'official_output_price':r['output_price']} for r in self.conn.execute('SELECT * FROM model_catalog ORDER BY model')}
     def create_catalog(self, model, body):
         try:
             with self.conn:
-                self.conn.execute("INSERT INTO model_catalog VALUES(?,?,?,?,?,?)", (model, body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price']))
+                self.conn.execute("INSERT INTO model_catalog VALUES(?,?,?,?,?,?,?)", (model, body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price'], body.get('currency', 'USD')))
         except sqlite3.IntegrityError:
             return False
         return True
     def update_catalog(self, model, body):
         with self.conn:
             updated = self.conn.execute(
-                "UPDATE model_catalog SET family=?,intellect=?,input_price=?,cache_price=?,output_price=? WHERE model=?",
-                (body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price'], model),
+                "UPDATE model_catalog SET family=?,intellect=?,input_price=?,cache_price=?,output_price=?,currency=? WHERE model=?",
+                (body['family'], body['intellect'], body['official_input_price'], body['official_cache_price'], body['official_output_price'], body.get('currency', 'USD'), model),
             ).rowcount
         return bool(updated)
     def delete_catalog(self, model):
@@ -1029,7 +1032,7 @@ class Store:
                         continue
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
-                    pricing = catalog[model]
+                    pricing = provider_pricing(r['base_url'], model, catalog[model])
                     source = json.loads(r['source_json']) if r['source_json'] else {}
                     model_aliases = source.get('model_aliases') or {}
                     wire_model = model_aliases.get(model)
@@ -1088,7 +1091,7 @@ class Store:
         if tier not in json.loads(row['tiers_json']):
             return None
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
-        pricing = catalog[model]
+        pricing = provider_pricing(row['base_url'], model, catalog[model])
         source = json.loads(row['source_json']) if row['source_json'] else {}
         model_aliases = source.get('model_aliases') or {}
         wire_model = model_aliases.get(model)
@@ -1115,7 +1118,7 @@ class Store:
             for model in json.loads(row['models_json']):
                 if model not in catalog or catalog[model]['intellect'] not in tiers:
                     continue
-                pricing = catalog[model]
+                pricing = provider_pricing(row['base_url'], model, catalog[model])
                 source = json.loads(row['source_json']) if row['source_json'] else {}
                 model_aliases = source.get('model_aliases') or {}
                 wire_model = model_aliases.get(model)

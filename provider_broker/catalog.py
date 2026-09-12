@@ -1,4 +1,5 @@
 """Default model-directory seed. Runtime entries are managed in SQLite; unknown models are never inferred."""
+from urllib.parse import urlsplit
 
 CATALOG = {
     "gpt-5.6-luna": {
@@ -35,11 +36,13 @@ CATALOG = {
     # another model.
     "deepseek-v4-flash": {
         "family": "DeepSeek", "intellect": "smart",
-        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+        "currency": "USD",
+        "official_input_price": 0.14, "official_cache_price": 0.0028, "official_output_price": 0.28,
     },
     "deepseek-v4-pro": {
         "family": "DeepSeek", "intellect": "expert",
-        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+        "currency": "USD",
+        "official_input_price": 0.435, "official_cache_price": 0.003625, "official_output_price": 0.87,
     },
     "doubao-seed-2.0-lite": {
         "family": "Doubao Seed", "intellect": "standard",
@@ -55,17 +58,22 @@ CATALOG = {
     },
     "doubao-seed-2.1-turbo": {
         "family": "Doubao Seed", "intellect": "smart",
-        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+        "currency": "CNY",
+        "official_input_price": 3.0, "official_cache_price": 0.6, "official_output_price": 15.0,
     },
     "doubao-seed-2.1-pro": {
         "family": "Doubao Seed", "intellect": "smart",
-        "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
+        "currency": "CNY",
+        "official_input_price": 6.0, "official_cache_price": 1.2, "official_output_price": 30.0,
     },
     "glm-5.3": {
         "family": "GLM", "intellect": "expert",
         "official_input_price": 0.0, "official_cache_price": 0.0, "official_output_price": 0.0,
     },
 }
+
+for _item in CATALOG.values():
+    _item.setdefault("currency", "USD")
 
 ALIASES = {
     "gpt-5.6": "gpt-5.6-sol", "claude-opus-4.8": "claude-opus-4-8",
@@ -99,6 +107,32 @@ PUBLIC_MODEL_IDS = {
         "doubao-seed-2.1-pro": "doubao-seed-2.1-pro",
     },
 }
+
+PROVIDER_PRICING = {
+    "llm-uqnm5hkklj592o02.cn-beijing.maas.aliyuncs.com": {
+        "qwen3.8-flash-next": {"currency": "CNY", "official_input_price": 0.8, "official_cache_price": 0.1, "official_output_price": 2.7},
+    },
+    "api.deepinfra.com": {
+        "deepseek-v4-flash": {"currency": "USD", "official_input_price": 0.09, "official_cache_price": 0.018, "official_output_price": 0.18},
+        "deepseek-v4-pro": {"currency": "USD", "official_input_price": 1.30, "official_cache_price": 0.10, "official_output_price": 2.60},
+    },
+    "api.deepseek.com": {
+        "deepseek-v4-flash": {"currency": "USD", "official_input_price": 0.14, "official_cache_price": 0.0028, "official_output_price": 0.28},
+        "deepseek-v4-pro": {"currency": "USD", "official_input_price": 0.435, "official_cache_price": 0.003625, "official_output_price": 0.87},
+    },
+    "ark.cn-beijing.volces.com": {
+        "doubao-seed-2.1-turbo": {"currency": "CNY", "official_input_price": 3.0, "official_cache_price": 0.6, "official_output_price": 15.0},
+        "doubao-seed-2.1-pro": {"currency": "CNY", "official_input_price": 6.0, "official_cache_price": 1.2, "official_output_price": 30.0},
+    },
+}
+
+
+def provider_pricing(base_url: str, model: str, fallback: dict) -> dict:
+    host = urlsplit(base_url).hostname.lower() if urlsplit(base_url).hostname else ""
+    for endpoint, prices in PROVIDER_PRICING.items():
+        if host == endpoint and canonicalize(model) in prices:
+            return prices[canonicalize(model)] | {"price_source": "official-provider"}
+    return fallback
 
 
 def canonicalize(model: str) -> str:
