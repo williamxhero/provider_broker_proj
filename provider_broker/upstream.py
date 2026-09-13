@@ -296,7 +296,11 @@ def normalize_usage(data: dict) -> dict:
 
 
 def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pricing=None) -> dict:
-    pricing = pricing or CATALOG.get(canonicalize(model))
+    # Costing is only authoritative when the runtime supplies a resolved
+    # Provider+Model + Key mapping price. The legacy global catalog is not a
+    # billing fallback.
+    if pricing is None:
+        return {"cost": None, "reason": "key-model mapping price is missing"}
     input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
     if pricing is None:
         return {"cost": None, "reason": "canonical model price is missing"}
@@ -878,6 +882,7 @@ async def invoke_stream(provider, body: dict) -> dict:
         "text": text, "chunks": chunks, "actual_model": actual_model,
         "latency_ms": ttft_ms, "usage": usage,
         "request_id": str(metadata.get("id") or uuid.uuid4()),
+        "currency": effective_pricing.get("currency") if isinstance(effective_pricing, dict) else None,
         "cost": cost_details["cost"], "cost_reason": cost_details["reason"],
         "diagnostic": diagnostic(),
     }
@@ -900,7 +905,7 @@ def observe(store, provider, requested_model, tier, body, status, *, output=None
         actual_model=output.get("actual_model"), tier=tier, effort=body.get("effort"),
         success=int(status == "completed"), latency_ms=output.get("latency_ms"), error=None,
         status=status, input_tokens=usage.get("input_tokens"), output_tokens=usage.get("output_tokens"),
-        cost=output.get("cost"), request_id=output.get("request_id") or str(uuid.uuid4()),
+        cost=output.get("cost"), currency=output.get("currency"), request_id=output.get("request_id") or str(uuid.uuid4()),
         diagnostic_json=json.dumps(diagnostic, sort_keys=True),
         route_id=route_id, attempt_number=attempt.get("attempt"), started_ms=attempt.get("started_ms"),
         elapsed_ms=attempt.get("elapsed_ms"),

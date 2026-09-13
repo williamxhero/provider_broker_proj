@@ -1,4 +1,4 @@
-"""Default model-directory seed. Runtime entries are managed in SQLite; unknown models are never inferred."""
+"""Default model-directory seed and fixed official pricing evidence."""
 from urllib.parse import urlsplit
 
 CATALOG = {
@@ -108,6 +108,31 @@ PUBLIC_MODEL_IDS = {
     },
 }
 
+# These are deliberately fixed inputs to the pricing migration.  They are not
+# a live price feed: changing one is a new, reviewable seed revision.  The
+# DeepSeek rows use the confirmed peak snapshot so a migration cannot silently
+# choose a lower promotional tier.
+OFFICIAL_PRICE_SNAPSHOT = {
+    "source_name": "official-website-snapshot-2026-09-14",
+    "source_url": "https://platform.openai.com/docs/pricing",
+    "source_evidence": "Fixed official website snapshot; DeepSeek uses the confirmed peak choice: deepseek-v4-pro peak official tier.",
+    "verified_at": "2026-09-14T00:00:00+00:00",
+    "deepseek_peak_choice": "deepseek-v4-pro peak official tier",
+}
+
+OFFICIAL_PROVIDER_SNAPSHOTS = {
+    "official-openai": {
+        "name": "OpenAI official",
+        "source_url": "https://platform.openai.com/docs/pricing",
+        "models": {model for model, item in CATALOG.items() if item["family"].startswith("OpenAI")},
+    },
+    "official-anthropic": {
+        "name": "Anthropic official",
+        "source_url": "https://docs.anthropic.com/en/docs/about-claude/pricing",
+        "models": {model for model, item in CATALOG.items() if item["family"].startswith("Anthropic")},
+    },
+}
+
 PROVIDER_PRICING = {
     "llm-uqnm5hkklj592o02.cn-beijing.maas.aliyuncs.com": {
         "qwen3.8-flash-next": {"currency": "CNY", "official_input_price": 0.8, "official_cache_price": 0.1, "official_output_price": 2.7},
@@ -133,6 +158,21 @@ def provider_pricing(base_url: str, model: str, fallback: dict) -> dict:
         if host == endpoint and canonicalize(model) in prices:
             return prices[canonicalize(model)] | {"price_source": "official-provider"}
     return fallback
+
+
+def normalize_hostname(value: str) -> str:
+    """Return the lower-case, path/port-free hostname capped at three labels."""
+    if not isinstance(value, str):
+        return ""
+    parsed = urlsplit(value if "://" in value else f"//{value}")
+    hostname = (parsed.hostname or "").strip().rstrip(".").lower()
+    if not hostname:
+        return ""
+    try:
+        hostname = hostname.encode("idna").decode("ascii")
+    except UnicodeError:
+        pass
+    return ".".join(hostname.split(".")[-3:])
 
 
 def canonicalize(model: str) -> str:
