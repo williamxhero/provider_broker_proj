@@ -35,7 +35,7 @@
         <div><p class="index">03 / STAGE</p><h2 id="model-view-title">Stage</h2></div>
         <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
-      <p class="field-help">每行对应一个 Stage；低价/高价组按该 Stage 当前模型输出价计算。测试只触达启用且当前可调用的 Key/Model capability pair，并在完成后刷新本行聚合指标。</p>
+      <p class="field-help">每个 Stage 只展示已确定的主模型；每条备注对应一个 Provider + API Key。测试只触达启用且当前可调用的主模型 Key，并在完成后刷新对应行指标。</p>
       <div class="table-wrap"><table id="model-view"></table></div>
       <output id="stage-test-result" class="notice" aria-live="polite"></output>
     </section>

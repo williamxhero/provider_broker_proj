@@ -31,11 +31,20 @@ API_KEY_RESOURCE_FIELDS = frozenset({
     "max_parallel", "window", "total_tokens", "fee_buckets", "edit",
 })
 STAGE_RESOURCE_FIELDS = frozenset({
-    "stage", "model", "family", "provider_types", "callable_key_count",
-    "latest_test", "technical_success_rate", "avg_first_token_latency_ms",
-    "window", "total_tokens", "fee_buckets", "edit", "models", "families",
-    "price_bands", "price_boundary_cny",
+    "stage", "fingerprint", "note", "model", "family", "provider_type",
+    "normalized_hostname", "api_key_mask", "status", "max_parallel",
+    "callable", "latest_test", "technical_success_rate",
+    "avg_first_token_latency_ms", "window", "total_tokens", "fee_buckets", "edit",
 })
+
+# The management console intentionally exposes the three routing stages, not
+# every model discovered in a provider's inventory.  Runtime routing may still
+# use the wider canonical catalog.
+STAGE_MODELS = {
+    "standard": "gpt-5.6-luna",
+    "smart": "gpt-5.6-terra",
+    "expert": "gpt-5.6-sol",
+}
 
 
 def broker_release_version() -> str:
@@ -2601,15 +2610,15 @@ class Store:
     def stage_test_providers(self, stage: str) -> list[Provider]:
         """Return enabled Key/Model capability pairs for a Stage test.
 
-        The console operates on a Stage, not an individual model, and expands
-        the operation to every current callable pair in that Stage.
+        The console operates on a Stage and its fixed primary model.  Runtime
+        routing may still enumerate the wider canonical catalog separately.
         """
         catalog = self.canonical_models()
+        candidate = STAGE_MODELS.get(stage)
+        if candidate is None or candidate not in catalog:
+            return []
         pairs = []
-        for candidate, metadata in catalog.items():
-            if metadata["stage"] != stage:
-                continue
-            pairs.extend((row, candidate) for row in self._stage_key_rows(stage, candidate, callable_only=True))
+        pairs.extend((row, candidate) for row in self._stage_key_rows(stage, candidate, callable_only=True))
         result = []
         seen = set()
         for row, candidate in pairs:
@@ -2656,108 +2665,67 @@ class Store:
                 "tokens_by_currency": {key: item["total_tokens"] for key, item in buckets.items()}}
 
     def stage_resources(self, window: str = "24h") -> list[dict]:
-        """Aggregate one row per Stage with stable low/high price groups.
-
-        Models and credentials are deliberately collection details inside a
-        Stage row.  The only business grouping key is Stage; price bands are a
-        deterministic sub-group derived from the distinct CNY output prices.
-        """
+        """Return one management row per fixed Stage and configured API Key."""
         if window not in ACCOUNTING_WINDOWS:
             raise ValueError("invalid window")
         canonical_model_metadata = self.canonical_models()
-        inventory_rows = self.conn.execute("SELECT fingerprint,models_json FROM source_provider ORDER BY id").fetchall()
-        models_by_stage: dict[str, set[str]] = {stage: set() for stage in ("standard", "smart", "expert")}
-        for inventory in inventory_rows:
-            try:
-                declared = json.loads(inventory["models_json"] or "[]")
-            except (TypeError, ValueError):
-                declared = []
-            for raw_model in declared:
-                model = canonicalize(str(raw_model))
-                metadata = canonical_model_metadata.get(model)
-                if metadata:
-                    models_by_stage[metadata["stage"]].add(model)
-
+        rows = self.conn.execute(
+            """SELECT s.*,p.enabled,p.note,p.max_parallel,p.tiers_json
+                 FROM source_provider s JOIN policy p USING(fingerprint)
+                ORDER BY s.id"""
+        ).fetchall()
         resources = []
-        stage_order = {"standard": 0, "smart": 1, "expert": 2}
-        for stage in sorted(models_by_stage, key=stage_order.__getitem__):
-            models = sorted(models_by_stage[stage])
-            if not models:
+        stage_order = ("standard", "smart", "expert")
+        for stage in stage_order:
+            model = STAGE_MODELS[stage]
+            metadata = canonical_model_metadata.get(model)
+            if metadata is None:
                 continue
-            matching_by_pair = {}
-            callable_by_pair = {}
-            for model in models:
-                for row in self._stage_key_rows(stage, model):
-                    matching_by_pair[(row["fingerprint"], model)] = row
-                for row in self._stage_key_rows(stage, model, callable_only=True):
-                    callable_by_pair[(row["fingerprint"], model)] = row
-            matching = list(matching_by_pair.values())
-            fingerprints = sorted({row["fingerprint"] for row in matching})
-            callable_fingerprints = {row["fingerprint"] for row in callable_by_pair.values()}
-            provider_types = sorted({
-                canonical_provider_type(
+            for row in rows:
+                try:
+                    declared = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
+                    tiers = set(json.loads(row["tiers_json"] or "[]"))
+                    source = json.loads(row["source_json"] or "{}")
+                except (TypeError, ValueError):
+                    declared, tiers, source = set(), set(), {}
+                if model not in declared or stage not in tiers:
+                    continue
+                fingerprint = row["fingerprint"]
+                accounting = self.accounting(window=window, fingerprint=fingerprint, stage=stage, model=model)
+                stats, _ = self._stage_scope_stats(stage, [model], [fingerprint], window)
+                callable_now = any(
+                    item["fingerprint"] == fingerprint
+                    for item in self._stage_key_rows(stage, model, callable_only=True)
+                )
+                latest = self._latest_stage_test([model], [fingerprint])
+                inventory_status = source.get("inventory_status")
+                status = "disabled" if not row["enabled"] else (
+                    "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
+                )
+                provider_type = canonical_provider_type(
                     row["pricing_provider_type"] or row["provider_type"],
-                    base_url=row["base_url"], models=models,
+                    base_url=row["base_url"],
                 ) or "UNKNOWN"
-                for row in matching
-            })
-            stats, accounting = self._stage_scope_stats(stage, models, fingerprints, window)
-            price_records = []
-            unknown_records = []
-            for fingerprint, model in sorted(matching_by_pair):
-                pricing = self.effective_key_pricing(fingerprint, model)
-                record = (fingerprint, model, pricing)
-                if pricing["priced"] and isinstance(pricing.get("output_price_cny"), (int, float)):
-                    price_records.append(record)
-                else:
-                    unknown_records.append(record)
-            distinct_prices = sorted({round(float(item[2]["output_price_cny"]), 10) for item in price_records})
-            if distinct_prices:
-                midpoint = len(distinct_prices) // 2
-                boundary = distinct_prices[midpoint] if len(distinct_prices) % 2 else (distinct_prices[midpoint - 1] + distinct_prices[midpoint]) / 2
-            else:
-                boundary = None
-            bands = {"low": [], "high": [], "unknown": unknown_records}
-            for record in price_records:
-                bands["low" if record[2]["output_price_cny"] <= boundary else "high"].append(record)
-
-            def band_payload(name: str, records: list[tuple[str, str, dict]]) -> dict:
-                band_models = sorted({record[1] for record in records})
-                band_fingerprints = sorted({record[0] for record in records})
-                band_stats, band_accounting = self._stage_scope_stats(stage, band_models, band_fingerprints, window)
-                prices = sorted({round(float(record[2]["output_price_cny"]), 10) for record in records if record[2].get("priced")})
-                latest = self._latest_stage_test(band_models, band_fingerprints)
-                return {
-                    "name": name,
-                    "models": band_models,
-                    "output_prices_cny": prices,
-                    "output_price_cny": prices[0] if len(prices) == 1 else None,
-                    "callable_key_count": len({fingerprint for fingerprint in band_fingerprints if fingerprint in callable_fingerprints}),
+                resources.append({
+                    "stage": stage,
+                    "fingerprint": fingerprint,
+                    "note": row["note"],
+                    "model": model,
+                    "family": metadata["family"],
+                    "provider_type": provider_type,
+                    "normalized_hostname": normalize_hostname(row["base_url"]) or "UNKNOWN",
+                    "api_key_mask": row["api_key_mask"] or "***",
+                    "status": status,
+                    "max_parallel": row["max_parallel"],
+                    "callable": callable_now,
                     "latest_test": latest,
-                    "technical_success_rate": band_stats["rate"],
-                    "avg_first_token_latency_ms": band_stats["ttft"],
-                    "total_tokens": band_accounting["total_tokens"],
-                    "fee_buckets": band_accounting["fee_buckets"],
-                }
-
-            resources.append({
-                "stage": stage,
-                "model": models[0] if len(models) == 1 else "UNKNOWN",
-                "family": " / ".join(sorted({canonical_model_metadata[model]["family"] for model in models})),
-                "provider_types": provider_types,
-                "callable_key_count": len(callable_fingerprints),
-                "latest_test": self._latest_stage_test(models, fingerprints),
-                "technical_success_rate": stats["rate"],
-                "avg_first_token_latency_ms": stats["ttft"],
-                "window": window,
-                "total_tokens": accounting["total_tokens"],
-                "fee_buckets": accounting["fee_buckets"],
-                "edit": {"stage": stage, "models": models},
-                "models": models,
-                "families": sorted({canonical_model_metadata[model]["family"] for model in models}),
-                "price_bands": {name: band_payload(name, records) for name, records in bands.items()},
-                "price_boundary_cny": boundary,
-            })
+                    "technical_success_rate": stats["rate"],
+                    "avg_first_token_latency_ms": stats["ttft"],
+                    "window": window,
+                    "total_tokens": accounting["total_tokens"],
+                    "fee_buckets": accounting["fee_buckets"],
+                    "edit": {"fingerprint": fingerprint, "href": f"/admin/v1/keys/{fingerprint}"},
+                })
         return resources
 
     def _stage_scope_stats(self, stage: str, models: list[str], fingerprints: list[str], window: str) -> tuple[dict, dict]:

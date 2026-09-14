@@ -295,9 +295,10 @@ async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa)
     assert inventory[0]['total_tokens'] == 150
     assert seven_day_inventory[0]['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert seven_day_inventory[0]['total_tokens'] == 300
-    stage = next(item for item in (await (await client.get('/admin/v1/stages?window=7d')).json())['items'] if item['model'] == 'gpt-5.6-luna')
-    assert stage['technical_success_rate'] == .5 and stage['avg_first_token_latency_ms'] == 200
-    assert stage['fee_buckets']['UNKNOWN']['total_fee'] == .625
+    stages = [item for item in (await (await client.get('/admin/v1/stages?window=7d')).json())['items'] if item['model'] == 'gpt-5.6-luna']
+    assert len(stages) == 1
+    assert stages[0]['technical_success_rate'] == .5 and stages[0]['avg_first_token_latency_ms'] == 200
+    assert stages[0]['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert quality['total_cost'] == .125
     assert (await client.get('/admin/v1/calls?sort=cost:asc')).status == 200
     assert (await client.get('/admin/v1/calls?sort=unknown:asc')).status == 400
@@ -747,8 +748,8 @@ async def test_summary_and_provider_stats_use_mixed_observations(client, cpa):
             db.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status) VALUES(?,?,?,?,?,?,?,?,?)",(provider['fingerprint'],'gpt-5.6-luna','gpt-5.6-luna','standard','low',success,ttft,status,status))
     summary=await client.get('/admin/v1/summary?window=24h',headers=headers); data=await summary.json()
     assert data['routable_apis']==1 and data['technical_success_rate']==.5 and data['avg_ttft_ms']==200
-    row=next(item for item in (await (await client.get('/admin/v1/stages?window=24h',headers=headers)).json())['items'] if item['model']=='gpt-5.6-luna')
-    assert row['technical_success_rate']==.5 and row['avg_first_token_latency_ms']==200
+    rows=[item for item in (await (await client.get('/admin/v1/stages?window=24h',headers=headers)).json())['items'] if item['model']=='gpt-5.6-luna']
+    assert len(rows)==1 and rows[0]['technical_success_rate']==.5 and rows[0]['avg_first_token_latency_ms']==200
 
 
 async def test_summary_counts_only_actual_routable_provider_keys(client, cpa):

@@ -81,42 +81,61 @@ def test_key_resources_merge_by_last_three_hostname_labels_and_keep_windowed_tot
     assert store.api_key_resource(first, "24h")["fingerprint"] == first
 
 
-def test_stage_resources_are_one_row_per_stage_with_stable_output_price_bands(tmp_path):
+def test_stage_resources_are_one_row_per_fixed_model_and_api_key(tmp_path):
     store = make_store(tmp_path)
-    store.create_canonical_model("standard-low", stage="standard", family="Low family")
-    store.create_canonical_model("standard-high", stage="standard", family="High family")
-    fingerprint = add_inventory(store, [{
-        "name": "Stage key", "base_url": "https://stage.vendor.example.com/v1",
-        "api_key": "stage-secret", "provider_type": "openai",
-        "models": ["standard-low", "standard-high"], "inventory_status": "available",
-    }])[0]
-    provider_id = store.conn.execute(
-        "SELECT id FROM pricing_provider WHERE provider_key='openai'"
-    ).fetchone()[0]
-    store.upsert_provider_model_price(provider_id=provider_id, model_id="standard-low", output_price_cny=5)
-    store.upsert_provider_model_price(provider_id=provider_id, model_id="standard-high", output_price_cny=15)
+    first, second = add_inventory(store, [
+        {
+            "name": "First", "base_url": "https://stage.vendor.example.com/v1",
+            "api_key": "stage-secret-one", "provider_type": "openai",
+            "models": ["gpt-5.6-luna", "gpt-5.6-terra"], "inventory_status": "available",
+        },
+        {
+            "name": "Second", "base_url": "https://stage.vendor.example.com/v1",
+            "api_key": "stage-secret-two", "provider_type": "openai",
+            "models": ["gpt-5.6-luna"], "inventory_status": "available",
+        },
+    ])
+    store.update_policy(first, {"note": "primary standard"})
+    store.update_policy(second, {"note": "backup standard"})
     store.observe(
-        fingerprint=fingerprint, requested_model="standard-low", actual_model="standard-low",
+        fingerprint=first, requested_model="gpt-5.6-luna", actual_model="gpt-5.6-luna",
         tier="standard", success=1, latency_ms=100, input_tokens=10,
         output_tokens=2, cost=0.06, currency="CNY", status="completed",
     )
     store.observe(
-        fingerprint=fingerprint, requested_model="standard-high", actual_model="standard-high",
+        fingerprint=second, requested_model="gpt-5.6-luna", actual_model="gpt-5.6-luna",
         tier="standard", success=0, latency_ms=200, input_tokens=20,
         output_tokens=3, cost=0.345, currency="CNY", status="completed",
     )
 
     stages = store.stage_resources("24h")
-    standard = next(item for item in stages if item["stage"] == "standard")
+    standard = [item for item in stages if item["stage"] == "standard"]
 
-    assert len([item for item in stages if item["stage"] == "standard"]) == 1
-    assert standard["model"] == "UNKNOWN"
-    assert standard["models"] == ["standard-high", "standard-low"]
-    assert standard["callable_key_count"] == 1
-    assert standard["total_tokens"] == 35
-    assert standard["price_boundary_cny"] == 10.0
-    assert standard["price_bands"]["low"]["output_prices_cny"] == [5.0]
-    assert standard["price_bands"]["low"]["models"] == ["standard-low"]
-    assert standard["price_bands"]["high"]["output_prices_cny"] == [15.0]
-    assert standard["price_bands"]["high"]["models"] == ["standard-high"]
-    assert standard["price_bands"]["unknown"]["models"] == []
+    assert len(standard) == 2
+    assert {item["fingerprint"] for item in standard} == {first, second}
+    assert {item["model"] for item in standard} == {"gpt-5.6-luna"}
+    assert {item["note"] for item in standard} == {"primary standard", "backup standard"}
+    assert {item["total_tokens"] for item in standard} == {12, 23}
+    assert all(item["provider_type"] == "openai" for item in standard)
+    assert all("price_bands" not in item and "models" not in item for item in standard)
+    assert not any(item["model"] in {"standard-low", "standard-high"} for item in stages)
+
+
+def test_stage_resources_use_only_the_three_approved_primary_models(tmp_path):
+    store = make_store(tmp_path)
+    add_inventory(store, [{
+        "name": "All models", "base_url": "https://all.vendor.example.com/v1",
+        "api_key": "all-stage-secret", "provider_type": "openai",
+        "models": [
+            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5",
+            "claude-sonnet-5", "claude-opus-5", "deepseek-v4-flash",
+        ], "inventory_status": "available",
+    }])
+
+    stages = store.stage_resources("24h")
+
+    assert [(item["stage"], item["model"]) for item in stages] == [
+        ("standard", "gpt-5.6-luna"),
+        ("smart", "gpt-5.6-terra"),
+        ("expert", "gpt-5.6-sol"),
+    ]

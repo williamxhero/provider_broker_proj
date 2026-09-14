@@ -59,14 +59,16 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
 
     stages_response = await admin_client.get("/admin/v1/stages?window=24h")
     assert stages_response.status == 200
-    stage = next(item for item in (await stages_response.json())["items"] if item["model"] == "gpt-5.6-luna")
-    assert set(stage) == STAGE_RESOURCE_FIELDS
-    assert stage["provider_types"] == ["anthropic", "openai"]
-    assert stage["callable_key_count"] == 1
-    assert stage["total_tokens"] == 40
-    assert set(stage["fee_buckets"]) == {"CNY", "USD"}
-    assert stage["fee_buckets"]["USD"]["total_fee"] == .25
-    assert stage["fee_buckets"]["CNY"]["total_fee"] == 2
+    stages = (await stages_response.json())["items"]
+    assert len(stages) == 2
+    assert all(set(item) == STAGE_RESOURCE_FIELDS for item in stages)
+    assert {item["model"] for item in stages} == {"gpt-5.6-luna"}
+    assert {item["fingerprint"] for item in stages} == {first, second}
+    assert {item["provider_type"] for item in stages} == {"anthropic", "openai"}
+    assert {item["status"] for item in stages} == {"enabled", "disabled"}
+    assert sum(item["total_tokens"] for item in stages) == 40
+    assert stages[0]["fee_buckets"]["USD"]["total_fee"] == .25
+    assert stages[1]["fee_buckets"]["CNY"]["total_fee"] == 2
 
     assert (await admin_client.get("/admin/v1/models?include_inactive=true")).status == 404
 

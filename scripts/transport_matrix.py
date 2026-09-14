@@ -24,8 +24,9 @@ SCHEMA = {
     "additionalProperties": False,
 }
 TIERS = {
-    "gpt-5.6-luna": "standard", "gpt-5.6-terra": "smart", "claude-sonnet-5": "smart",
-    "gpt-5.6-sol": "expert", "claude-opus-5": "expert",
+    "gpt-5.6-luna": "standard",
+    "gpt-5.6-terra": "smart",
+    "gpt-5.6-sol": "expert",
 }
 
 
@@ -78,27 +79,24 @@ def broker_cell(broker_url: str, model: str, contract: str, *, runs: int = 1) ->
     stages = (stage_inventory or {}).get("items") if status == 200 else None
     target = next((item for item in stages or []
                    if isinstance(item, dict) and item.get("stage") == stage and item.get("model") == model
-                   and type(item.get("callable_key_count")) is int
-                   and item["callable_key_count"] > 0), None)
+                   and item.get("callable") is True), None)
     if not target:
         return {"path": "broker_direct", "contract": contract, "model": model, "state": "failed", "reason": "no_enabled_target", "runs": 0, "passed_runs": 0}
-    payload = {"stage": stage, "model": model}
+    payload = {"stage": stage}
     started = time.monotonic()
     items = []
     for _ in range(runs):
         status, data = request(broker_url.rstrip("/") + "/admin/v1/stages/test", payload=payload)
-        results = (data or {}).get("items") if status == 200 else None
-        results = [result for result in results if isinstance(result, dict)] if isinstance(results, list) else []
-        item = next((result for result in results if result.get("state") == "succeeded"), None)
-        if item is None:
-            item = results[0] if results else {}
-        items.append((status, item))
-    status, item = items[-1]
-    passed_runs = sum(1 for cell_status, cell in items if cell_status == 200 and cell.get("state") == "succeeded")
+        tested = (data or {}).get("tested_count", 0) if status == 200 else 0
+        succeeded = (data or {}).get("succeeded_count", 0) if status == 200 else 0
+        items.append((status, tested, succeeded))
+    status, tested, succeeded = items[-1]
+    passed_runs = sum(1 for cell_status, tested_count, succeeded_count in items
+                      if cell_status == 200 and tested_count > 0 and succeeded_count == tested_count)
     return {
         "path": "broker_direct", "contract": contract, "model": model, "http_status": status,
         "state": "succeeded" if passed_runs == runs else "failed",
-        "error_type": item.get("error_type"), "ttfb_ms": item.get("ttfb_ms"), "ttft_ms": item.get("ttft_ms"),
+        "tested_count": tested, "succeeded_count": succeeded,
         "runs": runs, "passed_runs": passed_runs,
         "elapsed_ms": round((time.monotonic() - started) * 1000, 2),
     }
@@ -129,7 +127,7 @@ def main() -> int:
     cpa_key = os.getenv("CPA_INFERENCE_KEY", "")
     # Include the smart fallback tier in the release gate.  A flaky expert
     # model must not hide a healthy smart target from the any-provider gate.
-    models = args.models or ["gpt-5.6-luna", "gpt-5.6-terra", "claude-sonnet-5", "gpt-5.6-sol"]
+    models = args.models or ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol"]
     outcomes = []
     for model in models:
         for contract in (("structured",) if args.structured_only else ("plain", "structured")):

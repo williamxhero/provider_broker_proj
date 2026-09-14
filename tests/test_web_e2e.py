@@ -64,11 +64,12 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
                 ]}
             if path.startswith("/admin/v1/stages"):
                 return {"items": [{
-                    "stage": "standard", "model": "gpt-5.6-luna", "family": "openai",
-                    "provider_types": ["openai"], "callable_key_count": 1, "latest_test": None,
+                    "stage": "standard", "fingerprint": "fp-a", "note": "safe note",
+                    "model": "gpt-5.6-luna", "family": "OpenAI GPT-5.6", "provider_type": "openai",
+                    "normalized_hostname": "alpha.invalid", "api_key_mask": "abc***xyz",
+                    "status": "enabled", "max_parallel": 3, "callable": True, "latest_test": None,
                     "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
                     "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
-                    "price_bands": {"low": {"output_prices_cny": [2]}, "high": {"output_prices_cny": [8]}},
                 }], "window": "24h"}
             if path.startswith("/admin/v1/routing"):
                 return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
@@ -101,10 +102,10 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
         assert page.locator("#providers").get_by_text("abc***xyz", exact=True).count() == 1
         assert page.locator("#providers").get_by_text("def***uvw", exact=True).count() == 1
         model_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#model-view thead th").all_inner_texts()]
-        assert model_headers == ["Stage", "低价输出 / 1M CNY", "高价输出 / 1M CNY", "Provider types", "可调用 Key", "最近测试", "技术成功率", "平均首字延迟", "24h Token", "24h 费用", "操作"]
-        assert page.locator("#model-view tbody tr").get_by_role("button", name="测试").count() == 1
-        assert page.locator("#model-view").get_by_text("2", exact=True).count() == 1
-        assert page.locator("#model-view").get_by_text("8", exact=True).count() == 1
+        assert model_headers == ["Stage", "备注", "模型", "Provider", "API Key", "状态", "单 Key 并发上限", "可调用", "最近测试", "技术成功率", "平均首字延迟", "24h Token", "24h 费用", "操作"]
+        assert page.locator("#model-view tbody tr").get_by_role("button", name="测试 Stage").count() == 1
+        assert page.locator("#model-view").get_by_text("gpt-5.6-luna", exact=True).count() == 1
+        assert page.locator("#model-view").get_by_text("safe note", exact=True).count() == 1
         assert page.locator("#probe-stage, #probe-race, #probe-all, #probe-results").count() == 0
         assert page.locator("#model-directory").count() == 0
         assert page.locator("main > section:has(#analytics-title)").count() == 1

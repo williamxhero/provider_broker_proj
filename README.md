@@ -67,6 +67,8 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 ### 管理接口
 
+管理台 Stage 视图固定展示三条主模型映射：`standard → gpt-5.6-luna`、`smart → gpt-5.6-terra`、`expert → gpt-5.6-sol`。每个 Stage 下按备注对应的 Provider + API Key 展开独立行，域名只在 API Key 视图合并展示；运行时发现的其他模型不进入 Stage 主表。
+
 查看某个 Stage 的最新健康证据：
 
 ```bash

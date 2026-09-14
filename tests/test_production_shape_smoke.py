@@ -15,10 +15,10 @@ def test_structured_canary_uses_stage_contract_for_three_successful_runs(monkeyp
 
     def fake_request(url, *, payload=None, headers=None, timeout=70):
         if url.endswith("/stages?window=24h"):
-            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable_key_count": 1}]}
+            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable": True}]}
         assert url.endswith("/stages/test")
         calls.append(payload)
-        return 200, {"stage": "standard", "model": "gpt-5.6-luna", "items": [{"state": "succeeded"}]}
+        return 200, {"stage": "standard", "tested_count": 1, "succeeded_count": 1}
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)
     result = broker_cell("http://broker", "gpt-5.6-luna", "structured", runs=3)
@@ -26,13 +26,13 @@ def test_structured_canary_uses_stage_contract_for_three_successful_runs(monkeyp
     assert result["state"] == "succeeded"
     assert result["runs"] == result["passed_runs"] == 3
     assert len(calls) == 3
-    assert calls == [{"stage": "standard", "model": "gpt-5.6-luna"}] * 3
+    assert calls == [{"stage": "standard"}] * 3
 
 
 def test_structured_canary_fails_when_no_enabled_target_exists(monkeypatch):
     def fake_request(url, *, payload=None, headers=None, timeout=70):
         if url.endswith("/stages?window=24h"):
-            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable_key_count": 0}]}
+            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable": False}]}
         raise AssertionError("probe must not run without a target")
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)

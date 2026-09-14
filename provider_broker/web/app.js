@@ -278,27 +278,50 @@ function stageOrder(value) {
   return ({ standard: 0, smart: 1, expert: 2 })[value] ?? 99;
 }
 
-function formatPriceBand(band) {
-  if (!band || typeof band !== "object") return "n/a";
-  const prices = Array.isArray(band.output_prices_cny) ? band.output_prices_cny :
-    band.output_price_cny === null || band.output_price_cny === undefined ? [] : [band.output_price_cny];
-  return prices.length ? prices.map(formatPrice).join(" · ") : "n/a";
-}
-
 function renderModelView(payload = { items: state.stages }) {
   state.stages = payload.items || [];
   const table = byId("model-view");
-  const columns = [{ key: "stage", label: "Stage" }, { key: "low_price", label: "低价输出 / 1M CNY" }, { key: "high_price", label: "高价输出 / 1M CNY" }, { key: "provider_types", label: "Provider types" }, { key: "callable_key_count", label: "可调用 Key" }, { key: "latest_test", label: "最近测试" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_first_token_latency_ms", label: "平均首字延迟" }, { key: "total_tokens", label: `${state.qualityWindow} Token` }, { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "操作" }];
+  const columns = [
+    { key: "stage", label: "Stage" }, { key: "note", label: "备注" }, { key: "model", label: "模型" },
+    { key: "provider_type", label: "Provider" }, { key: "api_key_mask", label: "API Key" },
+    { key: "status", label: "状态" }, { key: "max_parallel", label: "单 Key 并发上限" },
+    { key: "callable", label: "可调用" }, { key: "latest_test", label: "最近测试" },
+    { key: "technical_success_rate", label: "技术成功率" },
+    { key: "avg_first_token_latency_ms", label: "平均首字延迟" },
+    { key: "total_tokens", label: `${state.qualityWindow} Token` },
+    { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "操作" },
+  ];
   const body = tableHead(table, columns, "modelView", () => renderModelView({ items: state.stages }));
-  sortItems(state.stages, "modelView", (item, key) => key === "provider_types" ? (item.provider_types || []).join(" ") : key === "latest_test" ? item.latest_test?.at : key === "low_price" ? item.price_bands?.low?.output_price_cny : key === "high_price" ? item.price_bands?.high?.output_price_cny : item[key]).forEach((item) => {
+  const grouped = new Map();
+  state.stages.forEach((item) => {
+    if (!grouped.has(item.stage)) grouped.set(item.stage, []);
+    grouped.get(item.stage).push(item);
+  });
+  const valueFor = (item, key) => key === "latest_test" ? item.latest_test?.at : item[key];
+  [...grouped.keys()].sort((left, right) => stageOrder(left) - stageOrder(right)).forEach((stage) => {
+    const items = sortItems(grouped.get(stage), "modelView", valueFor);
+    items.forEach((item, index) => {
     const row = document.createElement("tr");
+    if (index === 0) {
+      const stageCell = cell(item.stage);
+      stageCell.rowSpan = items.length;
+      row.append(stageCell);
+    }
     const latest = item.latest_test ? `${displayStatus(item.latest_test.status)} · ${formatShanghaiTime(item.latest_test.at)}` : "n/a";
-    const providers = (item.provider_types || []).map(empty).join(", ") || "n/a";
-    [item.stage, formatPriceBand(item.price_bands?.low), formatPriceBand(item.price_bands?.high), providers, item.callable_key_count, latest, formatPercent(item.technical_success_rate), formatMs(item.avg_first_token_latency_ms), formatTokens(item.total_tokens), formatFeeBuckets(item.fee_buckets)].forEach((value) => row.append(cell(value)));
+    const status = document.createElement("span");
+    status.className = `status ${item.status === "enabled" ? "on" : "off"}`;
+    status.textContent = item.status === "enabled" ? "启用" : item.status === "disabled" ? "停用" : "不可用";
+    const callable = item.callable ? "是" : "否";
+    row.append(cell(item.note), cell(item.model), cell(item.provider_type), cell(item.api_key_mask), (() => { const td = document.createElement("td"); td.append(status); return td; })(), cell(item.max_parallel), cell(callable), cell(latest), cell(formatPercent(item.technical_success_rate)), cell(formatMs(item.avg_first_token_latency_ms)), cell(formatTokens(item.total_tokens)), cell(formatFeeBuckets(item.fee_buckets)));
     const action = document.createElement("td");
-    const test = document.createElement("button"); test.type = "button"; test.className = "text-button"; test.textContent = "测试";
-    test.addEventListener("click", () => testStage(item, test));
-    action.append(test); row.append(action); body.append(row);
+    if (index === 0) {
+      const test = document.createElement("button"); test.type = "button"; test.className = "text-button"; test.textContent = "测试 Stage";
+      test.addEventListener("click", () => testStage(item, test));
+      action.rowSpan = items.length;
+      action.append(test);
+    }
+    row.append(action); body.append(row);
+    });
   });
 }
 
