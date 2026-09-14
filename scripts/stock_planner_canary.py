@@ -64,6 +64,15 @@ def _safe_attempts(items):
     ]
 
 
+def _runtime_source(home: Path) -> Path:
+    """Find the installed companion runtime without assuming its package layout."""
+    candidates = (home / "app" / "runtime", home / "runtime")
+    for candidate in candidates:
+        if (candidate / "ai_trading_companion").is_dir():
+            return candidate
+    raise RuntimeError("needs_repair: installed companion runtime package was not found")
+
+
 def _requirement_rows(packet: dict) -> list[dict]:
     """Accept both legacy m0_research and current chat_research packet contracts."""
     legacy = (packet.get("evidence_contract") or {}).get("requirements") or []
@@ -83,10 +92,13 @@ def main() -> int:
     parser.add_argument("--verification-read-repair")
     parser.add_argument("--discovery-url", action="append", default=[])
     args = parser.parse_args()
-    runtime_source = args.home / "app" / "runtime"
+    runtime_source = _runtime_source(args.home)
     sys.path.insert(0, str(runtime_source))
-    from ai_trading_companion.broker_client import BrokerError, ProviderBrokerClient
-    import ai_trading_companion.local_research as local_research
+    try:
+        from ai_trading_companion.broker_client import BrokerError, ProviderBrokerClient
+        import ai_trading_companion.local_research as local_research
+    except (ImportError, ModuleNotFoundError) as exc:
+        raise RuntimeError(f"needs_repair: companion planner runtime contract unavailable: {exc}") from exc
     BrokerResearchPlanner = local_research.BrokerResearchPlanner
 
     database = args.home / "data" / "trading-companion.sqlite3"
@@ -135,4 +147,8 @@ def main() -> int:
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    try:
+        raise SystemExit(main())
+    except RuntimeError as exc:
+        print(json.dumps({"status": "needs_repair", "reason": str(exc)}, ensure_ascii=False), flush=True)
+        raise SystemExit(2)
