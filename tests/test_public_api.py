@@ -266,7 +266,7 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     assert result_body['ttft_ms'] >= 0
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
-    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] is not None
+    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] is None
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
     streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
@@ -851,7 +851,7 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     assert item['provider']['inventory_models'] == []
     assert item['model'] == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
     assert item['base_price'] == {'input': 1, 'cache': .2, 'output': 4, 'currency': 'USD'}
-    assert item['final_price'] == {'input': 1.25, 'cache': .25, 'output': 5, 'blended': 4.09, 'currency': 'USD', 'multiplier': 1.25}
+    assert item['final_price'] == {'input': 1.0, 'cache': .2, 'output': 4.0, 'blended': 3.272, 'currency': 'USD', 'multiplier': 1.0}
     assert item['source'] == {
         'name': 'Public price table', 'kind': 'direct', 'type': 'direct', 'url': 'https://prices.example/api-direct',
         'evidence': 'published pricing table', 'verified_at': '2026-09-12T00:00:00Z',
@@ -912,7 +912,7 @@ async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without
     relay_view = await client.get('/admin/v1/pricing?provider=api-relay&model=gpt-5.6-luna', headers=headers)
     relay_item = (await relay_view.json())['items'][0]
     assert relay_item['base_price'] == {'input': .2, 'cache': .02, 'output': 1.2, 'currency': 'USD'}
-    assert relay_item['final_price']['input'] == .22 and relay_item['status'] == 'priced'
+    assert relay_item['final_price'] is None and relay_item['status'] == 'unpriced'
 
     conflict = await client.post('/admin/v1/pricing/bindings', headers=headers, json={
         'relay_provider_id': relay_id, 'relay_model_id': model,

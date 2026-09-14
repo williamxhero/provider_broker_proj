@@ -219,6 +219,19 @@ async def quality(request):
     return web.json_response(request.app["store"].quality(window))
 
 
+async def accounting(request):
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    stage = request.query.get("stage")
+    if stage is not None and stage not in ("standard", "smart", "expert"):
+        return web.json_response({"error": "invalid stage"}, status=400)
+    return web.json_response(request.app["store"].accounting(
+        window=window, fingerprint=request.query.get("fingerprint"), stage=stage,
+        model=request.query.get("model"),
+    ))
+
+
 async def data_health(request):
     return web.json_response(request.app["store"].data_health())
 
@@ -730,6 +743,82 @@ async def deactivate_pricing_binding_api(request):
     return web.Response(status=204)
 
 
+def _key_mapping_payload(row):
+    return {
+        'id': row['id'], 'fingerprint': row['fingerprint'], 'model_id': row['model_id'],
+        'target_provider_id': row['target_provider_id'], 'target_provider_key': row.get('target_provider_key'),
+        'target_model_id': row['target_model_id'], 'multiplier': row['multiplier'],
+        'enabled': bool(row['enabled']), 'created_at': row['created_at'], 'updated_at': row['updated_at'],
+    }
+
+
+def _valid_key_mapping_body(body, *, create=False):
+    required = {'fingerprint', 'model_id', 'target_provider_id', 'target_model_id', 'multiplier'} if create else set()
+    allowed = {'fingerprint', 'model_id', 'target_provider_id', 'target_model_id', 'multiplier', 'enabled'}
+    numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value > 0
+    return (
+        isinstance(body, dict) and required <= set(body) and set(body) <= allowed
+        and (not create or isinstance(body['fingerprint'], str) and 1 <= len(body['fingerprint']) <= 256)
+        and ('model_id' not in body or isinstance(body['model_id'], str))
+        and ('target_model_id' not in body or isinstance(body['target_model_id'], str))
+        and ('target_provider_id' not in body or type(body['target_provider_id']) is int)
+        and ('multiplier' not in body or numeric(body['multiplier']))
+        and ('enabled' not in body or type(body['enabled']) is bool)
+    )
+
+
+async def key_model_mappings_api(request):
+    store = request.app['store']
+    if request.method == 'GET':
+        enabled = None if request.query.get('include_inactive') == 'true' else True
+        return web.json_response({'items': [
+            _key_mapping_payload(row) for row in store.key_model_mappings(
+                fingerprint=request.query.get('fingerprint'), model=request.query.get('model'), enabled=enabled,
+            )
+        ]})
+    body = await request.json()
+    if not _valid_key_mapping_body(body, create=True):
+        return web.json_response({'error': 'invalid key-model mapping'}, status=400)
+    body = body | {'model_id': canonicalize(body['model_id']), 'target_model_id': canonicalize(body['target_model_id'])}
+    try:
+        mapping_id = store.upsert_key_model_mapping(**body)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        return web.json_response({'error': str(exc)}, status=409)
+    row = next(item for item in store.key_model_mappings(enabled=None) if item['id'] == mapping_id)
+    return web.json_response(_key_mapping_payload(row), status=201)
+
+
+async def update_key_model_mapping_api(request):
+    try:
+        mapping_id = int(request.match_info['mapping_id'])
+    except (TypeError, ValueError):
+        return web.json_response({'error': 'invalid mapping id'}, status=400)
+    body = await request.json()
+    if not _valid_key_mapping_body(body):
+        return web.json_response({'error': 'invalid key-model mapping'}, status=400)
+    if 'target_model_id' in body:
+        body['target_model_id'] = canonicalize(body['target_model_id'])
+    try:
+        updated = request.app['store'].update_key_model_mapping(mapping_id, **body)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        return web.json_response({'error': str(exc)}, status=409)
+    if not updated:
+        return web.json_response({'error': 'key-model mapping not found'}, status=404)
+    row = next(item for item in request.app['store'].key_model_mappings(enabled=None) if item['id'] == mapping_id)
+    return web.json_response(_key_mapping_payload(row))
+
+
+async def deactivate_key_model_mapping_api(request):
+    try:
+        mapping_id = int(request.match_info['mapping_id'])
+    except (TypeError, ValueError):
+        return web.json_response({'error': 'invalid mapping id'}, status=400)
+    row = next((item for item in request.app['store'].key_model_mappings(enabled=None) if item['id'] == mapping_id), None)
+    if row is None or not request.app['store'].update_key_model_mapping(mapping_id, enabled=False):
+        return web.json_response({'error': 'key-model mapping not found'}, status=404)
+    return web.Response(status=204)
+
+
 async def routing(request):
     store = request.app['store']
     if request.method == 'GET':
@@ -1025,7 +1114,7 @@ def create_app(settings: Settings, *, clock=None):
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync), web.post("/admin/v1/providers/register", register_providers),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.get("/admin/v1/models", pricing_models), web.post("/admin/v1/models", create_pricing_model),
         web.put("/admin/v1/models/{model}", update_pricing_model), web.patch("/admin/v1/models/{model}", update_pricing_model), web.delete("/admin/v1/models/{model}", deactivate_pricing_model),
         web.get("/admin/v1/pricing/providers", pricing_provider_api), web.post("/admin/v1/pricing/providers", pricing_provider_api),
@@ -1033,6 +1122,8 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/admin/v1/pricing", pricing_api), web.post("/admin/v1/pricing", pricing_api),
         web.put("/admin/v1/pricing/bindings/{binding_id}", update_pricing_binding_api), web.patch("/admin/v1/pricing/bindings/{binding_id}", update_pricing_binding_api), web.delete("/admin/v1/pricing/bindings/{binding_id}", deactivate_pricing_binding_api),
         web.get("/admin/v1/pricing/bindings", pricing_bindings_api), web.post("/admin/v1/pricing/bindings", pricing_bindings_api),
+        web.get("/admin/v1/pricing/mappings", key_model_mappings_api), web.post("/admin/v1/pricing/mappings", key_model_mappings_api),
+        web.put("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.patch("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.delete("/admin/v1/pricing/mappings/{mapping_id}", deactivate_key_model_mapping_api),
         web.put("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.patch("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.delete("/admin/v1/pricing/{provider_id}/{model_id}", deactivate_pricing_api),
         web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
         web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),

@@ -119,11 +119,12 @@ def test_legacy_migration_is_idempotent_lossless_and_does_not_reprice_observatio
 
     assert first["migrated"] is True
     assert second["migrated"] is False
-    assert len(prices) == 2
-    assert any(row["source_kind"] == "official" and row["input_price"] == 3.0 for row in prices)
-    assert any(row["source_kind"] == "legacy-migration" and row["unpriced"] is True for row in prices)
+    assert len(prices) == 1
+    assert prices[0]["source_kind"] == "official" and prices[0]["unpriced"] is True
     assert db.conn.execute("SELECT cost FROM observation").fetchone()[0] == 123.45
     assert db.conn.execute("SELECT multiplier FROM pricing_provider WHERE provider_type='relay'").fetchone()[0] == 1.0
+    mapping = db.key_model_mappings(fingerprint="legacy-fp", model="legacy-model")[0]
+    assert mapping["target_provider_type"] == "official" and mapping["multiplier"] == 1.7
     assert db.conn.execute("SELECT pricing_provider_id FROM source_provider WHERE fingerprint='legacy-fp'").fetchone()[0]
     assert db.conn.execute("SELECT count(*) FROM pricing_migration").fetchone()[0] == 1
 
@@ -134,6 +135,13 @@ def test_legacy_migration_rolls_back_every_domain_write_on_partial_failure(tmp_p
         "INSERT INTO model_catalog(model,family,intellect,input_price,cache_price,output_price,currency) VALUES(?,?,?,?,?,?,?)",
         ("boom", "Failure", "standard", 1.0, 0.1, 2.0, "USD"),
     )
+    db.conn.execute(
+        "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        ("boom-key", "Boom", "https://boom.example/v1", db._encrypt("secret"), "openai",
+         json.dumps(["boom"]), json.dumps({"provider_type": "direct"}), "2026-09-14T00:00:00Z"),
+    )
+    db.conn.execute("INSERT INTO policy(fingerprint) VALUES(?)", ("boom-key",))
     db.conn.execute(
         "CREATE TRIGGER fail_pricing_migration BEFORE INSERT ON canonical_model "
         "WHEN NEW.id='boom' BEGIN SELECT RAISE(ABORT, 'forced failure'); END"
@@ -146,5 +154,5 @@ def test_legacy_migration_rolls_back_every_domain_write_on_partial_failure(tmp_p
 
     assert db.conn.execute("SELECT count(*) FROM provider_model_price").fetchone()[0] == before_prices
     assert db.conn.execute("SELECT 1 FROM canonical_model WHERE id='boom'").fetchone() is None
-    status = db.conn.execute("SELECT status,error FROM pricing_migration WHERE version=1").fetchone()
+    status = db.conn.execute("SELECT status,error FROM pricing_migration WHERE version=2").fetchone()
     assert status["status"] == "failed" and "forced failure" in status["error"]

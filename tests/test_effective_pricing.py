@@ -1,3 +1,4 @@
+import json
 from pathlib import Path
 from types import SimpleNamespace
 
@@ -9,7 +10,7 @@ def store(tmp_path: Path) -> Store:
     return Store(tmp_path / "effective-pricing.sqlite", b"0" * 32)
 
 
-def test_effective_direct_price_is_provider_specific_and_applies_provider_multiplier(tmp_path):
+def test_effective_key_price_is_mapping_specific_and_applies_mapping_multiplier(tmp_path):
     db = store(tmp_path)
     provider_id = db.create_pricing_provider("direct-a", provider_type="direct", multiplier=1.5)
     db.create_canonical_model("model-a", stage="smart", family="A")
@@ -17,10 +18,21 @@ def test_effective_direct_price_is_provider_specific_and_applies_provider_multip
         provider_id=provider_id, model_id="model-a", source_kind="direct",
         input_price=1.0, cache_price=0.2, output_price=4.0, currency="USD",
     )
+    db.conn.execute(
+        "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        ("direct-key", "Direct", "https://direct.example/v1", db._encrypt("secret"), "openai",
+         json.dumps(["model-a"]), json.dumps({"provider_type": "direct"}), "2026-09-14T00:00:00Z"),
+    )
+    db.conn.execute("INSERT INTO policy(fingerprint) VALUES(?)", ("direct-key",))
+    db.create_key_model_mapping("direct-key", "model-a", target_provider_id=provider_id, multiplier=1.5)
 
-    resolved = db.effective_pricing(provider_id, "MODEL-A")
+    resolved = db.effective_key_pricing("direct-key", "MODEL-A")
 
-    assert resolved == {
+    assert {key: resolved[key] for key in (
+        "model", "stage", "currency", "input_price", "cache_price", "output_price",
+        "blended_price", "multiplier", "source", "priced", "reason",
+    )} == {
         "model": "model-a", "stage": "smart", "currency": "USD",
         "input_price": 1.5, "cache_price": 0.3, "output_price": 6.0,
         "blended_price": 4.908, "multiplier": 1.5,
@@ -28,7 +40,7 @@ def test_effective_direct_price_is_provider_specific_and_applies_provider_multip
     }
 
 
-def test_effective_relay_price_uses_bound_benchmark_and_unknown_is_not_free(tmp_path):
+def test_effective_relay_key_price_uses_mapping_and_binding_is_not_required(tmp_path):
     db = store(tmp_path)
     relay_id = db.create_pricing_provider("relay-a", provider_type="relay", multiplier=1.25)
     benchmark_id = db.create_pricing_provider("direct-a", provider_type="direct")
@@ -39,11 +51,22 @@ def test_effective_relay_price_uses_bound_benchmark_and_unknown_is_not_free(tmp_
         input_price=2.0, cache_price=0.5, output_price=8.0, currency="CNY",
     )
     db.bind_relay_price(relay_id, "relay-model", benchmark_id, "benchmark-model")
+    db.conn.execute(
+        "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
+        "VALUES(?,?,?,?,?,?,?,?)",
+        ("relay-key", "Relay", "https://relay.example/v1", db._encrypt("secret"), "relay",
+         json.dumps(["relay-model"]), json.dumps({"provider_type": "relay"}), "2026-09-14T00:00:00Z"),
+    )
+    db.conn.execute("INSERT INTO policy(fingerprint,multiplier) VALUES(?,?)", ("relay-key", 1.25))
+    db.create_key_model_mapping(
+        "relay-key", "relay-model", target_provider_id=benchmark_id,
+        target_model_id="benchmark-model", multiplier=1.25,
+    )
 
-    resolved = db.effective_pricing(relay_id, "relay-model")
-    missing = db.effective_pricing(relay_id, "missing-model")
+    resolved = db.effective_key_pricing("relay-key", "relay-model")
+    missing = db.effective_key_pricing("relay-key", "missing-model")
 
-    assert (resolved["currency"], resolved["source"], resolved["multiplier"]) == ("CNY", "relay", 1.25)
+    assert (resolved["currency"], resolved["source"], resolved["multiplier"]) == ("CNY", "direct", 1.25)
     assert (resolved["input_price"], resolved["cache_price"], resolved["output_price"]) == (2.5, 0.625, 10.0)
     assert resolved["priced"] is True
     assert missing["priced"] is False and missing["blended_price"] is None and missing["reason"]
@@ -105,6 +128,9 @@ def test_store_provider_candidates_use_effective_key_price_instead_of_global_cat
         input_price=1.0, cache_price=0.1, output_price=3.0, currency="EUR",
     )
     db.conn.execute("UPDATE source_provider SET pricing_provider_id=?", (provider_id,))
+    db.upsert_key_model_mapping(
+        row["fingerprint"], "gpt-5.6-terra", target_provider_id=provider_id, multiplier=1.4,
+    )
     db.conn.execute("UPDATE policy SET calibrated=1 WHERE fingerprint=?", (row["fingerprint"],))
     db.conn.commit()
 
