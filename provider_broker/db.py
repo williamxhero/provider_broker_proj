@@ -13,9 +13,11 @@ from urllib.parse import urlsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .catalog import (
+    ALLOWED_PROVIDER_TYPES,
     OFFICIAL_PRICE_SNAPSHOT,
     OFFICIAL_PROVIDER_SNAPSHOTS,
     blended_price,
+    canonical_provider_type,
     canonicalize,
     normalize_hostname,
     provider_pricing,
@@ -137,7 +139,7 @@ class Store:
           id INTEGER PRIMARY KEY,
           provider_key TEXT NOT NULL UNIQUE,
           name TEXT NOT NULL,
-          provider_type TEXT NOT NULL CHECK(provider_type IN ('official','direct','relay','legacy-migration')),
+          provider_type TEXT NOT NULL CHECK(provider_type IN ('official','direct','relay','openai','anthropic','deepseek','qwen','doubao','deepinfra','legacy-migration')),
           multiplier REAL NOT NULL DEFAULT 1.0 CHECK(multiplier > 0),
           active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
         );
@@ -151,7 +153,7 @@ class Store:
           id INTEGER PRIMARY KEY,
           provider_id INTEGER NOT NULL REFERENCES pricing_provider(id),
           model_id TEXT NOT NULL REFERENCES canonical_model(id),
-          source_kind TEXT NOT NULL CHECK(source_kind IN ('official','direct','relay','legacy-migration')),
+          source_kind TEXT NOT NULL CHECK(source_kind IN ('official','direct','relay','openai','anthropic','deepseek','qwen','doubao','deepinfra','legacy-migration')),
           input_price REAL NOT NULL DEFAULT 0 CHECK(input_price >= 0),
           cache_price REAL NOT NULL DEFAULT 0 CHECK(cache_price >= 0),
           output_price REAL NOT NULL DEFAULT 0 CHECK(output_price >= 0),
@@ -555,7 +557,10 @@ class Store:
 
     def create_pricing_provider(self, provider_key: str, *, provider_type: str,
                                 name: str | None = None, multiplier: float | None = None) -> int:
-        if provider_type not in {'official', 'direct', 'relay'}:
+        # direct/relay/official remain readable for old databases and explicit
+        # migration tooling; CPA-backed runtime providers use the six canonical
+        # identities in ALLOWED_PROVIDER_TYPES.
+        if provider_type not in (set(ALLOWED_PROVIDER_TYPES) | {'official', 'direct', 'relay'}):
             raise ValueError('invalid pricing provider type')
         if not provider_key:
             raise ValueError('pricing provider key is required')
@@ -583,7 +588,7 @@ class Store:
 
     def update_pricing_provider(self, provider_id: int, *, name: str, provider_type: str,
                                 multiplier: float | None = None, active: bool | None = None) -> bool:
-        if provider_type not in {'official', 'direct', 'relay'}:
+        if provider_type not in (set(ALLOWED_PROVIDER_TYPES) | {'official', 'direct', 'relay'}):
             raise ValueError('invalid pricing provider type')
         if not isinstance(name, str) or not name.strip():
             raise ValueError('pricing provider requires name')
@@ -632,24 +637,32 @@ class Store:
             return bool(self.conn.execute("DELETE FROM pricing_provider WHERE id=?", (provider_id,)).rowcount)
 
     def insert_provider_model_price(self, *, provider_id: int, model_id: str,
-                                    source_kind: str, input_price: float,
-                                    cache_price: float, output_price: float,
-                                    currency: str, multiplier: float | None = None,
+                                    source_kind: str = 'direct', input_price: float | None = None,
+                                    cache_price: float | None = None, output_price: float | None = None,
+                                    currency: str = 'CNY', output_price_cny: float | None = None,
+                                    multiplier: float | None = None,
                                     source_name: str | None = None,
                                     source_url: str | None = None,
                                     source_evidence: str | None = None,
                                     verified_at: str | None = None,
                                     legacy: bool = False, unpriced: bool | None = None) -> int:
-        if source_kind not in {'official', 'direct', 'relay'}:
+        if source_kind not in (set(ALLOWED_PROVIDER_TYPES) | {'official', 'direct', 'relay'}):
             raise ValueError('invalid price source kind')
+        if output_price_cny is not None:
+            input_price = cache_price = output_price = output_price_cny
+            currency = 'CNY'
+        if input_price is None or cache_price is None or output_price is None:
+            raise ValueError('Provider+Model output price is required')
         values = (input_price, cache_price, output_price)
         if any(not math.isfinite(value) or value < 0 for value in values):
             raise ValueError('prices must be non-negative')
         if not currency or not isinstance(currency, str):
             raise ValueError('price currency is required')
         provider_row = self.conn.execute(
-            "SELECT active FROM pricing_provider WHERE id=?", (provider_id,)
+            "SELECT active,provider_type FROM pricing_provider WHERE id=?", (provider_id,)
         ).fetchone()
+        if output_price_cny is not None and provider_row and provider_row['provider_type'] in ALLOWED_PROVIDER_TYPES:
+            source_kind = provider_row['provider_type']
         # Only key_model_mapping owns a multiplier. The physical legacy
         # columns are retained solely so old databases can be opened; new
         # writes always store neutral/false values there.
@@ -684,12 +697,23 @@ class Store:
         return int(cursor.lastrowid)
 
     def upsert_provider_model_price(self, **kwargs) -> int:
+        if "output_price_cny" in kwargs:
+            kwargs = dict(kwargs)
+            value = kwargs.pop("output_price_cny")
+            kwargs.setdefault("source_kind", "direct")
+            provider_type = self.conn.execute(
+                "SELECT provider_type FROM pricing_provider WHERE id=?", (kwargs["provider_id"],)
+            ).fetchone()
+            if provider_type and provider_type[0] in ALLOWED_PROVIDER_TYPES:
+                kwargs["source_kind"] = provider_type[0]
+            kwargs["input_price"] = kwargs["cache_price"] = kwargs["output_price"] = value
+            kwargs["currency"] = "CNY"
         existing = self.conn.execute(
             "SELECT id FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
             (kwargs['provider_id'], kwargs['model_id']),
         ).fetchone()
         if existing:
-            if kwargs['source_kind'] not in {'official', 'direct', 'relay'}:
+            if kwargs['source_kind'] not in (set(ALLOWED_PROVIDER_TYPES) | {'official', 'direct', 'relay'}):
                 raise ValueError('invalid price source kind')
             prices = [kwargs['input_price'], kwargs['cache_price'], kwargs['output_price']]
             if any(not math.isfinite(price) or price < 0 for price in prices):
@@ -758,7 +782,10 @@ class Store:
                FROM provider_model_price p JOIN pricing_provider pp ON pp.id=p.provider_id""" + clause +
             " ORDER BY p.id", params
         ).fetchall()
-        return [dict(row) | {'active': bool(row['active']), 'unpriced': bool(row['unpriced'])}
+        return [dict(row) | {
+                    'active': bool(row['active']), 'unpriced': bool(row['unpriced']),
+                    'output_price_cny': row['output_price'],
+                }
                 for row in rows]
 
     def _validate_key_model_mapping_target(self, fingerprint: str, model_id: str,
@@ -955,7 +982,14 @@ class Store:
             model_map = {key: value for key, value in model_map.items() if key == model_id}
         raw_prices = self.provider_model_prices(active=None if include_inactive else True)
         by_key = {(row['provider_id'], row['model_id']): row for row in raw_prices if row['provider_id'] in provider_ids and row['model_id'] in model_map}
-        candidates = set(by_key)
+        # Synced Provider+Model combinations are defined by current CPA
+        # inventory. Historical/static seed rows remain in storage for upgrade
+        # inspection but must not manufacture combinations in the live view.
+        candidates = {
+            key for key, row in by_key.items()
+            if not row['provider_key'].startswith(('key-source:', 'official-'))
+            and row['provider_key'] != 'official-seed'
+        }
         for row in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
             if row['pricing_provider_id'] not in provider_ids:
                 continue
@@ -1026,7 +1060,7 @@ class Store:
                 "SELECT * FROM pricing_provider WHERE provider_key=? AND provider_type <> 'legacy-migration'", (provider,)
             ).fetchone()
 
-        base = {"model": model_id, "stage": None, "currency": None,
+        base = {"model": model_id, "stage": None, "currency": "CNY", "output_price_cny": None,
                 "input_price": None, "cache_price": None, "output_price": None,
                 "blended_price": None, "source": None,
                 "priced": False, "reason": None}
@@ -1057,14 +1091,25 @@ class Store:
             base["reason"] = "provider model price is explicitly unpriced"
             return base
 
-        # Price rows contain only the fixed Provider+Model rate. The only
-        # multiplier is applied later, when a concrete API-key mapping is known.
-        components = [round(float(price[key]), 10)
-                      for key in ("input_price", "cache_price", "output_price")]
+        # CPA-backed rows use the single CNY output rate. Legacy direct/relay
+        # rows remain readable for old database upgrades, but are never
+        # created by the new sync path.
+        output_price = round(float(price["output_price"]), 10)
+        unified = price["source_kind"] in ALLOWED_PROVIDER_TYPES or (
+            price["currency"] == "CNY"
+            and float(price["input_price"]) == float(price["cache_price"]) == float(price["output_price"])
+        )
+        components = [output_price, output_price, output_price] if unified else [
+            round(float(price["input_price"]), 10),
+            round(float(price["cache_price"]), 10),
+            output_price,
+        ]
         base.update({
-            "currency": price["currency"], "input_price": components[0],
+            "currency": "CNY" if unified else price["currency"],
+            "output_price_cny": output_price if unified else None,
+            "input_price": components[0],
             "cache_price": components[1], "output_price": components[2],
-            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
+            "blended_price": output_price if unified else round(components[0] * .04 + components[1] * .16 + components[2] * .80, 10),
             "source": price["source_kind"], "priced": True,
         })
         return base
@@ -1083,7 +1128,7 @@ class Store:
                 "SELECT stage FROM canonical_model WHERE id=? AND active=1", (model_id,)
             ).fetchone()
             return {
-                "model": model_id, "stage": model_row["stage"] if model_row else None, "currency": None,
+                "model": model_id, "stage": model_row["stage"] if model_row else None, "currency": "CNY", "output_price_cny": None,
                 "input_price": None, "cache_price": None, "output_price": None,
                 "blended_price": None, "multiplier": None, "source": None,
                 "priced": False, "reason": "key-model mapping is missing or disabled",
@@ -1093,12 +1138,18 @@ class Store:
             return resolved | {"model": model_id, "mapping_id": mapping["id"], "mapping_multiplier": mapping["multiplier"],
                                "reason": resolved["reason"] or "mapped Provider+Model price is unpriced"}
         multiplier = float(mapping["multiplier"])
-        components = [round(float(resolved[key]) * multiplier, 10)
-                      for key in ("input_price", "cache_price", "output_price")]
+        output_price = round(float(resolved["output_price"]) * multiplier, 10)
+        unified = resolved.get("output_price_cny") is not None
+        components = [output_price, output_price, output_price] if unified else [
+            round(float(resolved["input_price"]) * multiplier, 10),
+            round(float(resolved["cache_price"]) * multiplier, 10),
+            output_price,
+        ]
         return resolved | {
             "model": model_id,
+            "output_price_cny": output_price if unified else None,
             "input_price": components[0], "cache_price": components[1], "output_price": components[2],
-            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
+            "blended_price": output_price if unified else round(components[0] * .04 + components[1] * .16 + components[2] * .80, 10),
             "multiplier": multiplier, "mapping_id": mapping["id"],
             "mapping_multiplier": multiplier, "mapped_provider_id": mapping["target_provider_id"],
             "mapped_model": mapping["target_model_id"],
@@ -2064,13 +2115,30 @@ class Store:
     def replace_source_snapshot(self, entries: list[dict], synced_at: str):
         rows = []
         site_notes = []
-        model_directory = self.model_directory()
-        existing_rows = self.conn.execute("SELECT fingerprint,base_url,api_key,models_json FROM source_provider").fetchall()
+        existing_rows = self.conn.execute(
+            "SELECT fingerprint,base_url,api_key,models_json,pricing_provider_id FROM source_provider"
+        ).fetchall()
         existing = {row["fingerprint"]: row for row in existing_rows}
+        existing_pricing = {
+            row["fingerprint"]: row["pricing_provider_id"]
+            for row in existing_rows if row["pricing_provider_id"] is not None
+        }
+        pricing_schema = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pricing_provider'"
+        ).fetchone()[0] or ''
+        supports_canonical_provider_types = "'openai'" in pricing_schema
         existing_policies = {row[0] for row in self.conn.execute("SELECT fingerprint FROM policy")}
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             from .catalog import PUBLIC_MODEL_IDS, canonicalize
+            declared_provider_type = entry.get("provider_type", "openai")
+            provider_type = entry.get("canonical_provider_type") or canonical_provider_type(
+                declared_provider_type, base_url,
+            )
+            if provider_type is None and declared_provider_type in {"direct", "relay"}:
+                provider_type = declared_provider_type
+            if provider_type not in (set(ALLOWED_PROVIDER_TYPES) | {"direct", "relay"}):
+                continue
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             host = (urlsplit(base_url).hostname or "").lower()
             public_provider = False
@@ -2079,7 +2147,10 @@ class Store:
                     source_models = list(dict.fromkeys(source_models + list(public_models)))
                     public_provider = True
                     break
-            models = [model for model in source_models if model in model_directory]
+            dynamic_inventory = "canonical_provider_type" in entry
+            models = [model for model in source_models if model != "unavailable"]
+            if not dynamic_inventory:
+                models = [model for model in models if model in self.model_directory()]
             # Stable fingerprints avoid decrypting credentials during ordinary
             # refreshes.  The fallback only supports one-time adoption of old
             # databases whose fingerprint included the previous model list.
@@ -2099,7 +2170,9 @@ class Store:
                 prior_models = json.loads(prior["models_json"])
                 if prior_models:
                     source_models = prior_models
-                    models = [model for model in source_models if model in model_directory]
+                    models = [model for model in source_models if model != "unavailable"]
+                    if not dynamic_inventory:
+                        models = [model for model in models if model in self.model_directory()]
                     entry = entry | {"inventory_status": "stale"}
                     fp = prior["fingerprint"]
                 else:
@@ -2115,7 +2188,11 @@ class Store:
                 key: str(entry.get("source", {}).get(key))[:160]
                 for key in ("section", "site_name", "provider_type")
                 if isinstance(entry.get("source"), dict) and isinstance(entry["source"].get(key), (str, int, float, bool))
-            } | {"inventory_status": entry.get("inventory_status", "unavailable")}
+            } | {
+                "inventory_status": entry.get("inventory_status", "unavailable"),
+                "canonical_provider_type": provider_type,
+                "transport_provider_type": entry.get("provider_type"),
+            }
             model_aliases = entry.get("model_aliases")
             if isinstance(model_aliases, dict):
                 source["model_aliases"] = {
@@ -2127,7 +2204,7 @@ class Store:
             name = str(entry.get("name") or (models[0] if models else "unavailable"))[:160]
             if api_key in name:
                 name = entry.get("provider_type", "openai")
-            rows.append((fp, name, base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
+            rows.append((fp, name, base_url, self._encrypt(api_key), provider_type, self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
         preserved_mappings = [
             dict(item) for item in self.key_model_mappings()
             if item["fingerprint"] in {row[0] for row in rows}
@@ -2147,47 +2224,74 @@ class Store:
             self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[10],) for r in rows])
             self.conn.executemany(
                 "UPDATE policy SET calibrated=? WHERE fingerprint=?",
-                [(int(any(model in model_directory for model in json.loads(r[7]))), r[0]) for r in rows if r[0] not in existing_policies],
+                [(int(bool(json.loads(r[7])) and json.loads(r[8]).get('inventory_status') != 'unavailable'), r[0])
+                 for r in rows if r[0] not in existing_policies],
             )
             # A site name is a useful first-run label, but never overwrite an
             # operator's policy note during a later CPA refresh.
             self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=? AND note=''", site_notes)
             for row in self.conn.execute("""SELECT s.fingerprint,s.base_url,s.provider_type,s.name,s.models_json
                                                FROM source_provider s JOIN policy p USING(fingerprint)"""):
-                provider_type = 'relay' if row['provider_type'] == 'relay' else 'direct'
+                provider_type = row['provider_type']
+                price_provider_type = provider_type if supports_canonical_provider_types else 'direct'
                 host = normalize_hostname(row['base_url']) or row['base_url'].lower()
-                key = f"key-source:{provider_type}:{host}"
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
-                    (key, row['name'], provider_type, 1.0),
-                )
-                provider_id = self.conn.execute("SELECT id FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()[0]
+                key = f"key-source:{price_provider_type}:{host}"
+                provider_id = existing_pricing.get(row['fingerprint'])
+                if provider_id is not None:
+                    existing_provider = self.conn.execute(
+                        "SELECT provider_type FROM pricing_provider WHERE id=?", (provider_id,)
+                    ).fetchone()
+                    try:
+                        self.conn.execute(
+                            "UPDATE pricing_provider SET provider_key=?,name=?,provider_type=?,active=1 WHERE id=?",
+                            (key, row['name'], price_provider_type, provider_id),
+                        )
+                    except sqlite3.IntegrityError:
+                        # An old SQLite file has a closed CHECK constraint.
+                        # Keep its legacy Provider row and use CNY-equalized
+                        # compatibility columns until a full DB rebuild is
+                        # explicitly requested.
+                        price_provider_type = existing_provider['provider_type'] if existing_provider else 'direct'
+                        key = f"key-source:{price_provider_type}:{host}"
+                if provider_id is None:
+                    self.conn.execute(
+                        "INSERT OR IGNORE INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
+                        (key, row['name'], price_provider_type, 1.0),
+                    )
+                    provider_id = self.conn.execute("SELECT id FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()[0]
                 self.conn.execute("UPDATE source_provider SET pricing_provider_id=? WHERE fingerprint=?", (provider_id, row['fingerprint']))
                 for model_id in json.loads(row['models_json']):
                     model_id = canonicalize(model_id)
-                    if model_id not in model_directory:
+                    if model_id == 'unavailable':
                         continue
+                    if not self.conn.execute("SELECT 1 FROM canonical_model WHERE id=?", (model_id,)).fetchone():
+                        from .catalog import CATALOG
+                        metadata = CATALOG.get(model_id, {})
+                        self.conn.execute(
+                            "INSERT INTO canonical_model(id,stage,family,active) VALUES(?,?,?,1)",
+                            (model_id, metadata.get('intellect', 'standard'),
+                             metadata.get('family', provider_type.title())),
+                        )
                     target_id, target_model = provider_id, model_id
                     mapping_multiplier = 1.0
                     if not self.conn.execute(
                         "SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
                         (provider_id, model_id),
                     ).fetchone():
-                        pricing = provider_pricing(row['base_url'], model_id, {})
-                        has_provider_seed = pricing.get('price_source') == 'official-provider'
-                        values = [pricing.get(key, 0) for key in (
-                            'official_input_price', 'official_cache_price', 'official_output_price')]
-                        self.insert_provider_model_price(
-                            provider_id=provider_id, model_id=model_id,
-                            source_kind=provider_type,
-                            input_price=values[0], cache_price=values[1], output_price=values[2],
-                            currency=pricing.get('currency', 'USD'),
-                            source_name='fixed-provider-snapshot' if has_provider_seed else 'sync-unpriced',
-                            source_url=OFFICIAL_PRICE_SNAPSHOT['source_url'] if has_provider_seed else None,
-                            source_evidence='fixed endpoint-specific snapshot' if has_provider_seed else 'No endpoint-specific price was supplied; intentionally unpriced',
-                            verified_at=OFFICIAL_PRICE_SNAPSHOT['verified_at'] if has_provider_seed else None,
-                            unpriced=not any(value > 0 for value in values),
-                        )
+                        if provider_type in ALLOWED_PROVIDER_TYPES:
+                            self.insert_provider_model_price(
+                                provider_id=provider_id, model_id=model_id,
+                                source_kind=price_provider_type, output_price_cny=20.0,
+                                source_name='cpa-sync-default',
+                                source_evidence='Default CNY output price for a new CPA combination',
+                            )
+                        else:
+                            self.insert_provider_model_price(
+                                provider_id=provider_id, model_id=model_id,
+                                source_kind=provider_type, input_price=0.0,
+                                cache_price=0.0, output_price=0.0, currency='USD',
+                                source_name='sync-unpriced', unpriced=True,
+                            )
                     self.upsert_key_model_mapping(
                         row['fingerprint'], model_id, target_provider_id=target_id,
                         target_model_id=target_model, multiplier=mapping_multiplier, enabled=True,
@@ -2225,6 +2329,7 @@ class Store:
     def _provider_from_row(self, row, model: str, model_directory: dict) -> Provider:
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
         source = json.loads(row['source_json']) if row['source_json'] else {}
+        transport_type = source.get('transport_provider_type') or row['provider_type']
         model_aliases = source.get('model_aliases') or {}
         wire_model = model_aliases.get(model)
         reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
@@ -2232,14 +2337,13 @@ class Store:
         pricing_by_model = {
             candidate: self.effective_key_pricing(row['fingerprint'], candidate)
             for candidate in source_models
-            if candidate in model_directory
         }
         pricing = pricing_by_model.get(model) or self.effective_key_pricing(row['fingerprint'], model)
         pricing_by_model = pricing_by_model | {model: pricing}
         price_group = int(pricing['blended_price'] * 100000) if pricing['priced'] else None
         return Provider(
             row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
-            row['provider_type'], headers, [model], pricing, price_group, int(row['max_parallel']),
+            transport_type, headers, [model], pricing, price_group, int(row['max_parallel']),
             bool(row['enabled']), row['site_id'], wire_model, reverse_aliases,
             pricing_by_model=pricing_by_model, price_currency=pricing['currency'],
             price_comparable=bool(pricing['priced']), price_source=pricing['source'],

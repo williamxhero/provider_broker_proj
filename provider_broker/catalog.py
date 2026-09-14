@@ -1,6 +1,46 @@
 """Default model-directory seed and fixed official pricing evidence."""
 from urllib.parse import urlsplit
 
+
+# Provider identity is an inventory concern, not a pricing-source concern.
+# These are the only vendor families that may cross the CPA -> Broker
+# boundary.  Keep the aliases here so sync and direct Store callers share one
+# canonical vocabulary.
+ALLOWED_PROVIDER_TYPES = frozenset({
+    "openai", "anthropic", "deepseek", "qwen", "doubao", "deepinfra",
+})
+PROVIDER_TYPE_ALIASES = {
+    "openai_chat": "openai", "openai_compatible": "openai",
+    "codex": "openai", "claude": "anthropic", "anthropic_api": "anthropic",
+    "aliyun": "qwen", "bailian": "qwen", "dashscope": "qwen",
+    "ark": "doubao", "volcengine": "doubao", "volc_engine": "doubao",
+    "seed": "doubao", "doubao_seed": "doubao",
+}
+
+
+def canonical_provider_type(value: object, base_url: str | None = None) -> str | None:
+    """Return the six-provider allowlist identity, or ``None`` if unknown."""
+    value = str(value or "").strip().casefold().replace("-", "_").replace(" ", "_")
+    if value in ALLOWED_PROVIDER_TYPES:
+        return value
+    if value in PROVIDER_TYPE_ALIASES:
+        return PROVIDER_TYPE_ALIASES[value]
+    host = urlsplit(str(base_url or "")).hostname or ""
+    host = host.casefold()
+    if host == "api.openai.com" or host.endswith(".openai.com"):
+        return "openai"
+    if host == "api.anthropic.com" or host.endswith(".anthropic.com"):
+        return "anthropic"
+    if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
+        return "deepseek"
+    if host == "api.deepinfra.com" or host.endswith(".deepinfra.com"):
+        return "deepinfra"
+    if host == "dashscope.aliyuncs.com" or host.endswith(".aliyuncs.com"):
+        return "qwen"
+    if host.endswith(".volces.com") or host.endswith(".volcengine.com"):
+        return "doubao"
+    return None
+
 CATALOG = {
     "gpt-5.6-luna": {
         "family": "OpenAI GPT-5.6", "intellect": "standard",

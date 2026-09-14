@@ -10,7 +10,7 @@ from pathlib import Path
 from aiohttp import TCPConnector, web
 
 from .db import Store
-from .catalog import canonicalize
+from .catalog import ALLOWED_PROVIDER_TYPES, canonicalize
 from .settings import Settings
 from .source import register_cpa, sync_cpa, scheduler as source_scheduler
 from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route, structured_schema
@@ -473,54 +473,23 @@ def _valid_model_body(body, *, include_model=False, allow_active=False):
 
 
 async def pricing_models(request):
-    stage = request.query.get('stage')
-    if stage is not None and stage not in ('standard', 'smart', 'expert'):
-        return web.json_response({'error': 'invalid stage'}, status=400)
-    active = None if request.query.get('include_inactive') == 'true' else True
-    # The Model directory is metadata-only. Pricing rows and key mappings have
-    # their own resources and must not be projected into this response.
-    items = request.app['store'].pricing_models(stage=stage, active=active)
-    return web.json_response({'items': [
-        {key: item[key] for key in ('id', 'stage', 'family', 'active')}
-        for item in items
-    ]})
+    del request
+    return web.json_response({'error': 'model directory has been removed'}, status=404)
 
 
 async def create_pricing_model(request):
-    body = await request.json()
-    if not _valid_model_body(body, include_model=True):
-        return web.json_response({'error': 'invalid canonical model'}, status=400)
-    model = canonicalize(body['model'])
-    try:
-        created = request.app['store'].create_canonical_model(model, stage=body['stage'], family=body['family'])
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=400)
-    if not created:
-        return web.json_response({'error': 'model already exists'}, status=409)
-    return web.json_response({'model': model}, status=201)
+    del request
+    return web.json_response({'error': 'model directory has been removed'}, status=404)
 
 
 async def update_pricing_model(request):
-    body = await request.json()
-    if not _valid_model_body(body, allow_active=True):
-        return web.json_response({'error': 'invalid canonical model'}, status=400)
-    model = canonicalize(request.match_info['model'])
-    try:
-        updated = request.app['store'].update_canonical_model(
-            model, stage=body['stage'], family=body['family'], active=body.get('active'),
-        )
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=400)
-    if not updated:
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.json_response({'model': model, 'updated': True})
+    del request
+    return web.json_response({'error': 'model directory has been removed'}, status=404)
 
 
 async def deactivate_pricing_model(request):
-    model = canonicalize(request.match_info['model'])
-    if not request.app['store'].deactivate_canonical_model(model):
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.Response(status=204)
+    del request
+    return web.json_response({'error': 'model directory has been removed'}, status=404)
 
 
 def _pricing_provider_payload(row):
@@ -535,11 +504,12 @@ async def pricing_provider_api(request):
     store = request.app['store']
     if request.method == 'GET':
         active = None if request.query.get('include_inactive') == 'true' else True
-        rows = store.pricing_providers(active=active)
+        rows = [row for row in store.pricing_providers(active=active)
+                if row['provider_type'] in ALLOWED_PROVIDER_TYPES]
         return web.json_response({'items': [_pricing_provider_payload(row) for row in rows]})
     body = await request.json()
     required = {'provider_key', 'name', 'provider_type'}
-    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in ('official', 'direct', 'relay'):
+    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in ('openai', 'anthropic', 'deepseek', 'qwen', 'doubao', 'deepinfra'):
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     try:
         provider_id = store.create_pricing_provider(body['provider_key'], provider_type=body['provider_type'], name=body['name'])
@@ -564,7 +534,7 @@ async def update_pricing_provider_api(request):
     if not isinstance(body, dict) or not body or not set(body) <= {'name', 'provider_type', 'active'}:
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     values = {key: body.get(key, current[key]) for key in ('name', 'provider_type')}
-    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in ('official', 'direct', 'relay'):
+    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in ('openai', 'anthropic', 'deepseek', 'qwen', 'doubao', 'deepinfra'):
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     if 'active' in body and type(body['active']) is not bool:
         return web.json_response({'error': 'active must be boolean'}, status=400)
@@ -644,6 +614,9 @@ async def pricing_api(request):
         return web.json_response({'error': 'invalid provider model price'}, status=400)
     write_body = _price_write_values(body)
     write_body |= {'provider_id': body['provider_id'], 'model_id': canonicalize(body['model_id'])}
+    provider = next((row for row in store.pricing_providers(active=None) if row['id'] == body['provider_id']), None)
+    if provider and provider['provider_type'] in ALLOWED_PROVIDER_TYPES:
+        write_body['source_kind'] = provider['provider_type']
     try:
         price_id = store.insert_provider_model_price(**write_body)
     except ValueError as exc:
@@ -662,6 +635,9 @@ async def update_pricing_api(request):
     except ValueError:
         return web.json_response({'error': 'invalid provider id'}, status=400)
     body = _price_write_values(body) | {'provider_id': provider_id, 'model_id': canonicalize(request.match_info['model_id'])}
+    provider = next((row for row in request.app['store'].pricing_providers(active=None) if row['id'] == provider_id), None)
+    if provider and provider['provider_type'] in ALLOWED_PROVIDER_TYPES:
+        body['source_kind'] = provider['provider_type']
     try:
         price_id = request.app['store'].upsert_provider_model_price(**body)
     except ValueError as exc:
