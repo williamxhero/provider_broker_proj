@@ -291,14 +291,13 @@ async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa)
     seven_day_inventory = (await (await client.get('/admin/v1/providers?window=7d')).json())['providers']
     quality = await (await client.get('/admin/v1/quality?window=1h')).json()
 
-    assert inventory[0]['cost_24h'] == .125
+    assert inventory[0]['fee_buckets']['UNKNOWN']['total_fee'] == .125
     assert inventory[0]['total_tokens'] == 150
-    assert inventory[0]['technical_success_rate'] == 1
-    assert inventory[0]['avg_ttft_ms'] == 100
-    assert seven_day_inventory[0]['cost_24h'] == .625
+    assert seven_day_inventory[0]['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert seven_day_inventory[0]['total_tokens'] == 300
-    assert seven_day_inventory[0]['technical_success_rate'] == .5
-    assert seven_day_inventory[0]['avg_ttft_ms'] == 200
+    stage = next(item for item in (await (await client.get('/admin/v1/stages?window=7d')).json())['items'] if item['model'] == 'gpt-5.6-luna')
+    assert stage['technical_success_rate'] == .5 and stage['avg_first_token_latency_ms'] == 200
+    assert stage['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert quality['total_cost'] == .125
     assert (await client.get('/admin/v1/calls?sort=cost:asc')).status == 200
     assert (await client.get('/admin/v1/calls?sort=unknown:asc')).status == 400
@@ -644,9 +643,9 @@ async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it
     assert result['items'][0]['state'] == 'succeeded' and result['items'][0]['ttft_ms'] is not None
 
     provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    assert provider['last_test_ttft_ms'] == result['items'][0]['ttft_ms']
-    assert provider['last_test_at'] is not None
-    assert provider['last_test_status'] == 'completed'
+    stage = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
+    assert stage['latest_test']['ttft_ms'] == result['items'][0]['ttft_ms']
+    assert stage['latest_test']['status'] == 'succeeded'
 
     store = client.app['store']
     with store.conn:
@@ -658,9 +657,8 @@ async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it
             'completed', '2099-01-01T00:00:00+00:00',
         ))
 
-    refreshed = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    assert refreshed['last_test_ttft_ms'] == 42.5
-    assert refreshed['last_test_at'] == '2099-01-01T00:00:00+00:00'
+    refreshed = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
+    assert refreshed['latest_test']['ttft_ms'] == result['items'][0]['ttft_ms']
 
     store.record_probe(
         fingerprint=provider['fingerprint'], model='gpt-5.6-luna', tier='standard', mode='all',
@@ -668,10 +666,10 @@ async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it
         ttfb_ms=None, ttft_ms=None, duration_ms=10000, error_type='first_token_timeout',
         error='first_token_timeout', now=datetime(2100, 1, 1, tzinfo=UTC),
     )
-    failed_latest = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    assert failed_latest['last_test_ttft_ms'] is None
-    assert failed_latest['last_test_status'] == 'first_token_timeout'
-    assert failed_latest['last_test_at'] == '2100-01-01T00:00:00+00:00'
+    failed_latest = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
+    assert failed_latest['latest_test']['ttft_ms'] is None
+    assert failed_latest['latest_test']['status'] == 'first_token_timeout'
+    assert failed_latest['latest_test']['at'] == '2100-01-01T00:00:00+00:00'
 
 
 async def test_one_click_key_test_probes_every_enabled_model(client, cpa):
@@ -695,7 +693,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('最近同步','从 CPA 手动同步','一键测试','API Key','Stage视角','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','API Key','Stage + canonical Model','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
     assert '中转站余额' not in page
     assert 'CPA 是唯一人工维护源' not in page
@@ -705,7 +703,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert css.status == 200 and css.content_type == 'text/css'
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
-    assert '最后测试' in script
+    assert '最近测试' in script
     for token in ('renderQuality','renderCalls','renderModelView','sortItems','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','可路由 API','技术成功率','平均 TTFT','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200
@@ -816,10 +814,7 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     model = await client.get('/admin/v1/models?stage=smart', headers=headers)
     models = (await model.json())['items']
     api_model = next(item for item in models if item['id'] == 'api-model')
-    assert api_model == {
-        'id': 'api-model', 'stage': 'smart', 'family': 'API Family',
-        'active': True, 'pricing_count': 0, 'inventory_provider_count': 0,
-    }
+    assert api_model == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
     assert not {'input_price', 'cache_price', 'output_price'} & api_model.keys()
 
     provider_response = await client.post('/admin/v1/pricing/providers', headers=headers, json={
@@ -1007,11 +1002,11 @@ async def test_summary_and_provider_stats_use_mixed_observations(client, cpa):
     db=client.app['store'].conn
     with db:
         for success,ttft,status in [(1,100,'completed'),(0,300,'transport_failed')]:
-            db.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status) VALUES(?,?,?,?,?,?,?,?,?)",(provider['fingerprint'],'luna','luna','standard','low',success,ttft,status,status))
+            db.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status) VALUES(?,?,?,?,?,?,?,?,?)",(provider['fingerprint'],'gpt-5.6-luna','gpt-5.6-luna','standard','low',success,ttft,status,status))
     summary=await client.get('/admin/v1/summary?window=24h',headers=headers); data=await summary.json()
     assert data['routable_apis']==1 and data['technical_success_rate']==.5 and data['avg_ttft_ms']==200
-    row=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
-    assert row['technical_success_rate']==.5 and row['avg_ttft_ms']==200
+    row=next(item for item in (await (await client.get('/admin/v1/stages?window=24h',headers=headers)).json())['items'] if item['model']=='gpt-5.6-luna')
+    assert row['technical_success_rate']==.5 and row['avg_first_token_latency_ms']==200
 
 
 async def test_summary_counts_only_actual_routable_provider_keys(client, cpa):
@@ -1033,12 +1028,12 @@ async def test_sync_replaces_source_and_malformed_rolls_back(client, cpa):
     cpa.app['config']={'providers':[{'name':'B','base_url':cpa.app['upstream'],'type':'openai','keys':[{'key':'other-secret','models':['gpt-5.6-luna']}]}]}
     replacement=await client.post('/admin/v1/sync',headers=headers)
     assert (await replacement.json())['offlined'] == 1
-    assert [p['name'] for p in (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers']] == ['B']
+    assert [p['note'] for p in (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers']] == ['B']
     assert (await (await client.get('/admin/v1/calls?limit=10',headers=headers)).json())['items']
     cpa.app['config']=['malformed']
     failed=await client.post('/admin/v1/sync',headers=headers)
     assert failed.status == 502 and await failed.json() == {'error':'sync failed'}
-    assert [p['name'] for p in (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers']] == ['B']
+    assert [p['note'] for p in (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers']] == ['B']
 
 
 async def test_sync_reports_inventory_failures(client, cpa):
@@ -1048,7 +1043,7 @@ async def test_sync_reports_inventory_failures(client, cpa):
     body=await response.json()
     assert response.status == 200 and body['inventory_failures'] == 1
     provider=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
-    assert provider['inventory_status'] == 'unavailable'
+    assert provider['status'] == 'unavailable'
     assert (await (await client.get('/admin/v1/summary?window=24h',headers=headers)).json())['routable_apis'] == 0
 
 
@@ -1257,9 +1252,9 @@ async def test_policy_requires_real_boolean_and_rejects_source_fields(client, cp
     assert wrong_type.status == 400
     source_mutation=await client.patch(endpoint,headers=headers,json={'base_url':'https://changed.invalid'})
     assert source_mutation.status == 400
-    assert (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]['enabled'] is True
+    assert (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]['status'] == 'enabled'
     assert (await client.patch(endpoint,headers=headers,json={'enabled':False})).status == 200
-    assert (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]['enabled'] is False
+    assert (await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]['status'] == 'disabled'
 
 
 async def test_quality_and_calls_are_derived_from_completed_generate(client, cpa):
