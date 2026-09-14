@@ -183,6 +183,8 @@ async def inventory(request):
     window = request.query.get("window", "24h")
     if window not in ("1h", "24h", "7d", "30d"):
         return web.json_response({"error": "invalid window"}, status=400)
+    # Internal inventory remains rich for runtime diagnostics and migration;
+    # the credential-facing console contract is /admin/v1/providers.
     return web.json_response({"providers": request.app["store"].inventory(window)})
 
 
@@ -190,7 +192,90 @@ async def providers(request):
     window = request.query.get("window", "24h")
     if window not in ("1h", "24h", "7d", "30d"):
         return web.json_response({"error": "invalid window"}, status=400)
-    return web.json_response({"providers": request.app["store"].inventory(window)})
+    return web.json_response({"providers": request.app["store"].api_key_resources(window)})
+
+
+async def key_resource(request):
+    store = request.app["store"]
+    fingerprint = request.match_info["fingerprint"]
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    if request.method == "GET":
+        resource = store.api_key_resource(fingerprint, window, include_mappings=True)
+        return web.json_response(resource or {"error": "provider not found"}, status=200 if resource else 404)
+
+    body = await request.json()
+    allowed = {"note", "enabled", "max_parallel", "mappings"}
+    valid = (
+        isinstance(body, dict) and bool(body) and set(body) <= allowed
+        and ("note" not in body or isinstance(body["note"], str) and len(body["note"]) <= 256)
+        and ("enabled" not in body or type(body["enabled"]) is bool)
+        and ("max_parallel" not in body or type(body["max_parallel"]) is int and 1 <= body["max_parallel"] <= 32)
+        and ("mappings" not in body or isinstance(body["mappings"], list))
+    )
+    if not valid:
+        return web.json_response({"error": "invalid API Key edit"}, status=400)
+    current = store.api_key_resource(fingerprint, window)
+    if current is None:
+        return web.json_response({"error": "provider not found"}, status=404)
+    mapping_fields = {"id", "target_provider_id", "target_model_id", "multiplier", "enabled"}
+    existing = {item["id"]: item for item in store.key_model_mappings(fingerprint=fingerprint, enabled=None)}
+    try:
+        for mapping in body.get("mappings", []):
+            if (not isinstance(mapping, dict) or set(mapping) - mapping_fields or
+                    type(mapping.get("id")) is not int or mapping["id"] not in existing or
+                    any(key not in {"id", "target_provider_id", "target_model_id", "multiplier", "enabled"} for key in mapping)):
+                raise ValueError("invalid key mapping edit")
+            values = {key: mapping[key] for key in mapping_fields - {"id"} if key in mapping}
+            if "target_provider_id" in values and type(values["target_provider_id"]) is not int:
+                raise ValueError("invalid key mapping edit")
+            if "target_model_id" in values:
+                if not isinstance(values["target_model_id"], str):
+                    raise ValueError("invalid key mapping edit")
+                values["target_model_id"] = canonicalize(values["target_model_id"])
+            if "enabled" in values and type(values["enabled"]) is not bool:
+                raise ValueError("invalid key mapping edit")
+            if "multiplier" in values and (type(values["multiplier"]) not in (int, float) or not math.isfinite(values["multiplier"]) or values["multiplier"] <= 0):
+                raise ValueError("invalid key mapping edit")
+            store.update_key_model_mapping(mapping["id"], **values)
+        policy = {key: body[key] for key in ("note", "enabled", "max_parallel") if key in body}
+        if policy and not store.update_policy(fingerprint, policy):
+            return web.json_response({"error": "provider not found"}, status=404)
+    except (ValueError, sqlite3.IntegrityError) as exc:
+        return web.json_response({"error": str(exc)}, status=409)
+    return web.json_response(store.api_key_resource(fingerprint, window, include_mappings=True))
+
+
+async def keys(request):
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    return web.json_response({"items": request.app["store"].api_key_resources(window), "window": window})
+
+
+async def stages(request):
+    window = request.query.get("window", "24h")
+    if window not in ("1h", "24h", "7d", "30d"):
+        return web.json_response({"error": "invalid window"}, status=400)
+    return web.json_response({"items": request.app["store"].stage_resources(window), "window": window})
+
+
+async def stage_test(request):
+    body = await request.json()
+    if (not isinstance(body, dict) or set(body) != {"stage", "model"} or
+            body["stage"] not in ("standard", "smart", "expert") or
+            not isinstance(body["model"], str) or not body["model"].strip()):
+        return web.json_response({"error": "stage and canonical model are required"}, status=400)
+    model = canonicalize(body["model"])
+    targets = request.app["store"].stage_test_providers(body["stage"], model)
+    results = await run_probe(
+        request.app["store"], tier=body["stage"], mode="all", targets=targets,
+        timeout_ms=request.app["settings"].probe_timeout_ms,
+        concurrency=request.app["settings"].probe_concurrency,
+        clock=request.app["clock"],
+    )
+    return web.json_response({"stage": body["stage"], "model": model, "items": results})
 
 
 async def summary(request):
@@ -471,7 +556,13 @@ async def pricing_models(request):
     if stage is not None and stage not in ('standard', 'smart', 'expert'):
         return web.json_response({'error': 'invalid stage'}, status=400)
     active = None if request.query.get('include_inactive') == 'true' else True
-    return web.json_response({'items': request.app['store'].pricing_models(stage=stage, active=active)})
+    # The Model directory is metadata-only. Pricing rows and key mappings have
+    # their own resources and must not be projected into this response.
+    items = request.app['store'].pricing_models(stage=stage, active=active)
+    return web.json_response({'items': [
+        {key: item[key] for key in ('id', 'stage', 'family', 'active')}
+        for item in items
+    ]})
 
 
 async def create_pricing_model(request):
@@ -836,6 +927,9 @@ async def routing(request):
 
 async def update_policy(request):
     body = await request.json()
+    # Legacy policy endpoint remains available to runtime migration tooling.
+    # The Key console uses /admin/v1/keys/{fingerprint}, whose contract is
+    # deliberately limited to safe credential fields and mappings.
     allowed = {"note", "multiplier", "enabled", "max_parallel", "calibrated", "tiers"}
     numeric = lambda value: type(value) in (int, float) and math.isfinite(value)
     valid = (
@@ -1113,7 +1207,9 @@ def create_app(settings: Settings, *, clock=None):
         web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync), web.post("/admin/v1/providers/register", register_providers),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
-        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys), web.get("/admin/v1/summary", summary),
+        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys),
+        web.get("/admin/v1/keys", keys), web.get("/admin/v1/keys/{fingerprint}", key_resource), web.patch("/admin/v1/keys/{fingerprint}", key_resource),
+        web.get("/admin/v1/stages", stages), web.post("/admin/v1/stages/test", stage_test), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.get("/admin/v1/models", pricing_models), web.post("/admin/v1/models", create_pricing_model),
         web.put("/admin/v1/models/{model}", update_pricing_model), web.patch("/admin/v1/models/{model}", update_pricing_model), web.delete("/admin/v1/models/{model}", deactivate_pricing_model),
