@@ -10,7 +10,7 @@ from pathlib import Path
 from aiohttp import TCPConnector, web
 
 from .db import Store
-from .catalog import blended_price, canonicalize
+from .catalog import canonicalize
 from .settings import Settings
 from .source import register_cpa, sync_cpa, scheduler as source_scheduler
 from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route, structured_schema
@@ -459,85 +459,6 @@ async def calls(request):
     return web.json_response({"items": items, "next_cursor": next_cursor})
 
 
-async def catalog(request):
-    counts = request.app["store"].catalog_counts()
-    # Preserve the legacy admin response shape while the Store catalog seam
-    # retains currency for normalized pricing and migration consumers.
-    built = {}
-    for name, value in request.app["store"].catalog().items():
-        projection = request.app["store"].legacy_catalog_projection(name)
-        item = {key: field for key, field in value.items() if key != "currency"}
-        if projection["status"] != "unique_official":
-            item.update({
-                "official_input_price": None, "official_cache_price": None,
-                "official_output_price": None, "blended_price": None,
-                "pricing_status": projection["status"],
-                "pricing_provider_count": projection["provider_count"],
-            })
-        else:
-            item["blended_price"] = blended_price(value)
-        item["available_provider_count"] = counts.get(name, 0)
-        built[name] = item
-    return web.json_response({"catalog": built})
-
-
-def valid_catalog_body(body, *, include_model=False):
-    fields = {'family', 'intellect', 'official_input_price', 'official_cache_price', 'official_output_price'}
-    if include_model:
-        fields.add('model')
-    numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
-    return (
-        isinstance(body, dict) and set(body) == fields
-        and (not include_model or isinstance(body['model'], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body['model']))
-        and isinstance(body['family'], str) and bool(body['family'].strip())
-        and body['intellect'] in ('standard', 'smart', 'expert')
-        and all(numeric(body[name]) for name in ('official_input_price', 'official_cache_price', 'official_output_price'))
-    )
-
-
-async def create_catalog(request):
-    body = await request.json()
-    if not valid_catalog_body(body, include_model=True):
-        return web.json_response({'error': 'invalid model catalog entry'}, status=400)
-    from .catalog import canonicalize
-    model = canonicalize(body['model'])
-    entry = body | {'model': model}
-    try:
-        created = request.app['store'].create_catalog(model, entry)
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=409)
-    if not created:
-        return web.json_response({'error': 'model already exists'}, status=409)
-    return web.json_response({'model': model}, status=201)
-
-
-async def update_catalog(request):
-    body = await request.json()
-    if not valid_catalog_body(body):
-        return web.json_response({'error': 'invalid model catalog entry'}, status=400)
-    from .catalog import canonicalize
-    model = canonicalize(request.match_info['model'])
-    try:
-        updated = request.app['store'].update_catalog(model, body)
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=409)
-    if not updated:
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.json_response({'model': model, 'updated': True})
-
-
-async def delete_catalog(request):
-    from .catalog import canonicalize
-    model = canonicalize(request.match_info['model'])
-    if not request.app['store'].delete_catalog(model):
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.Response(status=204)
-
-
-async def apply_catalog(request):
-    return web.json_response(request.app['store'].apply_catalog_to_inventory())
-
-
 def _valid_model_body(body, *, include_model=False, allow_active=False):
     fields = {'stage', 'family'} | ({'model'} if include_model else set())
     if allow_active:
@@ -606,7 +527,7 @@ def _pricing_provider_payload(row):
     return {
         'id': row['id'], 'provider_key': row['provider_key'], 'name': row['name'],
         'provider_type': row['provider_type'], 'type': row['provider_type'],
-        'multiplier': row['multiplier'], 'active': bool(row['active']),
+        'active': bool(row['active']),
     }
 
 
@@ -617,11 +538,11 @@ async def pricing_provider_api(request):
         rows = store.pricing_providers(active=active)
         return web.json_response({'items': [_pricing_provider_payload(row) for row in rows]})
     body = await request.json()
-    required = {'provider_key', 'name', 'provider_type', 'multiplier'}
-    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in ('official', 'direct', 'relay') or type(body['multiplier']) not in (int, float) or not math.isfinite(body['multiplier']) or body['multiplier'] <= 0:
+    required = {'provider_key', 'name', 'provider_type'}
+    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in ('official', 'direct', 'relay'):
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     try:
-        provider_id = store.create_pricing_provider(body['provider_key'], provider_type=body['provider_type'], name=body['name'], multiplier=body['multiplier'])
+        provider_id = store.create_pricing_provider(body['provider_key'], provider_type=body['provider_type'], name=body['name'])
     except ValueError as exc:
         return web.json_response({'error': str(exc)}, status=400)
     except sqlite3.IntegrityError:
@@ -640,10 +561,10 @@ async def update_pricing_provider_api(request):
     current = next((row for row in store.pricing_providers(active=None) if row['id'] == provider_id), None)
     if current is None:
         return web.json_response({'error': 'pricing provider not found'}, status=404)
-    if not isinstance(body, dict) or not body or not set(body) <= {'name', 'provider_type', 'multiplier', 'active'}:
+    if not isinstance(body, dict) or not body or not set(body) <= {'name', 'provider_type', 'active'}:
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
-    values = {key: body.get(key, current[key]) for key in ('name', 'provider_type', 'multiplier')}
-    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in ('official', 'direct', 'relay') or type(values['multiplier']) not in (int, float) or not math.isfinite(values['multiplier']):
+    values = {key: body.get(key, current[key]) for key in ('name', 'provider_type')}
+    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in ('official', 'direct', 'relay'):
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     if 'active' in body and type(body['active']) is not bool:
         return web.json_response({'error': 'active must be boolean'}, status=400)
@@ -669,17 +590,15 @@ async def deactivate_pricing_provider_api(request):
 
 def _valid_price_body(body):
     required = {'source_kind', 'input_price', 'cache_price', 'output_price', 'currency'}
-    optional = {'multiplier', 'source_name', 'source_url', 'source_evidence', 'verified_at', 'unpriced'}
+    optional = {'source_name', 'source_url', 'source_evidence', 'verified_at'}
     numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
     return (
         isinstance(body, dict) and required <= set(body) and set(body) <= required | optional
         and body['source_kind'] in ('official', 'direct', 'relay')
         and all(numeric(body[name]) for name in ('input_price', 'cache_price', 'output_price'))
-        and ('multiplier' not in body or type(body['multiplier']) in (int, float) and math.isfinite(body['multiplier']) and body['multiplier'] > 0)
         and isinstance(body['currency'], str) and re.fullmatch(r'[A-Za-z]{3,8}', body['currency'].strip())
         and all(name not in body or body[name] is None or isinstance(body[name], str) for name in ('source_name', 'source_url', 'source_evidence', 'verified_at'))
         and all(name not in body or body[name] is None or len(body[name]) <= limit for name, limit in (('source_name', 256), ('source_url', 2048), ('source_evidence', 4096), ('verified_at', 64)))
-        and all(name not in body or type(body[name]) is bool for name in ('unpriced',))
         and (body.get('source_url') is None or body['source_url'].startswith('https://'))
         and (body.get('verified_at') is None or _valid_iso_timestamp(body['verified_at']))
     )
@@ -714,14 +633,7 @@ async def pricing_api(request):
         return web.json_response({'error': 'invalid provider model price'}, status=400)
     body = body | {'model_id': canonicalize(body['model_id']), 'currency': body['currency'].strip().upper()}
     try:
-        existing = store.conn.execute(
-            "SELECT legacy FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
-            (body['provider_id'], body['model_id']),
-        ).fetchone()
-        if existing and existing['legacy']:
-            price_id = store.upsert_provider_model_price(**body)
-        else:
-            price_id = store.insert_provider_model_price(**body)
+        price_id = store.insert_provider_model_price(**body)
     except ValueError as exc:
         return web.json_response({'error': str(exc)}, status=400)
     except sqlite3.IntegrityError as exc:
@@ -754,83 +666,6 @@ async def deactivate_pricing_api(request):
         return web.json_response({'error': 'invalid provider id'}, status=400)
     if not request.app['store'].deactivate_provider_model_price(provider_id, canonicalize(request.match_info['model_id'])):
         return web.json_response({'error': 'provider model price not found'}, status=404)
-    return web.Response(status=204)
-
-
-def _binding_payload(row):
-    return {
-        'id': row['id'], 'active': bool(row['active']),
-        'relay': {'provider_id': row['relay_provider_id'], 'provider_key': row['relay_provider_key'], 'model_id': row['relay_model_id']},
-        'benchmark': {'provider_id': row['benchmark_provider_id'], 'provider_key': row['benchmark_provider_key'], 'model_id': row['benchmark_model_id']},
-        'source': {'name': row['source_name'], 'url': row['source_url'], 'evidence': row['source_evidence']},
-    }
-
-
-async def pricing_bindings_api(request):
-    store = request.app['store']
-    if request.method == 'GET':
-        active = None if request.query.get('include_inactive') == 'true' else True
-        return web.json_response({'items': [_binding_payload(row) for row in store.relay_price_bindings(active=active)]})
-    body = await request.json()
-    required = {'relay_provider_id', 'relay_model_id', 'benchmark_provider_id', 'benchmark_model_id'}
-    if not isinstance(body, dict) or not required <= set(body) or not set(body) <= required | {'source_name', 'source_url', 'source_evidence'} or not all(type(body[key]) is int for key in ('relay_provider_id', 'benchmark_provider_id')) or not all(isinstance(body[key], str) for key in ('relay_model_id', 'benchmark_model_id')):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    body = body | {
-        'relay_model_id': canonicalize(body['relay_model_id']),
-        'benchmark_model_id': canonicalize(body['benchmark_model_id']),
-    }
-    if any(not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body[key]) for key in ('relay_model_id', 'benchmark_model_id')):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    if any(body.get(key) is not None and (not isinstance(body[key], str) or len(body[key]) > limit) for key, limit in (('source_name', 256), ('source_url', 2048), ('source_evidence', 4096))):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    if body.get('source_url') is not None and not body['source_url'].startswith('https://'):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    try:
-        binding_id = store.bind_relay_price(**body)
-    except sqlite3.IntegrityError as exc:
-        return web.json_response({'error': str(exc)}, status=409)
-    return web.json_response({'id': binding_id, 'created': True}, status=201)
-
-
-async def update_pricing_binding_api(request):
-    body = await request.json()
-    required = {'benchmark_provider_id', 'benchmark_model_id'}
-    optional = {'source_name', 'source_url', 'source_evidence'}
-    if not isinstance(body, dict) or not required <= set(body) or not set(body) <= required | optional or type(body['benchmark_provider_id']) is not int or not isinstance(body['benchmark_model_id'], str) or (body.get('source_url') is not None and (not isinstance(body['source_url'], str) or not body['source_url'].startswith('https://'))):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    body = body | {'benchmark_model_id': canonicalize(body['benchmark_model_id'])}
-    if not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body['benchmark_model_id']) or any(body.get(key) is not None and (not isinstance(body[key], str) or len(body[key]) > limit) for key, limit in (('source_name', 256), ('source_url', 2048), ('source_evidence', 4096))):
-        return web.json_response({'error': 'invalid relay price binding'}, status=400)
-    try:
-        binding_id = int(request.match_info['binding_id'])
-    except (ValueError, TypeError):
-        return web.json_response({'error': 'invalid binding id'}, status=400)
-    current = next((item for item in request.app['store'].relay_price_bindings(active=None) if item['id'] == binding_id), None)
-    if current is None:
-        return web.json_response({'error': 'relay price binding not found'}, status=404)
-    body = body | {key: current[key] for key in ('source_name', 'source_url', 'source_evidence') if key not in body}
-    try:
-        updated = request.app['store'].update_relay_price_binding(binding_id, **body)
-    except (ValueError, TypeError):
-        return web.json_response({'error': 'invalid binding id'}, status=400)
-    except sqlite3.IntegrityError as exc:
-        return web.json_response({'error': str(exc)}, status=409)
-    if not updated:
-        return web.json_response({'error': 'relay price binding not found'}, status=404)
-    row = next(item for item in request.app['store'].relay_price_bindings(active=None) if item['id'] == binding_id)
-    return web.json_response(_binding_payload(row))
-
-
-async def deactivate_pricing_binding_api(request):
-    try:
-        binding_id = int(request.match_info['binding_id'])
-    except ValueError:
-        return web.json_response({'error': 'invalid binding id'}, status=400)
-    binding = next((item for item in request.app['store'].relay_price_bindings(active=None) if item['id'] == binding_id), None)
-    if binding is None:
-        return web.json_response({'error': 'relay price binding not found'}, status=404)
-    if not request.app['store'].deactivate_relay_price_binding(binding['relay_provider_id'], binding['relay_model_id']):
-        return web.json_response({'error': 'relay price binding not found'}, status=404)
     return web.Response(status=204)
 
 
@@ -927,17 +762,14 @@ async def routing(request):
 
 async def update_policy(request):
     body = await request.json()
-    # Legacy policy endpoint remains available to runtime migration tooling.
-    # The Key console uses /admin/v1/keys/{fingerprint}, whose contract is
-    # deliberately limited to safe credential fields and mappings.
-    allowed = {"note", "multiplier", "enabled", "max_parallel", "calibrated", "tiers"}
-    numeric = lambda value: type(value) in (int, float) and math.isfinite(value)
+    # Keep non-pricing Key policy controls available for operators. Pricing
+    # multipliers are deliberately absent from this contract.
+    allowed = {"note", "enabled", "max_parallel", "calibrated", "tiers"}
     valid = (
         isinstance(body, dict) and bool(body) and set(body) <= allowed
         and ("note" not in body or isinstance(body["note"], str))
         and ("enabled" not in body or type(body["enabled"]) is bool)
         and ("calibrated" not in body or type(body["calibrated"]) is bool)
-        and ("multiplier" not in body or numeric(body["multiplier"]) and body["multiplier"] > 0)
         and ("max_parallel" not in body or type(body["max_parallel"]) is int and 1 <= body["max_parallel"] <= 32)
         and ("tiers" not in body or isinstance(body["tiers"], list) and bool(body["tiers"])
              and all(tier in ("standard", "smart", "expert") for tier in body["tiers"]))
@@ -1209,21 +1041,17 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys),
         web.get("/admin/v1/keys", keys), web.get("/admin/v1/keys/{fingerprint}", key_resource), web.patch("/admin/v1/keys/{fingerprint}", key_resource),
+        web.put("/admin/v1/policy/{fingerprint}", update_policy), web.patch("/admin/v1/policy/{fingerprint}", update_policy),
         web.get("/admin/v1/stages", stages), web.post("/admin/v1/stages/test", stage_test), web.get("/admin/v1/summary", summary),
-        web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/catalog", catalog), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
+        web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.get("/admin/v1/models", pricing_models), web.post("/admin/v1/models", create_pricing_model),
         web.put("/admin/v1/models/{model}", update_pricing_model), web.patch("/admin/v1/models/{model}", update_pricing_model), web.delete("/admin/v1/models/{model}", deactivate_pricing_model),
         web.get("/admin/v1/pricing/providers", pricing_provider_api), web.post("/admin/v1/pricing/providers", pricing_provider_api),
         web.put("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.patch("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.delete("/admin/v1/pricing/providers/{provider_id}", deactivate_pricing_provider_api),
         web.get("/admin/v1/pricing", pricing_api), web.post("/admin/v1/pricing", pricing_api),
-        web.put("/admin/v1/pricing/bindings/{binding_id}", update_pricing_binding_api), web.patch("/admin/v1/pricing/bindings/{binding_id}", update_pricing_binding_api), web.delete("/admin/v1/pricing/bindings/{binding_id}", deactivate_pricing_binding_api),
-        web.get("/admin/v1/pricing/bindings", pricing_bindings_api), web.post("/admin/v1/pricing/bindings", pricing_bindings_api),
         web.get("/admin/v1/pricing/mappings", key_model_mappings_api), web.post("/admin/v1/pricing/mappings", key_model_mappings_api),
         web.put("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.patch("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.delete("/admin/v1/pricing/mappings/{mapping_id}", deactivate_key_model_mapping_api),
         web.put("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.patch("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.delete("/admin/v1/pricing/{provider_id}/{model_id}", deactivate_pricing_api),
-        web.post("/admin/v1/catalog", create_catalog), web.post("/admin/v1/catalog/apply", apply_catalog),
-        web.put("/admin/v1/catalog/{model}", update_catalog), web.patch("/admin/v1/catalog/{model}", update_catalog), web.delete("/admin/v1/catalog/{model}", delete_catalog), web.put("/admin/v1/policy/{fingerprint}", update_policy),
-        web.patch("/admin/v1/policy/{fingerprint}", update_policy),
         web.get("/admin/v1/health", health_results), web.post("/admin/v1/probes", probe),
     ])
     return app

@@ -62,8 +62,6 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
                     "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
                     "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
                 }], "window": "24h"}
-            if path == "/admin/v1/catalog":
-                return {"catalog": {}}
             if path.startswith("/admin/v1/routing"):
                 return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
             if path.startswith("/admin/v1/models") or path.startswith("/admin/v1/pricing"):
@@ -104,7 +102,7 @@ def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_pat
             store.create_canonical_model("console-model", stage="smart", family="Console family")
             provider_id = store.create_pricing_provider(
                 "console-direct", provider_type="direct",
-                name="Console <img src=x onerror=window.__injected=1>", multiplier=1.5,
+                name="Console <img src=x onerror=window.__injected=1>",
             )
             store.insert_provider_model_price(
                 provider_id=provider_id, model_id="console-model", source_kind="direct",
@@ -112,17 +110,6 @@ def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_pat
                 source_name="Console price list", source_url="https://prices.invalid/console",
                 source_evidence="Evidence <script>window.__injected=2</script>",
                 verified_at="2026-09-12T00:00:00Z",
-            )
-            relay_id = store.create_pricing_provider("console-relay", provider_type="relay", name="Console Relay", multiplier=1.0)
-            benchmark_id = store.create_pricing_provider("console-benchmark", provider_type="direct", name="Console Benchmark", multiplier=1.0)
-            store.insert_provider_model_price(
-                provider_id=benchmark_id, model_id="console-model", source_kind="direct",
-                input_price=1, cache_price=.2, output_price=4, currency="USD",
-                source_url="https://prices.invalid/benchmark", source_evidence="Benchmark table",
-            )
-            store.bind_relay_price(
-                relay_id, "console-model", benchmark_id, "console-model",
-                source_name="Relay terms", source_url="https://prices.invalid/binding", source_evidence="Initial binding",
             )
             seeded.set()
         broker.loop.call_soon_threadsafe(seed)
@@ -138,12 +125,5 @@ def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_pat
         assert "Console price list" in page.locator("#pricing").inner_text()
         assert "Evidence <script>window.__injected=2</script>" in page.locator("#pricing").inner_text()
         assert page.locator("#model-directory-section input[name=official_input_price]").count() == 0
-        page.locator("#pricing-bindings").get_by_text("Initial binding", exact=False).wait_for()
-        page.locator("#pricing-bindings").get_by_role("button", name="编辑").click()
-        page.locator("#binding-form input[name=source_evidence]").fill("Updated binding")
-        page.locator("#binding-form").get_by_role("button", name="保存").click()
-        page.locator("#pricing-bindings").get_by_text("Updated binding", exact=False).wait_for()
-        page.locator("#pricing-bindings").get_by_role("button", name="编辑").click()
-        page.locator("#binding-deactivate").click()
-        expect(page.locator("#pricing-bindings").get_by_text("Updated binding", exact=False)).to_have_count(0)
+        assert page.locator("#pricing-bindings").count() == 0
         browser.close()

@@ -101,7 +101,7 @@ def test_model_refresh_keeps_provider_identity_policy_and_health(tmp_path):
     }
     store.replace_source_snapshot([first], "2026-09-12T00:00:00+00:00")
     fingerprint = store.inventory()[0]["fingerprint"]
-    assert store.update_policy(fingerprint, {"enabled": False, "multiplier": 0.45, "note": "operator block", "calibrated": False})
+    assert store.update_policy(fingerprint, {"enabled": False, "note": "operator block", "calibrated": False})
     store.record_health(fingerprint, "gpt-5.6-luna", success=False, real=True, immediate_open=True)
     store.block_route(fingerprint, "gpt-5.6-luna")
 
@@ -111,7 +111,8 @@ def test_model_refresh_keeps_provider_identity_policy_and_health(tmp_path):
     row = store.inventory()[0]
     assert row["fingerprint"] == fingerprint
     assert row["models"] == ["gpt-5.6-luna", "gpt-5.6-terra"]
-    assert (row["enabled"], row["multiplier"], row["note"], row["calibrated"]) == (False, 0.45, "operator block", False)
+    assert (row["enabled"], row["note"], row["calibrated"]) == (False, "operator block", False)
+    assert store.conn.execute("SELECT multiplier FROM policy WHERE fingerprint=?", (fingerprint,)).fetchone()[0] == 1.0
     assert store.health(fingerprint, "gpt-5.6-luna")["state"] == "open"
     assert store.providers("standard") == []
 

@@ -297,20 +297,16 @@ def normalize_usage(data: dict) -> dict:
 
 def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pricing=None) -> dict:
     # Costing is only authoritative when the runtime supplies a resolved
-    # Provider+Model + Key mapping price. The legacy global catalog is not a
-    # billing fallback.
+    # Provider+Model price and the concrete key mapping multiplier.
     if pricing is None:
         return {"cost": None, "reason": "key-model mapping price is missing"}
     input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-    if pricing is None:
-        return {"cost": None, "reason": "canonical model price is missing"}
     if "priced" in pricing:
         priced = bool(pricing["priced"])
     else:
         priced = any(
             isinstance(pricing.get(key), (int, float)) and pricing[key] > 0
-            for key in ("input_price", "cache_price", "output_price",
-                        "official_input_price", "official_cache_price", "official_output_price")
+            for key in ("input_price", "cache_price", "output_price")
         )
     if not priced:
         return {"cost": None, "reason": pricing.get("reason") or "model price is unknown"}
@@ -320,9 +316,9 @@ def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pric
     cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
     cached = max(0, min(input_tokens, cached))
     uncached = max(0, input_tokens - cached)
-    input_price = pricing.get("input_price", pricing.get("official_input_price"))
-    cache_price = pricing.get("cache_price", pricing.get("official_cache_price"))
-    output_price = pricing.get("output_price", pricing.get("official_output_price"))
+    input_price = pricing.get("input_price")
+    cache_price = pricing.get("cache_price")
+    output_price = pricing.get("output_price")
     if not all(isinstance(value, (int, float)) for value in (input_price, cache_price, output_price)):
         return {"cost": None, "reason": "provider model price is incomplete"}
     cost = (uncached * input_price + cached * cache_price + output_tokens * output_price) / 1_000_000
@@ -1440,23 +1436,11 @@ async def route(store, tier: str, body: dict, parallel_cap: int = 3, invoker=inv
 def price_bands(providers):
     """Split comparable prices at their per-currency medians.
 
-    Legacy provider doubles only expose ``price_group`` and retain the old
-    single-band behavior.  Real candidates carry explicit pricing metadata;
-    those candidates are never compared across currencies, and unpriced
-    candidates are kept in a separate non-price band.
+    Candidates are compared only when their explicit Provider+Model price is
+    known. Prices from different currencies never share a band, and unknown
+    or explicitly unpriced candidates remain visible in a separate band.
     """
     providers = list(providers)
-    has_effective_metadata = any(hasattr(provider, "price_currency") for provider in providers)
-    if not has_effective_metadata:
-        ordered = sorted(providers, key=lambda provider: (provider.price_group, provider.id))
-        if not ordered:
-            return []
-        midpoint = len(ordered) // 2
-        median = ordered[midpoint].price_group if len(ordered) % 2 else (ordered[midpoint - 1].price_group + ordered[midpoint].price_group) / 2
-        lower = [provider for provider in ordered if provider.price_group <= median]
-        higher = [provider for provider in ordered if provider.price_group > median]
-        return [lower] + ([higher] if higher else [])
-
     groups = {}
     unknown = []
     for provider in providers:

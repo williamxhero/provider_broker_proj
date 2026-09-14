@@ -50,13 +50,9 @@ def test_analytics_and_routes_share_the_main_container_at_desktop_and_narrow_wid
                 return {"providers": []}
             if path.startswith("/admin/v1/stages"):
                 return {"items": [], "window": "24h"}
-            if path == "/admin/v1/catalog":
-                return {"catalog": {}}
             if path.startswith("/admin/v1/routing"):
                 return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
             if path.startswith("/admin/v1/models"):
-                return {"items": []}
-            if path.startswith("/admin/v1/pricing/bindings"):
                 return {"items": []}
             if path.startswith("/admin/v1/pricing"):
                 return {"items": []}
