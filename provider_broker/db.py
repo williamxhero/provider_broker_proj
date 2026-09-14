@@ -1106,12 +1106,13 @@ class Store:
             }
         resolved = self.effective_pricing(mapping["target_provider_id"], mapping["target_model_id"])
         if not resolved["priced"]:
-            return resolved | {"mapping_id": mapping["id"], "mapping_multiplier": mapping["multiplier"],
+            return resolved | {"model": model_id, "mapping_id": mapping["id"], "mapping_multiplier": mapping["multiplier"],
                                "reason": resolved["reason"] or "mapped Provider+Model price is unpriced"}
         multiplier = float(mapping["multiplier"])
         components = [round(float(resolved[key]) * multiplier, 10)
                       for key in ("input_price", "cache_price", "output_price")]
         return resolved | {
+            "model": model_id,
             "input_price": components[0], "cache_price": components[1], "output_price": components[2],
             "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
             "multiplier": multiplier, "mapping_id": mapping["id"],
@@ -1233,9 +1234,10 @@ class Store:
                     source_models = []
                 for raw_model in source_models:
                     model_id = canonicalize(str(raw_model))
-                    if model_id != "unavailable" and self.conn.execute(
-                        "SELECT 1 FROM canonical_model WHERE id=?", (model_id,)
-                    ).fetchone() and not self.conn.execute(
+                    if model_id != "unavailable" and (
+                        self.conn.execute("SELECT 1 FROM canonical_model WHERE id=?", (model_id,)).fetchone()
+                        or self.conn.execute("SELECT 1 FROM model_catalog WHERE model=?", (model_id,)).fetchone()
+                    ) and not self.conn.execute(
                         "SELECT 1 FROM key_model_mapping WHERE fingerprint=? AND model_id=?",
                         (source["fingerprint"], model_id),
                     ).fetchone():
