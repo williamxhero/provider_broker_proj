@@ -312,16 +312,22 @@ def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pric
         return {"cost": None, "reason": pricing.get("reason") or "model price is unknown"}
     if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
         return {"cost": None, "reason": "token usage is incomplete"}
-    details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
-    cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
-    cached = max(0, min(input_tokens, cached))
-    uncached = max(0, input_tokens - cached)
-    input_price = pricing.get("input_price")
-    cache_price = pricing.get("cache_price")
-    output_price = pricing.get("output_price")
-    if not all(isinstance(value, (int, float)) for value in (input_price, cache_price, output_price)):
-        return {"cost": None, "reason": "provider model price is incomplete"}
-    cost = (uncached * input_price + cached * cache_price + output_tokens * output_price) / 1_000_000
+    # New CPA rows expose one CNY output rate. Keep the component calculation
+    # only for legacy callers that have not yet crossed the new contract.
+    output_price_cny = pricing.get("output_price_cny")
+    if isinstance(output_price_cny, (int, float)):
+        cost = (input_tokens + output_tokens) * output_price_cny / 1_000_000
+    else:
+        details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
+        cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
+        cached = max(0, min(input_tokens, cached))
+        uncached = max(0, input_tokens - cached)
+        input_price = pricing.get("input_price")
+        cache_price = pricing.get("cache_price")
+        output_price = pricing.get("output_price")
+        if not all(isinstance(value, (int, float)) for value in (input_price, cache_price, output_price)):
+            return {"cost": None, "reason": "provider model price is incomplete"}
+        cost = (uncached * input_price + cached * cache_price + output_tokens * output_price) / 1_000_000
     return {"cost": round(cost * multiplier, 10), "reason": None}
 
 

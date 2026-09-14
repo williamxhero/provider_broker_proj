@@ -4,7 +4,7 @@ import json
 from urllib.parse import urlsplit
 from aiohttp import ClientSession
 
-from .catalog import canonicalize
+from .catalog import canonical_provider_type, canonicalize
 
 
 _CHAT_API_ROOTS = (
@@ -103,6 +103,8 @@ def _registration_entries(value: object) -> list[dict]:
                 raise ValueError("provider model names must be bounded strings")
             model_names.append(model.strip())
         provider_type = _provider_label(item.get("provider_type") or item.get("type") or item.get("provider") or "openai")
+        if canonical_provider_type(provider_type, base_url) is None:
+            raise ValueError("provider type is outside the six-provider allowlist")
         name = item.get("name") or item.get("site_name") or provider_type
         if not isinstance(name, str) or not name.strip() or len(name) > 160 or "\r" in name or "\n" in name:
             raise ValueError("provider name must be a bounded string")
@@ -372,7 +374,11 @@ def expand_config(payload: object) -> list[dict]:
                     if visible_name and secret in visible_name:
                         visible_name = None
                     request_headers = defaults | _request_headers(key.get('headers')) | _request_headers(credential.get('headers'))
-                    result.append({'name':visible_name or section,'site_name':visible_name,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':_provider_type(base, family),'request_headers':request_headers,'source':{'section':section,'site_name':visible_name}})
+                    wire_type = _provider_type(base, family)
+                    configured_models = list(dict.fromkeys(
+                        str(value).strip() for value in aliases.values() if isinstance(value, str) and value.strip()
+                    ))
+                    result.append({'name':visible_name or section,'site_name':visible_name,'base_url':base,'api_key':secret,'models':['unavailable'],'configured_models':configured_models,'aliases':aliases,'provider_type':wire_type,'canonical_provider_type':canonical_provider_type(family, base),'request_headers':request_headers,'source':{'section':section,'site_name':visible_name}})
         return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
     if isinstance(roots, dict): roots = roots.values()
@@ -396,7 +402,8 @@ def expand_config(payload: object) -> list[dict]:
                     site_name = None
                 request_headers = _request_headers(provider.get("headers"))
                 request_headers.update(_request_headers(key.get("headers")))
-                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names,"provider_type":_provider_type(normalized_base, kind, provider.get("protocol") or key.get("protocol")),"request_headers":request_headers,"source":{"site_name":site_name}})
+                wire_type = _provider_type(normalized_base, kind, provider.get("protocol") or key.get("protocol"))
+                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names,"configured_models":names,"provider_type":wire_type,"canonical_provider_type":canonical_provider_type(kind, normalized_base),"request_headers":request_headers,"source":{"site_name":site_name}})
     return result
 
 
@@ -410,7 +417,10 @@ async def sync_cpa(store, url: str, token: str) -> dict:
         async with session.get(endpoint+"/v0/management/config",headers=headers,timeout=20) as response:
             response.raise_for_status(); payload=await response.json()
     if not isinstance(payload, dict): raise ValueError('invalid source configuration')
-    entries=expand_config(payload)
+    entries=[entry for entry in expand_config(payload)
+             if entry.get('canonical_provider_type') in {
+                 'openai', 'anthropic', 'deepseek', 'qwen', 'doubao', 'deepinfra'
+             }]
     if not entries: raise ValueError('invalid source configuration')
     async with ClientSession() as session:
         for entry in entries:
@@ -420,11 +430,20 @@ async def sync_cpa(store, url: str, token: str) -> dict:
                     raw=await response.json(content_type=None)
                     discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
                     aliases=entry.get('aliases',{})
-                    models=list(dict.fromkeys(canonicalize(aliases.get(model.casefold(), model)) for model in discovered))
-                    configured_models = list(aliases.values()) or models
+                    discovered_models = list(dict.fromkeys(canonicalize(aliases.get(model.casefold(), model)) for model in discovered))
+                    configured_models = [canonicalize(model) for model in entry.get('configured_models', [])]
+                    # The configured Key/Model pairs are the CPA source of
+                    # truth. /models is only a liveness check and may expose
+                    # a broader vendor catalog than this key is allowed to
+                    # use.
+                    models = configured_models or discovered_models
                     public_catalog = _public_model_ids(entry['base_url'])
-                    public_ids = public_catalog or _public_model_ids(entry['base_url'], [canonicalize(model) for model in configured_models])
-                    if public_ids and (not models or entry.get('provider_type') == 'openai_chat'):
+                    public_ids = public_catalog or _public_model_ids(entry['base_url'], configured_models)
+                    # Public vendor IDs are only a discovery fallback. When
+                    # CPA or the upstream exposes models, those actual IDs
+                    # are authoritative; the static directory must not add
+                    # Provider+Model combinations during sync.
+                    if public_ids and not models:
                         models = list(public_ids)
                         entry['model_aliases'] = public_ids
                     entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
@@ -435,7 +454,7 @@ async def sync_cpa(store, url: str, token: str) -> dict:
                             if canonicalize(alias) in models
                         }
             except Exception:
-                entry['models']=['unavailable']; entry['inventory_status']='unavailable'
+                entry['models']=entry.get('configured_models') or ['unavailable']; entry['inventory_status']='unavailable'
                 inventory_failures+=1
     store.replace_source_snapshot(entries, datetime.datetime.now(datetime.UTC).isoformat())
     return {'count':len(entries),'inventory_failures':inventory_failures}
