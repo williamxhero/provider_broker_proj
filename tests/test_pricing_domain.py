@@ -15,17 +15,13 @@ def test_pricing_entities_keep_model_metadata_separate_from_provider_prices(tmp_
     db = store(tmp_path)
 
     provider_id = db.create_pricing_provider(
-        "relay-acme", provider_type="relay", name="Acme Relay", multiplier=1.25
+        "anthropic-acme", provider_type="anthropic", name="Acme Anthropic", multiplier=1.25
     )
     db.create_canonical_model("model-a", stage="smart", family="Family A")
     price_id = db.upsert_provider_model_price(
         provider_id=provider_id,
         model_id="model-a",
-        source_kind="relay",
-        input_price=1.0,
-        cache_price=0.2,
-        output_price=4.0,
-        currency="USD",
+        output_price_cny=4.0,
         source_url="https://prices.example/acme",
         source_evidence="published table",
         verified_at="2026-09-12T00:00:00+00:00",
@@ -40,11 +36,10 @@ def test_pricing_entities_keep_model_metadata_separate_from_provider_prices(tmp_
     }
     price = next(row for row in db.provider_model_prices() if row["id"] == price_id)
     assert (price["provider_id"], price["model_id"], price["source_kind"], price["currency"], price["active"]) == (
-        provider_id, "model-a", "relay", "USD", True,
+        provider_id, "model-a", "direct", "CNY", True,
     )
     db.upsert_provider_model_price(
-        provider_id=provider_id, model_id="model-a", source_kind="relay",
-        input_price=1.1, cache_price=0.2, output_price=4.0, currency="USD",
+        provider_id=provider_id, model_id="model-a", output_price_cny=4.0,
     )
     assert db.conn.execute(
         "SELECT source FROM configuration_event WHERE setting=?",
@@ -56,32 +51,28 @@ def test_pricing_entities_keep_model_metadata_separate_from_provider_prices(tmp_
 
 def test_active_provider_model_price_is_unique_but_can_be_deactivated(tmp_path):
     db = store(tmp_path)
-    provider_id = db.create_pricing_provider("direct-a", provider_type="direct", name="Direct A")
+    provider_id = db.create_pricing_provider("openai-a", provider_type="openai", name="OpenAI A")
     db.create_canonical_model("model-a", stage="standard", family="A")
     db.upsert_provider_model_price(
-        provider_id=provider_id, model_id="model-a", source_kind="direct",
-        input_price=1, cache_price=0.1, output_price=2, currency="USD",
+        provider_id=provider_id, model_id="model-a", output_price_cny=2,
     )
     with pytest.raises(sqlite3.IntegrityError):
         db.insert_provider_model_price(
-            provider_id=provider_id, model_id="model-a", source_kind="direct",
-            input_price=2, cache_price=0.2, output_price=3, currency="USD",
+            provider_id=provider_id, model_id="model-a", output_price_cny=3,
         )
     db.deactivate_provider_model_price(provider_id, "model-a")
     assert db.insert_provider_model_price(
-        provider_id=provider_id, model_id="model-a", source_kind="direct",
-        input_price=2, cache_price=0.2, output_price=3, currency="USD",
+        provider_id=provider_id, model_id="model-a", output_price_cny=3,
     ) > 0
 
 
-def test_relay_binding_requires_active_objects_and_protects_referenced_rows(tmp_path):
+def test_removed_binding_api_requires_explicit_provider_model_prices(tmp_path):
     db = store(tmp_path)
-    relay_id = db.create_pricing_provider("relay-a", provider_type="relay", name="Relay A")
-    base_id = db.create_pricing_provider("direct-a", provider_type="direct", name="Direct A")
+    relay_id = db.create_pricing_provider("anthropic-a", provider_type="anthropic", name="Anthropic A")
+    base_id = db.create_pricing_provider("openai-a", provider_type="openai", name="OpenAI A")
     db.create_canonical_model("model-a", stage="smart", family="A")
     db.insert_provider_model_price(
-        provider_id=base_id, model_id="model-a", source_kind="direct",
-        input_price=1, cache_price=0.1, output_price=2, currency="USD",
+        provider_id=base_id, model_id="model-a", output_price_cny=2,
     )
     with pytest.raises(ValueError, match="relay price bindings have been removed"):
         db.bind_relay_price(relay_id, "model-a", base_id, "model-a")

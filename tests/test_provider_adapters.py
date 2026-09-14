@@ -29,26 +29,26 @@ def test_known_vendor_bare_hosts_get_documented_api_roots():
         {"type": "deepinfra", "base_url": "https://api.deepinfra.com", "keys": [{"key": "x", "models": ["m"]}]},
         {"type": "ark", "base_url": "https://ark.cn-beijing.volces.com", "keys": [{"key": "x", "models": ["m"]}]},
         {"type": "qwen", "base_url": "https://dashscope.aliyuncs.com", "keys": [{"key": "x", "models": ["m"]}]},
-        {"type": "glm", "base_url": "https://open.bigmodel.cn", "keys": [{"key": "x", "models": ["m"]}]},
+        {"type": "anthropic", "base_url": "https://api.anthropic.com", "keys": [{"key": "x", "models": ["m"]}]},
     ]})
     assert entries[0]["base_url"] == "https://api.deepinfra.com/v1/openai"
     assert entries[1]["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
     assert entries[2]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
-    assert entries[3]["base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+    assert entries[3]["base_url"] == "https://api.anthropic.com"
 
 
 def test_vendor_aliases_and_hosts_select_chat_without_rewriting_arbitrary_gateways():
     entries = expand_config({"providers": [
         {"provider": "DeepSeek", "base_url": "https://api.deepseek.com", "keys": [{"key": "x", "models": ["m"]}]},
         {"vendor": "doubao-seed", "base_url": "https://ark.cn-beijing.volces.com", "keys": [{"key": "x", "models": ["m"]}]},
-        {"type": "zhipuai", "base_url": "https://open.bigmodel.cn", "keys": [{"key": "x", "models": ["m"]}]},
+        {"type": "qwen", "base_url": "https://dashscope.aliyuncs.com", "keys": [{"key": "x", "models": ["m"]}]},
         {"type": "openai", "base_url": "https://gateway.example/custom", "keys": [{"key": "x", "models": ["m"]}]},
     ]})
 
     assert [item["provider_type"] for item in entries] == ["openai_chat", "openai_chat", "openai_chat", "openai"]
     assert entries[0]["base_url"] == "https://api.deepseek.com/v1"
     assert entries[1]["base_url"] == "https://ark.cn-beijing.volces.com/api/v3"
-    assert entries[2]["base_url"] == "https://open.bigmodel.cn/api/paas/v4"
+    assert entries[2]["base_url"] == "https://dashscope.aliyuncs.com/compatible-mode/v1"
     assert entries[3]["base_url"] == "https://gateway.example/custom"
 
 

@@ -12,17 +12,16 @@ def store(tmp_path: Path) -> Store:
 
 def test_effective_key_price_is_mapping_specific_and_applies_mapping_multiplier(tmp_path):
     db = store(tmp_path)
-    provider_id = db.create_pricing_provider("direct-a", provider_type="direct", multiplier=1.5)
+    provider_id = db.create_pricing_provider("openai-a", provider_type="openai", multiplier=1.5)
     db.create_canonical_model("model-a", stage="smart", family="A")
     db.insert_provider_model_price(
-        provider_id=provider_id, model_id="model-a", source_kind="direct",
-        input_price=1.0, cache_price=0.2, output_price=4.0, currency="USD",
+        provider_id=provider_id, model_id="model-a", output_price_cny=4.0,
     )
     db.conn.execute(
         "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
         "VALUES(?,?,?,?,?,?,?,?)",
         ("direct-key", "Direct", "https://direct.example/v1", db._encrypt("secret"), "openai",
-         json.dumps(["model-a"]), json.dumps({"provider_type": "direct"}), "2026-09-14T00:00:00Z"),
+         json.dumps(["model-a"]), json.dumps({"provider_type": "openai"}), "2026-09-14T00:00:00Z"),
     )
     db.conn.execute("INSERT INTO policy(fingerprint) VALUES(?)", ("direct-key",))
     db.create_key_model_mapping("direct-key", "model-a", target_provider_id=provider_id, multiplier=1.5)
@@ -31,34 +30,32 @@ def test_effective_key_price_is_mapping_specific_and_applies_mapping_multiplier(
 
     assert {key: resolved[key] for key in (
         "model", "stage", "currency", "input_price", "cache_price", "output_price",
-        "blended_price", "multiplier", "source", "priced", "reason",
+        "output_price_cny", "blended_price", "multiplier", "source", "priced", "reason",
     )} == {
-        "model": "model-a", "stage": "smart", "currency": "USD",
-        "input_price": 1.5, "cache_price": 0.3, "output_price": 6.0,
-        "blended_price": 4.908, "multiplier": 1.5,
-        "source": "direct", "priced": True, "reason": None,
+        "model": "model-a", "stage": "smart", "currency": "CNY",
+        "input_price": 6.0, "cache_price": 6.0, "output_price": 6.0,
+        "output_price_cny": 6.0, "blended_price": 6.0, "multiplier": 1.5,
+        "source": "pricing", "priced": True, "reason": None,
     }
 
 
-def test_effective_relay_key_price_uses_mapping_and_binding_is_not_required(tmp_path):
+def test_effective_cross_provider_key_price_uses_mapping_multiplier(tmp_path):
     db = store(tmp_path)
-    relay_id = db.create_pricing_provider("relay-a", provider_type="relay", multiplier=1.25)
-    benchmark_id = db.create_pricing_provider("direct-a", provider_type="direct")
+    key_provider_id = db.create_pricing_provider("anthropic-a", provider_type="anthropic")
+    benchmark_id = db.create_pricing_provider("openai-b", provider_type="openai")
     db.create_canonical_model("relay-model", stage="smart", family="A")
     db.create_canonical_model("benchmark-model", stage="smart", family="A")
     db.insert_provider_model_price(
-        provider_id=benchmark_id, model_id="benchmark-model", source_kind="direct",
-        input_price=2.0, cache_price=0.5, output_price=8.0, currency="CNY",
+        provider_id=benchmark_id, model_id="benchmark-model", output_price_cny=8.0,
     )
     db.insert_provider_model_price(
-        provider_id=relay_id, model_id="relay-model", source_kind="relay",
-        input_price=2.0, cache_price=0.5, output_price=8.0, currency="CNY",
+        provider_id=key_provider_id, model_id="relay-model", output_price_cny=8.0,
     )
     db.conn.execute(
         "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
         "VALUES(?,?,?,?,?,?,?,?)",
-        ("relay-key", "Relay", "https://relay.example/v1", db._encrypt("secret"), "relay",
-         json.dumps(["relay-model"]), json.dumps({"provider_type": "relay"}), "2026-09-14T00:00:00Z"),
+        ("relay-key", "Anthropic", "https://anthropic.example/v1", db._encrypt("secret"), "anthropic",
+         json.dumps(["relay-model"]), json.dumps({"provider_type": "anthropic"}), "2026-09-14T00:00:00Z"),
     )
     db.conn.execute("INSERT INTO policy(fingerprint,multiplier) VALUES(?,?)", ("relay-key", 1.25))
     db.create_key_model_mapping(
@@ -69,8 +66,8 @@ def test_effective_relay_key_price_uses_mapping_and_binding_is_not_required(tmp_
     resolved = db.effective_key_pricing("relay-key", "relay-model")
     missing = db.effective_key_pricing("relay-key", "missing-model")
 
-    assert (resolved["currency"], resolved["source"], resolved["multiplier"]) == ("CNY", "direct", 1.25)
-    assert (resolved["input_price"], resolved["cache_price"], resolved["output_price"]) == (2.5, 0.625, 10.0)
+    assert (resolved["currency"], resolved["source"], resolved["multiplier"]) == ("CNY", "pricing", 1.25)
+    assert (resolved["input_price"], resolved["cache_price"], resolved["output_price"]) == (10.0, 10.0, 10.0)
     assert resolved["priced"] is True
     assert missing["priced"] is False and missing["blended_price"] is None and missing["reason"]
 
@@ -79,10 +76,10 @@ def test_estimate_cost_details_uses_final_component_prices_and_cached_tokens():
     details = estimate_cost_details(
         "model-a",
         {"input_tokens": 900, "output_tokens": 100, "input_tokens_details": {"cached_tokens": 400}},
-        pricing={"input_price": 1.5, "cache_price": 0.3, "output_price": 6.0, "priced": True},
+        pricing={"output_price_cny": 6.0, "priced": True},
     )
 
-    assert details == {"cost": 0.00147, "reason": None}
+    assert details == {"cost": 0.006, "reason": None}
 
 
 def test_price_bands_never_compare_different_currencies_or_unpriced_candidates():
@@ -104,7 +101,7 @@ def test_route_candidate_audit_preserves_effective_price_projection(tmp_path):
     db.record_candidate(
         "route-1", fingerprint="key-1", model="model-a", site_id="site-a", eligible=True,
         initial_rank=1, stage="smart", currency="USD", multiplier=1.25,
-        price=3.75, price_source="relay", price_comparable=True,
+        price=3.75, price_source="pricing", price_comparable=True,
     )
 
     candidate = db.route_detail("route-1")["candidates"][0]
@@ -113,7 +110,7 @@ def test_route_candidate_audit_preserves_effective_price_projection(tmp_path):
     assert candidate["currency"] == "USD"
     assert candidate["multiplier"] == 1.25
     assert candidate["price"] == 3.75
-    assert candidate["price_source"] == "relay"
+    assert candidate["price_source"] == "pricing"
     assert candidate["price_comparable"] == 1
 
 
@@ -125,10 +122,9 @@ def test_store_provider_candidates_use_effective_key_price_instead_of_global_cat
         "source": {"provider_type": "direct", "inventory_status": "available"},
     }], "2026-09-12T00:00:00Z")
     row = db.conn.execute("SELECT fingerprint FROM source_provider").fetchone()
-    provider_id = db.create_pricing_provider("direct-runtime", provider_type="direct", multiplier=1.4)
+    provider_id = db.create_pricing_provider("openai-runtime", provider_type="openai", multiplier=1.4)
     db.insert_provider_model_price(
-        provider_id=provider_id, model_id="gpt-5.6-terra", source_kind="direct",
-        input_price=1.0, cache_price=0.1, output_price=3.0, currency="EUR",
+        provider_id=provider_id, model_id="gpt-5.6-terra", output_price_cny=3.0,
     )
     db.conn.execute("UPDATE source_provider SET pricing_provider_id=?", (provider_id,))
     db.upsert_key_model_mapping(
@@ -139,8 +135,8 @@ def test_store_provider_candidates_use_effective_key_price_instead_of_global_cat
 
     candidate = db.providers("smart")[0]
 
-    assert candidate.pricing["input_price"] == 1.4
+    assert candidate.pricing["input_price"] == 4.2
     assert candidate.pricing["output_price"] == 4.2
-    assert candidate.pricing["currency"] == "EUR"
-    assert candidate.price_currency == "EUR" and candidate.price_comparable is True
+    assert candidate.pricing["currency"] == "CNY"
+    assert candidate.price_currency == "CNY" and candidate.price_comparable is True
     assert candidate.price_group == int(candidate.pricing["blended_price"] * 100000)

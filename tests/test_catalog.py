@@ -1,6 +1,4 @@
-import pytest
-
-from provider_broker.catalog import CATALOG, blended_price, canonicalize
+from provider_broker.catalog import CATALOG, canonicalize
 from provider_broker.db import Store
 from provider_broker.upstream import model_fulfills
 
@@ -15,7 +13,7 @@ APPROVED_STAGES = {
 }
 
 
-def test_approved_catalog_entries_have_explicit_stage_and_valid_blended_price():
+def test_approved_catalog_entries_have_explicit_stage_and_output_price():
     approved = set().union(*APPROVED_STAGES.values())
 
     assert approved <= set(CATALOG)
@@ -24,10 +22,7 @@ def test_approved_catalog_entries_have_explicit_stage_and_valid_blended_price():
             entry = CATALOG[model]
             assert entry["intellect"] == stage
             assert entry["family"]
-            assert all(isinstance(entry[field], (int, float)) for field in (
-                "official_input_price", "official_cache_price", "official_output_price",
-            ))
-            assert blended_price(entry) >= 0
+            assert isinstance(entry["official_output_price_cny"], (int, float))
 
 
 def test_approved_aliases_canonicalize_deterministically():
@@ -58,23 +53,23 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
     assert {provider.models[0] for provider in store.providers("standard")} == set()
     assert {provider.models[0] for provider in store.providers("smart")} == {"deepseek-v4-flash"}
     assert {provider.models[0] for provider in store.providers("expert")} == {"glm-5.3"}
-    assert "unknown-provider-model" not in store.inventory()[0]["models"]
+    assert "unknown-provider-model" in store.inventory()[0]["models"]
+    assert all("unknown-provider-model" not in provider.models for provider in store.providers("smart"))
 
 
 def test_legacy_catalog_writes_are_removed_and_fixed_directory_is_stable(tmp_path):
     path = tmp_path / "broker.sqlite3"
     first = Store(path, b"0123456789abcdef")
-    with pytest.raises(ValueError, match="compatibility catalog has been removed"):
-        first.create_catalog("operator-model", {})
-    with first.conn:
-        first.conn.execute("UPDATE model_catalog SET family='Operator override' WHERE model='gpt-5.6-luna'")
     first.conn.close()
 
     reopened = Store(path, b"0123456789abcdef")
 
-    assert reopened.catalog()["glm-5.3"] == {"family": CATALOG["glm-5.3"]["family"], "intellect": CATALOG["glm-5.3"]["intellect"]}
-    assert "operator-model" not in reopened.model_directory()
-    assert reopened.catalog()["gpt-5.6-luna"]["family"] == "OpenAI GPT-5.6"
+    assert reopened.canonical_models()["glm-5.3"] == {
+        "id": "glm-5.3", "family": CATALOG["glm-5.3"]["family"],
+        "stage": CATALOG["glm-5.3"]["intellect"], "active": True,
+    }
+    assert "operator-model" not in reopened.canonical_models()
+    assert reopened.canonical_models()["gpt-5.6-luna"]["family"] == "OpenAI GPT-5.6"
 
 
 def test_model_fulfillment_requires_known_model_and_never_downgrades():

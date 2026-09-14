@@ -61,10 +61,11 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
                     "provider_types": ["openai"], "callable_key_count": 1, "latest_test": None,
                     "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
                     "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
+                    "price_bands": {"low": {"output_prices_cny": [2]}, "high": {"output_prices_cny": [8]}},
                 }], "window": "24h"}
             if path.startswith("/admin/v1/routing"):
                 return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
-            if path.startswith("/admin/v1/models") or path.startswith("/admin/v1/pricing"):
+            if path.startswith("/admin/v1/pricing"):
                 return {"items": []}
             if path.startswith("/admin/v1/quality"):
                 return {"calls": 0, "failures": {}}
@@ -88,8 +89,13 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
         assert provider_headers == ["域名", "状态", "备注", "API Key", "单 Key 并发上限", "24h Token", "24h 费用", "操作"]
         assert page.locator("#providers").get_by_role("button", name="一键测试").count() == 0
         assert page.locator("#providers").get_by_text("safe note", exact=True).count() == 1
+        model_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#model-view thead th").all_inner_texts()]
+        assert model_headers == ["Stage", "低价输出 / 1M CNY", "高价输出 / 1M CNY", "Provider types", "可调用 Key", "最近测试", "技术成功率", "平均首字延迟", "24h Token", "24h 费用", "操作"]
         assert page.locator("#model-view tbody tr").get_by_role("button", name="测试").count() == 1
-        assert page.locator("#model-directory input[name=official_input_price]").count() == 0
+        assert page.locator("#model-view").get_by_text("2", exact=True).count() == 1
+        assert page.locator("#model-view").get_by_text("8", exact=True).count() == 1
+        assert page.locator("#probe-stage, #probe-race, #probe-all, #probe-results").count() == 0
+        assert page.locator("#model-directory").count() == 0
         assert page.locator("main > section:has(#analytics-title)").count() == 1
         assert page.locator("main > section:has(#route-audit-title)").count() == 1
         browser.close()
@@ -101,12 +107,11 @@ def test_pricing_console_shows_only_provider_model_and_cny_price(tmp_path):
             store = broker.app["store"]
             store.create_canonical_model("console-model", stage="smart", family="Console family")
             provider_id = store.create_pricing_provider(
-                "console-direct", provider_type="direct",
+                "console-openai", provider_type="openai",
                 name="Console <img src=x onerror=window.__injected=1>",
             )
             store.insert_provider_model_price(
-                provider_id=provider_id, model_id="console-model", source_kind="direct",
-                input_price=1, cache_price=.2, output_price=4, currency="USD",
+                provider_id=provider_id, model_id="console-model", output_price_cny=4,
                 source_name="Console price list", source_url="https://prices.invalid/console",
                 source_evidence="Evidence <script>window.__injected=2</script>",
                 verified_at="2026-09-12T00:00:00Z",

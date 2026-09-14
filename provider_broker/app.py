@@ -11,6 +11,7 @@ from aiohttp import TCPConnector, web
 
 from .db import Store
 from .catalog import canonicalize
+from .pricing import PROVIDER_TYPES
 from .settings import Settings
 from .source import register_cpa, sync_cpa, scheduler as source_scheduler
 from .upstream import ClientDeadlineExceeded, UpstreamFailure, invoke_stream, route, structured_schema
@@ -220,7 +221,14 @@ async def key_resource(request):
     if current is None:
         return web.json_response({"error": "provider not found"}, status=404)
     mapping_fields = {"id", "target_provider_id", "target_model_id", "multiplier", "enabled"}
-    existing = {item["id"]: item for item in store.key_model_mappings(fingerprint=fingerprint, enabled=None)}
+    # Key rows are grouped by normalized hostname. Resolve all underlying
+    # credentials so a group edit cannot silently update only the first key.
+    member_fingerprints = store.api_key_group_fingerprints(fingerprint)
+    existing = {
+        item["id"]: item
+        for member in member_fingerprints
+        for item in store.key_model_mappings(fingerprint=member, enabled=None)
+    }
     try:
         for mapping in body.get("mappings", []):
             if (not isinstance(mapping, dict) or set(mapping) - mapping_fields or
@@ -240,8 +248,10 @@ async def key_resource(request):
                 raise ValueError("invalid key mapping edit")
             store.update_key_model_mapping(mapping["id"], **values)
         policy = {key: body[key] for key in ("note", "enabled", "max_parallel") if key in body}
-        if policy and not store.update_policy(fingerprint, policy):
-            return web.json_response({"error": "provider not found"}, status=404)
+        if policy:
+            for member in member_fingerprints:
+                if not store.update_policy(member, policy):
+                    return web.json_response({"error": "provider not found"}, status=404)
     except (ValueError, sqlite3.IntegrityError) as exc:
         return web.json_response({"error": str(exc)}, status=409)
     return web.json_response(store.api_key_resource(fingerprint, window, include_mappings=True))
@@ -263,19 +273,21 @@ async def stages(request):
 
 async def stage_test(request):
     body = await request.json()
-    if (not isinstance(body, dict) or set(body) != {"stage", "model"} or
-            body["stage"] not in ("standard", "smart", "expert") or
-            not isinstance(body["model"], str) or not body["model"].strip()):
-        return web.json_response({"error": "stage and canonical model are required"}, status=400)
-    model = canonicalize(body["model"])
-    targets = request.app["store"].stage_test_providers(body["stage"], model)
+    if (not isinstance(body, dict) or set(body) != {"stage"} or
+            body.get("stage") not in ("standard", "smart", "expert")):
+        return web.json_response({"error": "stage is required"}, status=400)
+    targets = request.app["store"].stage_test_providers(body["stage"])
     results = await run_probe(
         request.app["store"], tier=body["stage"], mode="all", targets=targets,
         timeout_ms=request.app["settings"].probe_timeout_ms,
         concurrency=request.app["settings"].probe_concurrency,
         clock=request.app["clock"],
     )
-    return web.json_response({"stage": body["stage"], "model": model, "items": results})
+    return web.json_response({
+        "stage": body["stage"],
+        "tested_count": len(results),
+        "succeeded_count": sum(item.get("state") == "succeeded" for item in results),
+    })
 
 
 async def summary(request):
@@ -459,70 +471,6 @@ async def calls(request):
     return web.json_response({"items": items, "next_cursor": next_cursor})
 
 
-def _valid_model_body(body, *, include_model=False, allow_active=False):
-    fields = {'stage', 'family'} | ({'model'} if include_model else set())
-    if allow_active:
-        fields.add('active')
-    return (
-        isinstance(body, dict) and (set(body) == fields if include_model else set(body) <= fields and {'stage', 'family'} <= set(body))
-        and (not include_model or isinstance(body['model'], str) and re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body['model']))
-        and isinstance(body['family'], str) and bool(body['family'].strip())
-        and body['stage'] in ('standard', 'smart', 'expert')
-        and (not allow_active or 'active' not in body or type(body['active']) is bool)
-    )
-
-
-async def pricing_models(request):
-    stage = request.query.get('stage')
-    if stage is not None and stage not in ('standard', 'smart', 'expert'):
-        return web.json_response({'error': 'invalid stage'}, status=400)
-    active = None if request.query.get('include_inactive') == 'true' else True
-    # The Model directory is metadata-only. Pricing rows and key mappings have
-    # their own resources and must not be projected into this response.
-    items = request.app['store'].pricing_models(stage=stage, active=active)
-    return web.json_response({'items': [
-        {key: item[key] for key in ('id', 'stage', 'family', 'active')}
-        for item in items
-    ]})
-
-
-async def create_pricing_model(request):
-    body = await request.json()
-    if not _valid_model_body(body, include_model=True):
-        return web.json_response({'error': 'invalid canonical model'}, status=400)
-    model = canonicalize(body['model'])
-    try:
-        created = request.app['store'].create_canonical_model(model, stage=body['stage'], family=body['family'])
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=400)
-    if not created:
-        return web.json_response({'error': 'model already exists'}, status=409)
-    return web.json_response({'model': model}, status=201)
-
-
-async def update_pricing_model(request):
-    body = await request.json()
-    if not _valid_model_body(body, allow_active=True):
-        return web.json_response({'error': 'invalid canonical model'}, status=400)
-    model = canonicalize(request.match_info['model'])
-    try:
-        updated = request.app['store'].update_canonical_model(
-            model, stage=body['stage'], family=body['family'], active=body.get('active'),
-        )
-    except ValueError as exc:
-        return web.json_response({'error': str(exc)}, status=400)
-    if not updated:
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.json_response({'model': model, 'updated': True})
-
-
-async def deactivate_pricing_model(request):
-    model = canonicalize(request.match_info['model'])
-    if not request.app['store'].deactivate_canonical_model(model):
-        return web.json_response({'error': 'model not found'}, status=404)
-    return web.Response(status=204)
-
-
 def _pricing_provider_payload(row):
     return {
         'id': row['id'], 'provider_key': row['provider_key'], 'name': row['name'],
@@ -539,7 +487,7 @@ async def pricing_provider_api(request):
         return web.json_response({'items': [_pricing_provider_payload(row) for row in rows]})
     body = await request.json()
     required = {'provider_key', 'name', 'provider_type'}
-    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in ('official', 'direct', 'relay'):
+    if not isinstance(body, dict) or set(body) != required or not isinstance(body['provider_key'], str) or len(body['provider_key'].strip()) > 128 or not body['provider_key'].strip() or not isinstance(body['name'], str) or len(body['name'].strip()) > 256 or not body['name'].strip() or body['provider_type'] not in PROVIDER_TYPES:
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     try:
         provider_id = store.create_pricing_provider(body['provider_key'], provider_type=body['provider_type'], name=body['name'])
@@ -564,7 +512,7 @@ async def update_pricing_provider_api(request):
     if not isinstance(body, dict) or not body or not set(body) <= {'name', 'provider_type', 'active'}:
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     values = {key: body.get(key, current[key]) for key in ('name', 'provider_type')}
-    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in ('official', 'direct', 'relay'):
+    if not isinstance(values['name'], str) or len(values['name'].strip()) > 256 or not values['name'].strip() or values['provider_type'] not in PROVIDER_TYPES:
         return web.json_response({'error': 'invalid pricing provider'}, status=400)
     if 'active' in body and type(body['active']) is not bool:
         return web.json_response({'error': 'active must be boolean'}, status=400)
@@ -788,8 +736,13 @@ async def update_policy(request):
     )
     if not valid:
         return web.json_response({"error": "invalid policy"}, status=400)
-    if not request.app["store"].update_policy(request.match_info["fingerprint"], body):
+    store = request.app["store"]
+    members = store.api_key_group_fingerprints(request.match_info["fingerprint"])
+    if not members:
         return web.json_response({"error": "provider not found"}, status=404)
+    for member in members:
+        if not store.update_policy(member, body):
+            return web.json_response({"error": "provider not found"}, status=404)
     return web.json_response({"updated": True})
 
 
@@ -971,43 +924,6 @@ async def json_contract(request, handler):
         return web.json_response({"error": "request body must be valid JSON"}, status=400)
 
 
-async def health_results(request):
-    tier = request.query.get("stage")
-    if tier not in ("standard", "smart", "expert"):
-        return web.json_response({"error": "invalid stage"}, status=400)
-    return web.json_response({"items": request.app["store"].health_results(tier, request.query.get("fingerprint"), request.query.get("model"))})
-
-
-async def probe(request):
-    try:
-        body = await request.json()
-    except Exception:
-        body = None
-    allowed = {"stage", "mode", "fingerprint", "model", "timeout_ms", "concurrency", "contract", "record"}
-    if not isinstance(body, dict) or not set(body) <= allowed or body.get("stage") not in ("standard", "smart", "expert") or body.get("mode") not in ("race", "all"):
-        return web.json_response({"error": "invalid probe request"}, status=400)
-    timeout_ms = body.get("timeout_ms", request.app["settings"].probe_timeout_ms)
-    concurrency = body.get("concurrency", request.app["settings"].probe_concurrency)
-    contract = body.get("contract", "structured")
-    record = body.get("record", True)
-    if type(timeout_ms) is not int or not 100 <= timeout_ms <= 120_000 or type(concurrency) is not int or not 1 <= concurrency <= 32 or contract not in {"plain", "structured"} or type(record) is not bool:
-        return web.json_response({"error": "invalid probe request"}, status=400)
-    results = await run_probe(request.app["store"], tier=body["stage"], mode=body["mode"], fingerprint=body.get("fingerprint"),
-                              model=body.get("model"), timeout_ms=timeout_ms, concurrency=concurrency, contract=contract, record=record,
-                              clock=request.app["clock"])
-    return web.json_response({"items": results})
-
-
-async def test_provider_keys(request):
-    results = await run_probe(
-        request.app["store"], tier="all", mode="all",
-        timeout_ms=request.app["settings"].probe_timeout_ms,
-        concurrency=request.app["settings"].probe_concurrency,
-        clock=request.app["clock"],
-    )
-    return web.json_response({"items": results, "total_keys": len(request.app["store"].inventory())})
-
-
 def create_app(settings: Settings, *, clock=None):
     app = web.Application(middlewares=[json_contract])
     app["settings"] = settings
@@ -1051,20 +967,17 @@ def create_app(settings: Settings, *, clock=None):
         web.patch("/admin/v1/balances/{site}", update_balance_site), web.post("/admin/v1/balances/{site}/login", login_balance_site), web.post("/admin/v1/balances/{site}/cookie", import_balance_cookie), web.post("/admin/v1/balances/{site}/browser-login", open_balance_browser_login), web.post("/admin/v1/balances/{site}/browser-confirm", confirm_balance_browser_login), web.post("/admin/v1/balances/{site}/sync", sync_balance_sites),
         web.post("/v1/generate", generate), web.post("/v1/generate/stream", stream), web.post("/admin/v1/sync", sync), web.post("/admin/v1/providers/register", register_providers),
         web.get("/admin/v1/sites", sites), web.patch("/admin/v1/sites/{site_id}", update_site), web.patch("/admin/v1/capacity", update_global_capacity),
-        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers), web.post("/admin/v1/providers/test", test_provider_keys),
+        web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers),
         web.get("/admin/v1/keys", keys), web.get("/admin/v1/keys/{fingerprint}", key_resource), web.patch("/admin/v1/keys/{fingerprint}", key_resource),
         web.put("/admin/v1/policy/{fingerprint}", update_policy), web.patch("/admin/v1/policy/{fingerprint}", update_policy),
         web.get("/admin/v1/stages", stages), web.post("/admin/v1/stages/test", stage_test), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
-        web.get("/admin/v1/models", pricing_models), web.post("/admin/v1/models", create_pricing_model),
-        web.put("/admin/v1/models/{model}", update_pricing_model), web.patch("/admin/v1/models/{model}", update_pricing_model), web.delete("/admin/v1/models/{model}", deactivate_pricing_model),
         web.get("/admin/v1/pricing/providers", pricing_provider_api), web.post("/admin/v1/pricing/providers", pricing_provider_api),
         web.put("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.patch("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.delete("/admin/v1/pricing/providers/{provider_id}", deactivate_pricing_provider_api),
         web.get("/admin/v1/pricing", pricing_api), web.post("/admin/v1/pricing", pricing_api),
         web.get("/admin/v1/pricing/mappings", key_model_mappings_api), web.post("/admin/v1/pricing/mappings", key_model_mappings_api),
         web.put("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.patch("/admin/v1/pricing/mappings/{mapping_id}", update_key_model_mapping_api), web.delete("/admin/v1/pricing/mappings/{mapping_id}", deactivate_key_model_mapping_api),
         web.put("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.patch("/admin/v1/pricing/{provider_id}/{model_id}", update_pricing_api), web.delete("/admin/v1/pricing/{provider_id}/{model_id}", deactivate_pricing_api),
-        web.get("/admin/v1/health", health_results), web.post("/admin/v1/probes", probe),
     ])
     return app
 

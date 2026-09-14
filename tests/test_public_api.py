@@ -266,7 +266,7 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     assert result_body['ttft_ms'] >= 0
     audit=(await (await client.get('/admin/v1/calls?limit=1',headers=headers)).json())['items'][0]
     assert audit['status']=='completed' and audit['intellect']=='standard' and audit['effort']=='medium'
-    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] is None
+    assert audit['output_tokens']==2 and audit['request_id']=='req-stream' and audit['cost'] == 0.0001
     assert 'hi' not in str(audit) and 'provider-secret' not in str(audit)
     streamed=await client.post('/v1/generate/stream',json={'prompt':'hi','intellect':'standard'})
     assert streamed.headers['Content-Type'].startswith('text/event-stream')
@@ -446,76 +446,7 @@ async def test_model_upgrade_is_accepted_and_recorded_as_fulfilled_intellect(cli
     audit=(await (await client.get('/admin/v1/calls?limit=10',headers=headers)).json())['items']
     assert len(audit)==1 and audit[0]['status']=='completed'
     assert audit[0]['requested_model']=='gpt-5.6-luna' and audit[0]['actual_model']=='gpt-5.6-terra'
-    health = await client.get('/admin/v1/health?stage=standard', headers=headers)
-    assert (await health.json())['items'][0]['state'] == 'healthy'
-
-
-async def test_manual_probe_can_target_an_open_provider(client, cpa):
-    await client.post('/admin/v1/sync')
-    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    store = client.app['store']
-    store.record_health(provider['fingerprint'], 'gpt-5.6-luna', success=False, real=True, immediate_open=True)
-
-    probe = await client.post('/admin/v1/probes', json={
-        'stage': 'standard', 'mode': 'all', 'fingerprint': provider['fingerprint'],
-        'model': 'gpt-5.6-luna', 'timeout_ms': 10_000, 'concurrency': 1,
-    })
-
-    body = await probe.json()
-    assert probe.status == 200
-    assert len(body['items']) == 1
-    assert body['items'][0]['model'] == 'gpt-5.6-luna'
-
-
-async def test_half_open_failure_reopens_without_retrying_the_same_provider(client, cpa):
-    cpa.app['config'] = {'providers': [{'name': 'Recovery candidate', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
-        {'key': 'recovery-key', 'models': ['gpt-5.6-luna']},
-    ]}]}
-    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer recovery-key': {'status': 503}}
-    await client.post('/admin/v1/sync')
-    provider = client.app['store'].providers('standard')[0]
-    client.app['store'].record_health(provider.fingerprint, provider.models[0], success=False, real=True, immediate_open=True)
-
-    recovered = await client.post('/admin/v1/probes', json={
-        'stage': 'standard', 'mode': 'all', 'fingerprint': provider.fingerprint,
-        'model': provider.models[0], 'timeout_ms': 10_000, 'concurrency': 1,
-    })
-    assert recovered.status == 200
-    assert (await recovered.json())['items'][0]['state'] == 'succeeded'
-    assert client.app['store'].health(provider.fingerprint, provider.models[0])['state'] == 'half_open'
-
-    failed = await client.post('/v1/generate', json={'prompt': 'recover-or-reopen', 'intellect': 'standard'})
-
-    body = await failed.json()
-    assert failed.status == 503
-    assert [attempt['status'] for attempt in body['attempts']] == ['unavailable']
-    health = client.app['store'].health(provider.fingerprint, provider.models[0])
-    assert health['state'] == 'open' and health['consecutive_failures'] == 1
-    assert cpa.app['upstream_app']['hedge_requests'] == ['Bearer recovery-key']
-
-
-async def test_successful_probe_keeps_a_recent_real_failure_suspect(client, cpa):
-    cpa.app['config'] = {'providers': [{'name': 'Schema candidate', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
-        {'key': 'schema-key', 'models': ['gpt-5.6-luna']},
-    ]}]}
-    cpa.app['upstream_app']['hedge_behaviors'] = {'Bearer schema-key': {'status': 400}}
-    await client.post('/admin/v1/sync')
-    provider = client.app['store'].providers('standard')[0]
-
-    failed = await client.post('/v1/generate', json={'prompt': 'long structured research shape ' + 'e' * 33_000, 'intellect': 'standard'})
-
-    assert failed.status == 503
-    assert client.app['store'].health(provider.fingerprint, provider.models[0])['state'] == 'suspect'
-
-    cpa.app['upstream_app']['hedge_behaviors'] = {}
-    recovered = await client.post('/admin/v1/probes', json={
-        'stage': 'standard', 'mode': 'all', 'fingerprint': provider.fingerprint,
-        'model': provider.models[0], 'timeout_ms': 10_000, 'concurrency': 1,
-    })
-
-    assert recovered.status == 200
-    health = await client.get('/admin/v1/health?stage=standard')
-    assert (await health.json())['items'][0]['state'] == 'half_open'
+    assert (await client.get('/admin/v1/health?stage=standard', headers=headers)).status == 404
 
 
 async def test_six_smart_schema_calls_recover_an_open_independent_provider(client, cpa):
@@ -601,99 +532,13 @@ async def test_six_long_smart_schema_calls_do_not_preemptively_consume_expert_ca
     assert set(fallback_statuses[2:]) <= {'cancelled'}
 
 
-async def test_plain_diagnostic_probe_does_not_mutate_health(client, cpa):
-    await client.post('/admin/v1/sync')
-    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    before = client.app['store'].health(provider['fingerprint'], 'gpt-5.6-luna')
-
-    response = await client.post('/admin/v1/probes', json={
-        'stage': 'standard', 'mode': 'all', 'fingerprint': provider['fingerprint'],
-        'model': 'gpt-5.6-luna', 'timeout_ms': 10_000, 'concurrency': 1,
-        'contract': 'plain', 'record': False,
-    })
-
-    assert response.status == 200 and len((await response.json())['items']) == 1
-    assert client.app['store'].health(provider['fingerprint'], 'gpt-5.6-luna') == before
-
-
-async def test_manual_probe_is_isolated_from_call_quality_and_records_health(client, cpa):
-    headers = {'Authorization': 'Bearer admin-secret'}
-    await client.post('/admin/v1/sync', headers=headers)
-    before = await (await client.get('/admin/v1/quality?window=24h', headers=headers)).json()
-    probe = await client.post('/admin/v1/probes', headers=headers, json={'stage': 'standard', 'mode': 'all'})
-    result = await probe.json()
-    assert probe.status == 200 and len(result['items']) == 1 and result['items'][0]['state'] == 'succeeded'
-    envelope = json.loads(cpa.app['upstream_app']['last_response_payload']['input'])
-    assert envelope['output_schema'] == {
-        'type': 'object', 'required': ['healthy'], 'properties': {'healthy': {'type': 'boolean'}},
-        'additionalProperties': False,
-    }
-    after = await (await client.get('/admin/v1/quality?window=24h', headers=headers)).json()
-    assert after == before
-    health = await (await client.get('/admin/v1/health?stage=standard', headers=headers)).json()
-    assert health['items'][0]['state'] == 'healthy' and health['items'][0]['ttft_ms'] is not None
-
-
-async def test_one_click_key_test_updates_latest_ttft_and_real_use_supersedes_it(client, cpa):
-    await client.post('/admin/v1/sync')
-
-    tested = await client.post('/admin/v1/providers/test')
-    result = await tested.json()
-    assert tested.status == 200 and result['total_keys'] == len(result['items']) == 1
-    assert result['items'][0]['state'] == 'succeeded' and result['items'][0]['ttft_ms'] is not None
-
-    provider = (await (await client.get('/admin/v1/providers')).json())['providers'][0]
-    stage = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
-    assert stage['latest_test']['ttft_ms'] == result['items'][0]['ttft_ms']
-    assert stage['latest_test']['status'] == 'succeeded'
-
-    store = client.app['store']
-    with store.conn:
-        store.conn.execute("UPDATE probe_event SET created_at='2026-01-01T00:00:00+00:00'")
-        store.conn.execute("""INSERT INTO observation(
-            fingerprint,requested_model,actual_model,tier,success,latency_ms,status,created_at
-        ) VALUES(?,?,?,?,?,?,?,?)""", (
-            provider['fingerprint'], 'gpt-5.6-luna', 'gpt-5.6-luna', 'standard', 1, 42.5,
-            'completed', '2099-01-01T00:00:00+00:00',
-        ))
-
-    refreshed = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
-    assert refreshed['latest_test']['ttft_ms'] == result['items'][0]['ttft_ms']
-
-    store.record_probe(
-        fingerprint=provider['fingerprint'], model='gpt-5.6-luna', tier='standard', mode='all',
-        reachable=True, responded=False, first_token=False, model_matched=False,
-        ttfb_ms=None, ttft_ms=None, duration_ms=10000, error_type='first_token_timeout',
-        error='first_token_timeout', now=datetime(2100, 1, 1, tzinfo=UTC),
-    )
-    failed_latest = next(item for item in (await (await client.get('/admin/v1/stages')).json())['items'] if item['model'] == 'gpt-5.6-luna')
-    assert failed_latest['latest_test']['ttft_ms'] is None
-    assert failed_latest['latest_test']['status'] == 'first_token_timeout'
-    assert failed_latest['latest_test']['at'] == '2100-01-01T00:00:00+00:00'
-
-
-async def test_one_click_key_test_probes_every_enabled_model(client, cpa):
-    cpa.app['config'] = {'providers': [{'name': 'Multi-model key', 'base_url': cpa.app['upstream'], 'type': 'openai', 'keys': [
-        {'key': 'multi-model-key', 'models': ['gpt-5.6-luna', 'gpt-5.6-terra']},
-    ]}]}
-    cpa.app['upstream_app']['models'] = ['gpt-5.6-luna', 'gpt-5.6-terra']
-
-    await client.post('/admin/v1/sync')
-    tested = await client.post('/admin/v1/providers/test')
-    result = await tested.json()
-
-    assert tested.status == 200
-    assert result['total_keys'] == 1
-    assert [item['model'] for item in result['items']] == ['gpt-5.6-luna', 'gpt-5.6-terra']
-    assert all(item['state'] == 'succeeded' for item in result['items'])
-
 async def test_web_console_is_direct_and_management_api_needs_no_session(client):
     response=await client.get('/')
     assert response.status == 200
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('最近同步','从 CPA 手动同步','API Key','Stage + canonical Model','Provider + Model 价格','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','API Key','Stage','Provider + Model 价格','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
     assert '中转站余额' not in page
     assert 'CPA 是唯一人工维护源' not in page
@@ -778,23 +623,15 @@ async def test_catalog_rejects_incomplete_and_unknown_updates(client):
 
 async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(client):
     headers = {'Authorization': 'Bearer admin-secret'}
-    created_model = await client.post('/admin/v1/models', headers=headers, json={
-        'model': 'api-model', 'stage': 'smart', 'family': 'API Family',
-    })
-    assert created_model.status == 201
-
-    model = await client.get('/admin/v1/models?stage=smart', headers=headers)
-    models = (await model.json())['items']
-    api_model = next(item for item in models if item['id'] == 'api-model')
-    assert api_model == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
-    assert not {'input_price', 'cache_price', 'output_price'} & api_model.keys()
+    assert (await client.get('/admin/v1/models?stage=smart', headers=headers)).status == 404
+    client.app['store'].create_canonical_model('api-model', stage='smart', family='API Family')
 
     assert (await client.post('/admin/v1/pricing/providers', headers=headers, json={
-        'provider_key': 'legacy-provider-field', 'name': 'Rejected', 'provider_type': 'direct', 'multiplier': 2,
+            'provider_key': 'legacy-provider-field', 'name': 'Rejected', 'provider_type': 'direct', 'multiplier': 2,
     })).status == 400
 
     provider_response = await client.post('/admin/v1/pricing/providers', headers=headers, json={
-        'provider_key': 'api-direct', 'name': 'API Direct', 'provider_type': 'direct',
+        'provider_key': 'api-openai', 'name': 'API OpenAI', 'provider_type': 'openai',
     })
     assert provider_response.status == 201
     provider = await provider_response.json()
@@ -811,11 +648,11 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     })
     assert duplicate.status == 409
 
-    listed = await client.get('/admin/v1/pricing?provider=api-direct&model=api-model&currency=USD', headers=headers)
+    listed = await client.get('/admin/v1/pricing?provider=api-openai&model=api-model&currency=CNY', headers=headers)
     item = (await listed.json())['items'][0]
     assert item == {
         'id': item['id'], 'active': True,
-        'provider': {'id': provider['id'], 'name': 'API Direct', 'provider_key': 'api-direct'},
+        'provider': {'id': provider['id'], 'name': 'API OpenAI', 'provider_key': 'api-openai'},
         'model': {'id': 'api-model'}, 'output_price_cny': 4.0,
     }
     assert not {'stage', 'source', 'source_kind', 'source_name', 'source_url', 'source_evidence', 'currency'} & item.keys()
@@ -836,11 +673,11 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     })
     assert updated.status == 200
     assert (await client.delete(f"/admin/v1/pricing/{provider['id']}/api-model", headers=headers)).status == 204
-    inactive = await client.get('/admin/v1/pricing?provider=api-direct&include_inactive=true', headers=headers)
+    inactive = await client.get('/admin/v1/pricing?provider=api-openai&include_inactive=true', headers=headers)
     assert (await inactive.json())['items'][0]['active'] is False
 
 
-async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without_legacy_writes(client, cpa):
+async def test_pricing_api_validates_removed_binding_api_and_exposes_inventory_without_legacy_writes(client, cpa):
     headers = {'Authorization': 'Bearer admin-secret'}
     await client.post('/admin/v1/sync', headers=headers)
     store = client.app['store']
@@ -848,7 +685,7 @@ async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without
     provider = store.conn.execute('SELECT pricing_provider_id FROM source_provider WHERE fingerprint=?', (inventory['fingerprint'],)).fetchone()[0]
     model = 'gpt-5.6-luna'
     relay = await client.post('/admin/v1/pricing/providers', headers=headers, json={
-        'provider_key': 'api-relay', 'name': 'API Relay', 'provider_type': 'relay',
+        'provider_key': 'api-anthropic', 'name': 'API Anthropic', 'provider_type': 'anthropic',
     })
     assert relay.status == 201
     relay_id = (await relay.json())['id']
@@ -858,7 +695,7 @@ async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without
         'provider_id': relay_id, 'model_id': model, 'output_price_cny': 8.4,
     })
     assert direct_price.status == 201
-    relay_view = await client.get('/admin/v1/pricing?provider=api-relay&model=gpt-5.6-luna', headers=headers)
+    relay_view = await client.get('/admin/v1/pricing?provider=api-anthropic&model=gpt-5.6-luna', headers=headers)
     relay_item = (await relay_view.json())['items'][0]
     assert relay_item['output_price_cny'] == 8.4
     assert not {'stage', 'source', 'base_price', 'final_price', 'binding'} & relay_item.keys()
@@ -886,7 +723,7 @@ async def test_catalog_deletions_survive_a_store_restart(client):
     reopened = Store(client.app['settings'].database_path, client.app['settings'].key_bytes())
 
     try:
-        assert 'gpt-5.5' in reopened.model_directory()
+        assert 'gpt-5.5' in reopened.canonical_models()
     finally:
         reopened.conn.close()
 

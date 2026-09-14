@@ -54,18 +54,16 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
         raise ValueError("invalid probe contract")
     now = (clock or (lambda: datetime.now(UTC)))()
     candidates = list(targets) if targets is not None else (store.providers(tier) if mode == "race" else [])
-    if targets is None and tier == "all":
-        candidates = store.key_test_providers()
-    elif targets is None and mode == "all":
-        # A filtered manual probe must always reach its explicit target, including
-        # an open circuit. Due-target preselection can otherwise select another
-        # row and leave the requested target with an empty result.
+    if targets is None and mode == "all":
+        # Scheduled recovery probes pass an explicit target, including an open
+        # circuit. Stage-triggered tests enumerate their callable pairs here.
         if fingerprint and model:
             candidates = [store.probe_provider(fingerprint, model)]
         else:
-            rows = store.health_results(tier, fingerprint, model)
-            candidates = [store.probe_provider(row["fingerprint"], row["model"]) for row in rows]
-    catalog = store.model_directory()
+            candidates = store.stage_test_providers(tier)
+            if fingerprint:
+                candidates = [candidate for candidate in candidates if candidate.fingerprint == fingerprint]
+    catalog = store.canonical_models()
     candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("stage") == tier)
                   and (not fingerprint or candidate.fingerprint == fingerprint) and (not model or candidate.models[0] == model)]
     if mode == "race" and targets is None:
@@ -166,7 +164,7 @@ async def scheduler(app):
                 for fingerprint, model in due:
                     provider = store.probe_provider(fingerprint, model)
                     if provider:
-                        catalog = store.model_directory()[model]
+                        catalog = store.canonical_models()[model]
                         await run_probe(store, tier=catalog["stage"], mode="all", fingerprint=fingerprint, model=model,
                                         timeout_ms=settings.probe_timeout_ms, concurrency=settings.probe_concurrency, clock=clock)
             await asyncio.sleep(max(1, settings.health_scheduler_seconds))

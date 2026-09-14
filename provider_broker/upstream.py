@@ -4,6 +4,7 @@ from collections import deque
 import hashlib
 import json
 import logging
+import math
 import random
 import time
 import uuid
@@ -301,28 +302,22 @@ def estimate_cost_details(model: str, usage: dict, multiplier: float = 1.0, pric
     if pricing is None:
         return {"cost": None, "reason": "key-model mapping price is missing"}
     input_tokens, output_tokens = usage.get("input_tokens"), usage.get("output_tokens")
-    if "priced" in pricing:
-        priced = bool(pricing["priced"])
-    else:
-        priced = any(
-            isinstance(pricing.get(key), (int, float)) and pricing[key] > 0
-            for key in ("input_price", "cache_price", "output_price")
-        )
-    if not priced:
+    output_price_cny = pricing.get("output_price_cny")
+    if pricing.get("priced") is not True or (
+        type(output_price_cny) not in (int, float)
+        or not math.isfinite(output_price_cny)
+        or output_price_cny <= 0
+    ):
         return {"cost": None, "reason": pricing.get("reason") or "model price is unknown"}
-    if not isinstance(input_tokens, int) or not isinstance(output_tokens, int):
+    if type(input_tokens) is not int or type(output_tokens) is not int:
         return {"cost": None, "reason": "token usage is incomplete"}
-    details = usage.get("input_tokens_details") if isinstance(usage.get("input_tokens_details"), dict) else {}
-    cached = details.get("cached_tokens", 0) if isinstance(details.get("cached_tokens", 0), int) else 0
-    cached = max(0, min(input_tokens, cached))
-    uncached = max(0, input_tokens - cached)
-    input_price = pricing.get("input_price")
-    cache_price = pricing.get("cache_price")
-    output_price = pricing.get("output_price")
-    if not all(isinstance(value, (int, float)) for value in (input_price, cache_price, output_price)):
-        return {"cost": None, "reason": "provider model price is incomplete"}
-    cost = (uncached * input_price + cached * cache_price + output_tokens * output_price) / 1_000_000
-    return {"cost": round(cost * multiplier, 10), "reason": None}
+    if type(multiplier) not in (int, float) or not math.isfinite(multiplier) or multiplier <= 0:
+        return {"cost": None, "reason": "key-model mapping multiplier is invalid"}
+    # There is one monetary truth. Cached and uncached input tokens use
+    # exactly the same CNY output rate as generated tokens; the mapping
+    # multiplier is the only runtime adjustment.
+    cost = (input_tokens + output_tokens) * float(output_price_cny) / 1_000_000
+    return {"cost": round(cost * float(multiplier), 10), "reason": None}
 
 
 def estimate_cost(model: str, usage: dict, multiplier: float, pricing=None) -> float | None:

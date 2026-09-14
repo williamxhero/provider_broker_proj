@@ -5,6 +5,7 @@ from urllib.parse import urlsplit
 from aiohttp import ClientSession
 
 from .catalog import canonicalize
+from .pricing import canonical_provider_type
 
 
 _CHAT_API_ROOTS = (
@@ -103,6 +104,11 @@ def _registration_entries(value: object) -> list[dict]:
                 raise ValueError("provider model names must be bounded strings")
             model_names.append(model.strip())
         provider_type = _provider_label(item.get("provider_type") or item.get("type") or item.get("provider") or "openai")
+        pricing_provider_type = canonical_provider_type(
+            provider_type, base_url=base_url, models=model_names,
+        )
+        if pricing_provider_type is None:
+            raise ValueError("unsupported provider type")
         name = item.get("name") or item.get("site_name") or provider_type
         if not isinstance(name, str) or not name.strip() or len(name) > 160 or "\r" in name or "\n" in name:
             raise ValueError("provider name must be a bounded string")
@@ -112,6 +118,7 @@ def _registration_entries(value: object) -> list[dict]:
             "name": name.strip(), "site_name": str(item.get("site_name") or name).strip()[:160],
             "base_url": base_url, "api_key": api_key, "models": list(dict.fromkeys(model_names)),
             "provider_type": provider_type,
+            "pricing_provider_type": pricing_provider_type,
         })
     return result
 
@@ -372,7 +379,11 @@ def expand_config(payload: object) -> list[dict]:
                     if visible_name and secret in visible_name:
                         visible_name = None
                     request_headers = defaults | _request_headers(key.get('headers')) | _request_headers(credential.get('headers'))
-                    result.append({'name':visible_name or section,'site_name':visible_name,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':_provider_type(base, family),'request_headers':request_headers,'source':{'section':section,'site_name':visible_name}})
+                    transport_type = _provider_type(base, family)
+                    pricing_type = canonical_provider_type(family, base_url=base)
+                    if pricing_type is None:
+                        raise ValueError("unsupported provider type")
+                    result.append({'name':visible_name or section,'site_name':visible_name,'base_url':base,'api_key':secret,'models':['unavailable'],'aliases':aliases,'provider_type':transport_type,'pricing_provider_type':pricing_type,'request_headers':request_headers,'source':{'section':section,'site_name':visible_name,'provider_type':pricing_type}})
         return result
     roots = payload.get("providers", payload.get("data", payload)) if isinstance(payload, dict) else payload
     if isinstance(roots, dict): roots = roots.values()
@@ -396,7 +407,11 @@ def expand_config(payload: object) -> list[dict]:
                     site_name = None
                 request_headers = _request_headers(provider.get("headers"))
                 request_headers.update(_request_headers(key.get("headers")))
-                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names,"provider_type":_provider_type(normalized_base, kind, provider.get("protocol") or key.get("protocol")),"request_headers":request_headers,"source":{"site_name":site_name}})
+                transport_type = _provider_type(normalized_base, kind, provider.get("protocol") or key.get("protocol"))
+                pricing_type = canonical_provider_type(kind, base_url=normalized_base, models=names)
+                if pricing_type is None:
+                    raise ValueError("unsupported provider type")
+                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names,"provider_type":transport_type,"pricing_provider_type":pricing_type,"request_headers":request_headers,"source":{"site_name":site_name,"provider_type":pricing_type}})
     return result
 
 

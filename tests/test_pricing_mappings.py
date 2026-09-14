@@ -15,43 +15,47 @@ def make_store(tmp_path: Path) -> Store:
 def test_key_model_mapping_is_unique_and_is_the_only_runtime_multiplier(tmp_path):
     db = make_store(tmp_path)
     db.replace_source_snapshot([{
-        "name": "direct", "base_url": "https://direct.example/v1", "api_key": "secret",
+        "name": "openai", "base_url": "https://openai.example/v1", "api_key": "secret",
         "provider_type": "openai", "models": ["gpt-5.6-luna"],
-        "source": {"provider_type": "direct", "inventory_status": "available"},
+        "source": {"provider_type": "openai", "inventory_status": "available"},
     }], "2026-09-14T00:00:00Z")
     fingerprint = db.conn.execute("SELECT fingerprint FROM source_provider").fetchone()[0]
-    official_id = db.conn.execute(
-        "SELECT id FROM pricing_provider WHERE provider_key='official-seed'"
+    provider_id = db.conn.execute(
+        "SELECT pricing_provider_id FROM source_provider WHERE fingerprint=?", (fingerprint,)
     ).fetchone()[0]
+    db.upsert_provider_model_price(provider_id=provider_id, model_id="gpt-5.6-sol", output_price_cny=20)
     mapping_id = db.upsert_key_model_mapping(
-        fingerprint, "gpt-5.6", target_provider_id=official_id,
+        fingerprint, "gpt-5.6", target_provider_id=provider_id,
         target_model_id="gpt-5.6-sol", multiplier=1.25,
     )
     db.conn.execute("UPDATE policy SET multiplier=9.0 WHERE fingerprint=?", (fingerprint,))
-    db.conn.execute("UPDATE pricing_provider SET multiplier=8.0 WHERE id=?", (official_id,))
+    db.conn.execute("UPDATE pricing_provider SET multiplier=8.0 WHERE id=?", (provider_id,))
     db.conn.commit()
 
     resolved = db.effective_key_pricing(fingerprint, "gpt-5.6")
     assert resolved["mapping_id"] == mapping_id
     assert resolved["multiplier"] == 1.25
-    assert resolved["input_price"] == db.effective_pricing(official_id, "gpt-5.6-sol")["input_price"] * 1.25
+    assert resolved["input_price"] == db.effective_pricing(provider_id, "gpt-5.6-sol")["input_price"] * 1.25
     with pytest.raises(sqlite3.IntegrityError):
         db.create_key_model_mapping(
-            fingerprint, "gpt-5.6-sol", target_provider_id=official_id,
+            fingerprint, "gpt-5.6", target_provider_id=provider_id,
             target_model_id="gpt-5.6-sol",
         )
 
 
-def test_relay_mapping_has_an_explicit_endpoint_price_and_missing_mapping_is_unknown(tmp_path):
+def test_mapping_has_an_explicit_endpoint_price_and_missing_mapping_is_unknown(tmp_path):
     db = make_store(tmp_path)
     db.replace_source_snapshot([{
-        "name": "relay", "base_url": "https://relay.example/v1", "api_key": "relay-secret",
-        "provider_type": "relay", "models": ["gpt-5.6-sol"],
-        "source": {"provider_type": "relay", "inventory_status": "available"},
+        "name": "deepseek", "base_url": "https://api.deepseek.com/v1", "api_key": "deepseek-secret",
+        "provider_type": "deepseek", "models": ["gpt-5.6-sol"],
+        "source": {"provider_type": "deepseek", "inventory_status": "available"},
     }], "2026-09-14T00:00:00Z")
     fingerprint, = db.conn.execute("SELECT fingerprint FROM source_provider").fetchone()
     mapping = db.key_model_mappings(fingerprint=fingerprint)[0]
-    assert mapping["target_provider_key"] == "key-source:relay:relay.example"
+    provider_id = mapping["target_provider_id"]
+    db.upsert_provider_model_price(provider_id=provider_id, model_id="gpt-5.6-sol", output_price_cny=0, unpriced=True)
+    mapping = db.key_model_mappings(fingerprint=fingerprint)[0]
+    assert mapping["target_provider_key"] == "deepseek"
     assert db.effective_key_pricing(fingerprint, "gpt-5.6-sol")["priced"] is False
     assert db.effective_key_pricing(fingerprint, "gpt-5.6-sol")["reason"] == "provider model price is explicitly unpriced"
     assert db.effective_key_pricing(fingerprint, "gpt-5.6-luna")["reason"] == "key-model mapping is missing or disabled"

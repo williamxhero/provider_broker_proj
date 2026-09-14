@@ -12,11 +12,10 @@ def make_store(tmp_path):
 
 def test_only_key_mapping_multiplier_changes_authoritative_cost(tmp_path):
     db = make_store(tmp_path)
-    provider_id = db.create_pricing_provider("spec71-direct", provider_type="direct", name="Spec 71")
+    provider_id = db.create_pricing_provider("spec71-openai", provider_type="openai", name="Spec 71")
     db.create_canonical_model("spec71-model", stage="smart", family="Spec 71")
     db.insert_provider_model_price(
-        provider_id=provider_id, model_id="spec71-model", source_kind="direct",
-        input_price=2, cache_price=.2, output_price=8, currency="USD",
+        provider_id=provider_id, model_id="spec71-model", output_price_cny=8,
         source_name="Spec 71 table", source_url="https://prices.example/spec71",
         source_evidence="fixed endpoint table", verified_at="2026-09-14T00:00:00Z",
     )
@@ -36,8 +35,8 @@ def test_only_key_mapping_multiplier_changes_authoritative_cost(tmp_path):
     resolved = db.effective_key_pricing(fingerprint, "spec71-model")
 
     assert resolved["multiplier"] == 1.5
-    assert resolved["input_price"] == 3.0
-    assert resolved["cache_price"] == .3
+    assert resolved["input_price"] == 12.0
+    assert resolved["cache_price"] == 12.0
     assert resolved["output_price"] == 12.0
     assert "multiplier" not in db.pricing_providers()[0]
     assert "multiplier" not in db.provider_model_prices()[0]
@@ -45,7 +44,7 @@ def test_only_key_mapping_multiplier_changes_authoritative_cost(tmp_path):
 
 def test_legacy_price_rows_and_relay_bindings_are_non_authoritative(tmp_path):
     db = make_store(tmp_path)
-    provider_id = db.create_pricing_provider("spec71-legacy-carrier", provider_type="direct")
+    provider_id = db.create_pricing_provider("spec71-legacy-carrier", provider_type="openai")
     db.create_canonical_model("spec71-legacy-model", stage="standard", family="Spec 71")
     db.conn.execute(
         "INSERT INTO provider_model_price(provider_id,model_id,source_kind,input_price,cache_price,output_price,multiplier,currency,legacy,unpriced,active) VALUES(?,?,?,?,?,?,?,?,?,?,1)",
@@ -60,14 +59,13 @@ def test_legacy_price_rows_and_relay_bindings_are_non_authoritative(tmp_path):
         db.bind_relay_price(provider_id, "spec71-legacy-model", provider_id, "spec71-legacy-model")
 
 
-def test_relay_pricing_is_explicit_and_unpriced_is_not_zero_cost(tmp_path):
+def test_unpriced_provider_model_is_not_zero_cost(tmp_path):
     db = make_store(tmp_path)
-    relay_id = db.create_pricing_provider("spec71-relay", provider_type="relay")
+    relay_id = db.create_pricing_provider("spec71-anthropic", provider_type="anthropic")
     db.create_canonical_model("spec71-relay-model", stage="smart", family="Spec 71")
     db.insert_provider_model_price(
-        provider_id=relay_id, model_id="spec71-relay-model", source_kind="relay",
-        input_price=0, cache_price=0, output_price=0, currency="USD", unpriced=True,
-        source_name="awaiting relay quote", source_evidence="intentionally unpriced",
+        provider_id=relay_id, model_id="spec71-relay-model", output_price_cny=0, unpriced=True,
+        source_name="awaiting price quote", source_evidence="intentionally unpriced",
     )
 
     resolved = db.effective_pricing(relay_id, "spec71-relay-model")

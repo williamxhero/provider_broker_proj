@@ -15,17 +15,16 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .catalog import (
     OFFICIAL_PRICE_SNAPSHOT,
     OFFICIAL_PROVIDER_SNAPSHOTS,
-    blended_price,
     canonicalize,
     normalize_hostname,
-    provider_pricing,
 )
+from .pricing import DEFAULT_OUTPUT_PRICE_CNY, PROVIDER_TYPES, canonical_provider_type, require_provider_type
 
 
 TELEMETRY_SCHEMA_VERSION = 1
 ROUTING_POLICY_VERSION = "v1"
 DELIVERY_MODES = {"non_stream", "plain_stream", "validated_stream"}
-PRICING_MIGRATION_VERSION = 3
+PRICING_MIGRATION_VERSION = 4
 ACCOUNTING_WINDOWS = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}
 API_KEY_RESOURCE_FIELDS = frozenset({
     "fingerprint", "normalized_hostname", "status", "note", "api_key_mask",
@@ -34,7 +33,8 @@ API_KEY_RESOURCE_FIELDS = frozenset({
 STAGE_RESOURCE_FIELDS = frozenset({
     "stage", "model", "family", "provider_types", "callable_key_count",
     "latest_test", "technical_success_rate", "avg_first_token_latency_ms",
-    "window", "total_tokens", "fee_buckets", "edit",
+    "window", "total_tokens", "fee_buckets", "edit", "models", "families",
+    "price_bands", "price_boundary_cny",
 })
 
 
@@ -108,6 +108,31 @@ class Store:
         self.default_race_parallel_cap = default_race_parallel_cap
         self._migrate()
 
+    def _upgrade_pricing_provider_schema(self) -> None:
+        """Broaden the old CHECK constraint without changing provider IDs."""
+        row = self.conn.execute(
+            "SELECT sql FROM sqlite_master WHERE type='table' AND name='pricing_provider'"
+        ).fetchone()
+        if row is None or "'openai'" in (row[0] or ''):
+            return
+        self.conn.commit()
+        self.conn.execute("PRAGMA foreign_keys=OFF")
+        try:
+            self.conn.execute("""CREATE TABLE pricing_provider_v4 (
+                id INTEGER PRIMARY KEY,
+                provider_key TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                provider_type TEXT NOT NULL CHECK(provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra','official','direct','relay','legacy-migration')),
+                multiplier REAL NOT NULL DEFAULT 1.0 CHECK(multiplier > 0),
+                active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
+            )""")
+            self.conn.execute("INSERT INTO pricing_provider_v4 SELECT id,provider_key,name,provider_type,multiplier,active FROM pricing_provider")
+            self.conn.execute("DROP TABLE pricing_provider")
+            self.conn.execute("ALTER TABLE pricing_provider_v4 RENAME TO pricing_provider")
+            self.conn.commit()
+        finally:
+            self.conn.execute("PRAGMA foreign_keys=ON")
+
     def _migrate(self):
         self.conn.execute("PRAGMA foreign_keys=ON")
         self.conn.executescript("""
@@ -115,6 +140,7 @@ class Store:
         CREATE TABLE IF NOT EXISTS source_provider (
           id INTEGER PRIMARY KEY, fingerprint TEXT UNIQUE NOT NULL, name TEXT NOT NULL,
           base_url TEXT NOT NULL, api_key BLOB NOT NULL, provider_type TEXT NOT NULL,
+          pricing_provider_type TEXT,
           request_headers BLOB, api_key_mask TEXT NOT NULL DEFAULT '***',
           models_json TEXT NOT NULL, source_json TEXT NOT NULL, synced_at TEXT NOT NULL,
           pricing_provider_id INTEGER REFERENCES pricing_provider(id)
@@ -137,7 +163,7 @@ class Store:
           id INTEGER PRIMARY KEY,
           provider_key TEXT NOT NULL UNIQUE,
           name TEXT NOT NULL,
-          provider_type TEXT NOT NULL CHECK(provider_type IN ('official','direct','relay','legacy-migration')),
+          provider_type TEXT NOT NULL CHECK(provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra','official','direct','relay','legacy-migration')),
           multiplier REAL NOT NULL DEFAULT 1.0 CHECK(multiplier > 0),
           active INTEGER NOT NULL DEFAULT 1 CHECK(active IN (0,1))
         );
@@ -155,6 +181,7 @@ class Store:
           input_price REAL NOT NULL DEFAULT 0 CHECK(input_price >= 0),
           cache_price REAL NOT NULL DEFAULT 0 CHECK(cache_price >= 0),
           output_price REAL NOT NULL DEFAULT 0 CHECK(output_price >= 0),
+          output_price_cny REAL,
           multiplier REAL NOT NULL DEFAULT 1.0 CHECK(multiplier > 0),
           currency TEXT NOT NULL,
           source_name TEXT,
@@ -305,6 +332,7 @@ class Store:
         );
         CREATE INDEX IF NOT EXISTS balance_snapshot_site_time ON balance_snapshot(site_id, id DESC);
         """)
+        self._upgrade_pricing_provider_schema()
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN calibrated INTEGER NOT NULL DEFAULT 0')
         except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE policy ADD COLUMN multiplier REAL NOT NULL DEFAULT 1.0')
@@ -332,11 +360,26 @@ class Store:
         except sqlite3.OperationalError: pass
         try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN pricing_provider_id INTEGER REFERENCES pricing_provider(id)")
         except sqlite3.OperationalError: pass
+        try: self.conn.execute("ALTER TABLE source_provider ADD COLUMN pricing_provider_type TEXT")
+        except sqlite3.OperationalError: pass
         for table in ('provider_model_price', 'relay_price_binding'):
             try: self.conn.execute(f'ALTER TABLE {table} ADD COLUMN source_name TEXT')
             except sqlite3.OperationalError: pass
         try: self.conn.execute('ALTER TABLE provider_model_price ADD COLUMN multiplier REAL NOT NULL DEFAULT 1.0')
         except sqlite3.OperationalError: pass
+        try: self.conn.execute('ALTER TABLE provider_model_price ADD COLUMN output_price_cny REAL')
+        except sqlite3.OperationalError: pass
+        self.conn.execute("UPDATE provider_model_price SET output_price_cny=output_price WHERE output_price_cny IS NULL")
+        for row in self.conn.execute("SELECT fingerprint,provider_type,base_url,models_json,pricing_provider_type FROM source_provider"):
+            if row['pricing_provider_type']:
+                continue
+            try:
+                models = json.loads(row['models_json'])
+            except (TypeError, ValueError):
+                models = []
+            provider_type = canonical_provider_type(row['provider_type'], base_url=row['base_url'], models=models)
+            if provider_type:
+                self.conn.execute("UPDATE source_provider SET pricing_provider_type=? WHERE fingerprint=?", (provider_type, row['fingerprint']))
         # Existing inventories predate explicit site fault domains.  Derive a
         # stable non-secret domain before routing starts so upgrade does not
         # collapse every old key into the synthetic "default" site.
@@ -392,15 +435,15 @@ class Store:
         for model, item in CATALOG.items():
             self.conn.execute(
                 """INSERT OR IGNORE INTO provider_model_price(
-                    provider_id,model_id,source_kind,input_price,cache_price,output_price,currency,
+                    provider_id,model_id,source_kind,input_price,cache_price,output_price,output_price_cny,currency,
                     source_name,source_url,source_evidence,verified_at,legacy,unpriced,active
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
                 (
-                    official_seed_id, model, 'official', item['official_input_price'],
-                    item['official_cache_price'], item['official_output_price'], item.get('currency', 'USD'),
+                    official_seed_id, model, 'official', item['official_output_price_cny'],
+                    item['official_output_price_cny'], item['official_output_price_cny'], item['official_output_price_cny'], 'CNY',
                     OFFICIAL_PRICE_SNAPSHOT['source_name'], OFFICIAL_PRICE_SNAPSHOT['source_url'],
                     OFFICIAL_PRICE_SNAPSHOT['source_evidence'], OFFICIAL_PRICE_SNAPSHOT['verified_at'], 0,
-                    int(not any(item[key] > 0 for key in ('official_input_price', 'official_cache_price', 'official_output_price'))),
+                    int(item['official_output_price_cny'] <= 0),
                 ),
             )
         # Keep official vendor identities separate from the fixed seed. Every
@@ -421,17 +464,17 @@ class Store:
                 )
                 self.conn.execute(
                     """INSERT OR IGNORE INTO provider_model_price(
-                       provider_id,model_id,source_kind,input_price,cache_price,output_price,
+                       provider_id,model_id,source_kind,input_price,cache_price,output_price,output_price_cny,
                        multiplier,currency,source_name,source_url,source_evidence,verified_at,
                        legacy,unpriced,active
-                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                    ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
                     (
-                        provider_id, model, "official", item["official_input_price"],
-                        item["official_cache_price"], item["official_output_price"], 1.0,
-                        item.get("currency", "USD"), OFFICIAL_PRICE_SNAPSHOT["source_name"],
+                        provider_id, model, "official", item["official_output_price_cny"],
+                        item["official_output_price_cny"], item["official_output_price_cny"], item["official_output_price_cny"], 1.0,
+                        "CNY", OFFICIAL_PRICE_SNAPSHOT["source_name"],
                         snapshot["source_url"], OFFICIAL_PRICE_SNAPSHOT["source_evidence"],
                         OFFICIAL_PRICE_SNAPSHOT["verified_at"], 0,
-                        int(not any(item[key] > 0 for key in ("official_input_price", "official_cache_price", "official_output_price"))),
+                        int(item["official_output_price_cny"] <= 0),
                     ),
                 )
         self.conn.execute(
@@ -459,20 +502,7 @@ class Store:
             self.migrate_pricing()
         self.conn.commit()
 
-    def canonical_models(self) -> dict[str, dict]:
-        rows = self.conn.execute(
-            "SELECT id,stage,family,active FROM canonical_model ORDER BY id"
-        ).fetchall()
-        return {
-            row['id']: {
-                'id': row['id'], 'stage': row['stage'], 'family': row['family'],
-                'active': bool(row['active']),
-            }
-            for row in rows
-        }
-
-    def model_directory(self, *, active: bool | None = True) -> dict[str, dict]:
-        """Return canonical Model metadata without any pricing projection."""
+    def canonical_models(self, *, active: bool | None = True) -> dict[str, dict]:
         clauses = []
         params: list[object] = []
         if active is not None:
@@ -483,9 +513,9 @@ class Store:
             "SELECT id,stage,family,active FROM canonical_model" + where + " ORDER BY id", params
         ).fetchall()
         return {
-            row["id"]: {
-                "id": row["id"], "stage": row["stage"], "family": row["family"],
-                "active": bool(row["active"]),
+            row['id']: {
+                'id': row['id'], 'stage': row['stage'], 'family': row['family'],
+                'active': bool(row['active']),
             }
             for row in rows
         }
@@ -555,8 +585,7 @@ class Store:
 
     def create_pricing_provider(self, provider_key: str, *, provider_type: str,
                                 name: str | None = None, multiplier: float | None = None) -> int:
-        if provider_type not in {'official', 'direct', 'relay'}:
-            raise ValueError('invalid pricing provider type')
+        provider_type = require_provider_type(provider_type)
         if not provider_key:
             raise ValueError('pricing provider key is required')
         with self.conn:
@@ -573,8 +602,9 @@ class Store:
         return int(cursor.lastrowid)
 
     def pricing_providers(self, *, active: bool | None = None) -> list[dict]:
-        clause = ' WHERE provider_type <> ?' + ('' if active is None else ' AND active=?')
-        params = ('legacy-migration',) if active is None else ('legacy-migration', int(active))
+        placeholders = ','.join('?' for _ in PROVIDER_TYPES)
+        clause = f' WHERE provider_type IN ({placeholders})' + ('' if active is None else ' AND active=?')
+        params = tuple(sorted(PROVIDER_TYPES)) if active is None else tuple(sorted(PROVIDER_TYPES)) + (int(active),)
         rows = self.conn.execute(
             "SELECT id,provider_key,name,provider_type,active FROM pricing_provider" + clause + " ORDER BY id",
             params,
@@ -583,8 +613,7 @@ class Store:
 
     def update_pricing_provider(self, provider_id: int, *, name: str, provider_type: str,
                                 multiplier: float | None = None, active: bool | None = None) -> bool:
-        if provider_type not in {'official', 'direct', 'relay'}:
-            raise ValueError('invalid pricing provider type')
+        provider_type = require_provider_type(provider_type)
         if not isinstance(name, str) or not name.strip():
             raise ValueError('pricing provider requires name')
         row = self.conn.execute(
@@ -632,21 +661,25 @@ class Store:
             return bool(self.conn.execute("DELETE FROM pricing_provider WHERE id=?", (provider_id,)).rowcount)
 
     def insert_provider_model_price(self, *, provider_id: int, model_id: str,
-                                    source_kind: str, input_price: float,
-                                    cache_price: float, output_price: float,
-                                    currency: str, multiplier: float | None = None,
+                                    output_price_cny: float | None = None,
+                                    source_kind: str | None = None, input_price: float | None = None,
+                                    cache_price: float | None = None, output_price: float | None = None,
+                                    currency: str | None = None, multiplier: float | None = None,
                                     source_name: str | None = None,
                                     source_url: str | None = None,
                                     source_evidence: str | None = None,
                                     verified_at: str | None = None,
                                     legacy: bool = False, unpriced: bool | None = None) -> int:
-        if source_kind not in {'official', 'direct', 'relay'}:
-            raise ValueError('invalid price source kind')
-        values = (input_price, cache_price, output_price)
-        if any(not math.isfinite(value) or value < 0 for value in values):
-            raise ValueError('prices must be non-negative')
-        if not currency or not isinstance(currency, str):
-            raise ValueError('price currency is required')
+        del source_kind, currency, multiplier
+        if output_price_cny is None:
+            output_price_cny = output_price
+        if not isinstance(output_price_cny, (int, float)) or not math.isfinite(output_price_cny) or output_price_cny < 0:
+            raise ValueError('CNY output price must be non-negative')
+        output_price_cny = float(output_price_cny)
+        # The old component arguments are accepted only as a migration shim.
+        input_price = cache_price = output_price = output_price_cny
+        source_kind = 'direct'
+        currency = 'CNY'
         provider_row = self.conn.execute(
             "SELECT active FROM pricing_provider WHERE id=?", (provider_id,)
         ).fetchone()
@@ -656,48 +689,53 @@ class Store:
         multiplier = 1.0
         legacy = False
         if unpriced is None:
-            unpriced = not any(value > 0 for value in values)
-        if not unpriced and not any(value > 0 for value in values):
+            unpriced = output_price_cny <= 0
+        if not unpriced and output_price_cny <= 0:
             raise ValueError('a priced row needs a non-zero price')
-        model = self.conn.execute(
-            "SELECT active FROM canonical_model WHERE id=?", (model_id,)
-        ).fetchone()
-        if not provider_row or not provider_row['active'] or not model or not model['active']:
+        model_id = canonicalize(model_id)
+        model = self.conn.execute("SELECT active FROM canonical_model WHERE id=?", (model_id,)).fetchone()
+        if model is None:
+            self.conn.execute(
+                "INSERT OR IGNORE INTO canonical_model(id,stage,family,active) VALUES(?,?,?,0)",
+                (model_id, 'standard', 'dynamic'),
+            )
+            model = self.conn.execute("SELECT active FROM canonical_model WHERE id=?", (model_id,)).fetchone()
+        if not provider_row or not provider_row['active'] or not model:
             raise sqlite3.IntegrityError('price requires active provider and model')
         transaction = nullcontext() if self.conn.in_transaction else self.conn
         with transaction:
             cursor = self.conn.execute(
                 """INSERT INTO provider_model_price(
-                   provider_id,model_id,source_kind,input_price,cache_price,output_price,multiplier,currency,
+                   provider_id,model_id,source_kind,input_price,cache_price,output_price,output_price_cny,multiplier,currency,
                    source_name,source_url,source_evidence,verified_at,legacy,unpriced,active
-                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
-                (provider_id, model_id, source_kind, input_price, cache_price, output_price,
-                 multiplier, currency, source_name, source_url, source_evidence, verified_at, int(legacy), int(unpriced)),
+                ) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,1)""",
+                (provider_id, model_id, source_kind, input_price, cache_price, output_price, output_price_cny,
+                 1.0, currency, source_name, source_url, source_evidence, verified_at, int(legacy), int(unpriced)),
             )
             self.record_configuration_change(
                 f"pricing:{provider_id}:{model_id}", None,
-                {'source_kind': source_kind, 'input_price': input_price, 'cache_price': cache_price,
-                 'output_price': output_price, 'currency': currency, 'source_name': source_name,
+                {'output_price_cny': output_price_cny, 'source_name': source_name,
                  'source_url': source_url, 'source_evidence': source_evidence, 'verified_at': verified_at,
                  'unpriced': bool(unpriced)}, source='pricing',
             )
         return int(cursor.lastrowid)
 
     def upsert_provider_model_price(self, **kwargs) -> int:
+        if kwargs.get('output_price_cny') is None:
+            kwargs['output_price_cny'] = kwargs.get('output_price')
+        value = kwargs['output_price_cny']
+        if not isinstance(value, (int, float)) or not math.isfinite(value) or value < 0:
+            raise ValueError('CNY output price must be non-negative')
+        kwargs['output_price_cny'] = float(value)
+        kwargs['input_price'] = kwargs['cache_price'] = kwargs['output_price'] = float(value)
+        kwargs['currency'] = 'CNY'
         existing = self.conn.execute(
             "SELECT id FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
             (kwargs['provider_id'], kwargs['model_id']),
         ).fetchone()
         if existing:
-            if kwargs['source_kind'] not in {'official', 'direct', 'relay'}:
-                raise ValueError('invalid price source kind')
-            prices = [kwargs['input_price'], kwargs['cache_price'], kwargs['output_price']]
-            if any(not math.isfinite(price) or price < 0 for price in prices):
-                raise ValueError('prices must be non-negative')
-            if not kwargs['currency'] or not isinstance(kwargs['currency'], str):
-                raise ValueError('price currency is required')
             before = self.conn.execute(
-                "SELECT source_kind,input_price,cache_price,output_price,currency,source_name,source_url,source_evidence,verified_at,unpriced FROM provider_model_price WHERE id=?",
+                "SELECT output_price_cny,source_name,source_url,source_evidence,verified_at,unpriced FROM provider_model_price WHERE id=?",
                 (existing['id'],),
             ).fetchone()
             values = kwargs.copy()
@@ -705,20 +743,18 @@ class Store:
             values['multiplier'] = 1.0
             values['legacy'] = False
             values.setdefault('unpriced', None)
-            values['unpriced'] = int(values['unpriced'] if values['unpriced'] is not None else not any(price > 0 for price in prices))
+            values['unpriced'] = int(values['unpriced'] if values['unpriced'] is not None else values['output_price_cny'] <= 0)
             transaction = nullcontext() if self.conn.in_transaction else self.conn
             with transaction:
                 self.conn.execute(
-                """UPDATE provider_model_price SET source_kind=?,input_price=?,cache_price=?,output_price=?,
-                       multiplier=?,currency=?,source_name=?,source_url=?,source_evidence=?,verified_at=?,legacy=?,unpriced=? WHERE id=?""",
-                    (values['source_kind'], values['input_price'], values['cache_price'], values['output_price'],
-                     values['multiplier'], values['currency'], values.get('source_name'), values.get('source_url'), values.get('source_evidence'), values.get('verified_at'),
-                     int(values.get('legacy', False)), values['unpriced'], existing['id']),
+                    """UPDATE provider_model_price SET source_kind='direct',input_price=?,cache_price=?,output_price=?,
+                       output_price_cny=?,multiplier=1.0,currency='CNY',source_name=?,source_url=?,source_evidence=?,verified_at=?,legacy=0,unpriced=? WHERE id=?""",
+                    (values['output_price_cny'], values['output_price_cny'], values['output_price_cny'], values['output_price_cny'],
+                     values.get('source_name'), values.get('source_url'), values.get('source_evidence'), values.get('verified_at'),
+                     int(values.get('unpriced', values['output_price_cny'] <= 0)), existing['id']),
                 )
             after = {
-                'source_kind': values['source_kind'], 'input_price': values['input_price'],
-                'cache_price': values['cache_price'], 'output_price': values['output_price'],
-                'currency': values['currency'], 'source_name': values.get('source_name'), 'source_url': values.get('source_url'),
+                'output_price_cny': values['output_price_cny'], 'source_name': values.get('source_name'), 'source_url': values.get('source_url'),
                 'source_evidence': values.get('source_evidence'), 'verified_at': values.get('verified_at'),
                 'unpriced': bool(values['unpriced']),
             }
@@ -749,11 +785,12 @@ class Store:
             return changed
 
     def provider_model_prices(self, *, active: bool | None = None) -> list[dict]:
-        clause = ' WHERE pp.provider_type <> ? AND p.source_kind <> ? AND p.legacy=0' + ('' if active is None else ' AND p.active=?')
-        params = ('legacy-migration', 'legacy-migration') if active is None else ('legacy-migration', 'legacy-migration', int(active))
+        placeholders = ','.join('?' for _ in PROVIDER_TYPES)
+        clause = f' WHERE pp.provider_type IN ({placeholders}) AND p.legacy=0' + ('' if active is None else ' AND p.active=?')
+        params = tuple(sorted(PROVIDER_TYPES)) if active is None else tuple(sorted(PROVIDER_TYPES)) + (int(active),)
         rows = self.conn.execute(
             """SELECT p.id,p.provider_id,p.model_id,p.source_kind,p.input_price,p.cache_price,p.output_price,
-                      p.currency,p.source_name,p.source_url,p.source_evidence,p.verified_at,p.unpriced,p.active,
+                      p.output_price_cny,p.currency,p.source_name,p.source_url,p.source_evidence,p.verified_at,p.unpriced,p.active,
                       pp.provider_key,pp.name provider_name,pp.provider_type
                FROM provider_model_price p JOIN pricing_provider pp ON pp.id=p.provider_id""" + clause +
             " ORDER BY p.id", params
@@ -769,13 +806,14 @@ class Store:
             "SELECT 1 FROM source_provider WHERE fingerprint=?", (fingerprint,)
         ).fetchone()
         model = self.conn.execute(
-            "SELECT 1 FROM canonical_model WHERE id=? AND active=1", (model_id,)
+            "SELECT 1 FROM canonical_model WHERE id=?", (model_id,)
         ).fetchone()
         target_model = self.conn.execute(
-            "SELECT 1 FROM canonical_model WHERE id=? AND active=1", (target_model_id,)
+            "SELECT 1 FROM canonical_model WHERE id=?", (target_model_id,)
         ).fetchone()
         provider = self.conn.execute(
-            "SELECT 1 FROM pricing_provider WHERE id=? AND active=1 AND provider_type <> 'legacy-migration'", (target_provider_id,)
+            "SELECT 1 FROM pricing_provider WHERE id=? AND active=1 AND provider_type IN (?,?,?,?,?,?)",
+            (target_provider_id, *sorted(PROVIDER_TYPES)),
         ).fetchone()
         price = self.conn.execute(
             "SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1 AND source_kind <> 'legacy-migration' AND legacy=0",
@@ -784,7 +822,7 @@ class Store:
         if not source:
             raise ValueError("key fingerprint is not configured")
         if not model or not target_model:
-            raise ValueError("mapping requires active canonical models")
+            raise ValueError("mapping requires known canonical models")
         if not provider:
             raise ValueError("mapping requires an active target provider")
         if not price:
@@ -909,38 +947,6 @@ class Store:
             for row in rows
         ]
 
-    def pricing_models(self, *, stage: str | None = None, active: bool | None = None) -> list[dict]:
-        clauses = []
-        params = []
-        if stage is not None:
-            clauses.append('m.stage=?')
-            params.append(stage)
-        if active is not None:
-            clauses.append('m.active=?')
-            params.append(int(active))
-        where = ' WHERE ' + ' AND '.join(clauses) if clauses else ''
-        rows = self.conn.execute(
-            f"""SELECT m.id,m.stage,m.family,m.active,
-                       (SELECT count(*) FROM provider_model_price p
-                          JOIN pricing_provider pp ON pp.id=p.provider_id
-                         WHERE p.model_id=m.id AND p.active=1
-                           AND p.source_kind <> 'legacy-migration' AND p.legacy=0
-                           AND pp.provider_type <> 'legacy-migration') pricing_count
-                  FROM canonical_model m{where} ORDER BY m.id""", params,
-        ).fetchall()
-        result = []
-        for row in rows:
-            provider_ids = set()
-            for inventory in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
-                try:
-                    models = json.loads(inventory['models_json'])
-                except (TypeError, ValueError):
-                    models = []
-                if row['id'] in models:
-                    provider_ids.add(inventory['pricing_provider_id'])
-            result.append(dict(row) | {'active': bool(row['active']), 'inventory_provider_count': len(provider_ids)})
-        return result
-
     def pricing_entries(self, *, provider: str | None = None, model: str | None = None,
                         stage: str | None = None, currency: str | None = None,
                         include_inactive: bool = False, status: str | None = None) -> list[dict]:
@@ -948,12 +954,15 @@ class Store:
         provider_ids = {item['id'] for item in providers}
         if provider:
             provider_ids = {item['id'] for item in providers if provider in {str(item['id']), item['provider_key'], item['name']}}
-        models = self.pricing_models(stage=stage, active=None if include_inactive else True)
-        model_map = {item['id']: item for item in models}
+        raw_prices = self.provider_model_prices(active=None if include_inactive else True)
+        model_rows = self.conn.execute("SELECT id,stage,family,active FROM canonical_model").fetchall()
+        model_map = {
+            row['id']: {'id': row['id'], 'stage': row['stage'], 'family': row['family'], 'active': bool(row['active'])}
+            for row in model_rows
+        }
         if model:
             model_id = canonicalize(model)
             model_map = {key: value for key, value in model_map.items() if key == model_id}
-        raw_prices = self.provider_model_prices(active=None if include_inactive else True)
         by_key = {(row['provider_id'], row['model_id']): row for row in raw_prices if row['provider_id'] in provider_ids and row['model_id'] in model_map}
         candidates = set(by_key)
         for row in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
@@ -963,7 +972,7 @@ class Store:
                 inventory_models = json.loads(row['models_json'])
             except (TypeError, ValueError):
                 inventory_models = []
-            candidates.update((row['pricing_provider_id'], item) for item in inventory_models if item in model_map)
+            candidates.update((row['pricing_provider_id'], canonicalize(item)) for item in inventory_models if canonicalize(item) in model_map and row['pricing_provider_id'] in provider_ids)
         provider_map = {item['id']: item for item in providers}
         inventory_map = {}
         for row in self.conn.execute('SELECT pricing_provider_id,models_json FROM source_provider WHERE pricing_provider_id IS NOT NULL').fetchall():
@@ -979,7 +988,7 @@ class Store:
             model_item = model_map[model_id]
             resolved = self.effective_pricing(provider_id, model_id)
             display_price = price
-            if currency and (display_price or resolved.get('currency')) and str((display_price or resolved)['currency']).upper() != currency.upper():
+            if currency and currency.upper() != 'CNY':
                 continue
             active = bool(price['active']) if price else bool(provider_item['active'] and model_item['active'])
             priced = bool(resolved['priced'])
@@ -987,14 +996,14 @@ class Store:
             if status and status != row_status:
                 continue
             source = {
-                'kind': price['source_kind'] if price else None,
-                'type': price['source_kind'] if price else None,
+                'kind': 'pricing' if price else None,
+                'type': 'pricing' if price else None,
                 'name': price['source_name'] if price else None,
                 'url': price['source_url'] if price else None,
                 'evidence': price['source_evidence'] if price else None,
                 'verified_at': price['verified_at'] if price else None,
             }
-            base = ({'input': price['input_price'], 'cache': price['cache_price'], 'output': price['output_price'], 'currency': price['currency']}
+            base = ({'input': price['output_price_cny'], 'cache': price['output_price_cny'], 'output': price['output_price_cny'], 'currency': 'CNY'}
                     if price else {'input': None, 'cache': None, 'output': None, 'currency': None})
             final = ({'input': resolved['input_price'], 'cache': resolved['cache_price'], 'output': resolved['output_price'],
                       'blended': resolved['blended_price'], 'currency': resolved['currency']}
@@ -1019,33 +1028,31 @@ class Store:
         model_id = canonicalize(model)
         if isinstance(provider, int):
             provider_row = self.conn.execute(
-                "SELECT * FROM pricing_provider WHERE id=? AND provider_type <> 'legacy-migration'", (provider,)
+                "SELECT * FROM pricing_provider WHERE id=? AND provider_type IN (?,?,?,?,?,?)",
+                (provider, *sorted(PROVIDER_TYPES)),
             ).fetchone()
         else:
             provider_row = self.conn.execute(
-                "SELECT * FROM pricing_provider WHERE provider_key=? AND provider_type <> 'legacy-migration'", (provider,)
+                "SELECT * FROM pricing_provider WHERE provider_key=? AND provider_type IN (?,?,?,?,?,?)",
+                (provider, *sorted(PROVIDER_TYPES)),
             ).fetchone()
 
-        base = {"model": model_id, "stage": None, "currency": None,
+        base = {"model": model_id, "stage": None, "currency": "CNY",
                 "input_price": None, "cache_price": None, "output_price": None,
-                "blended_price": None, "source": None,
-                "priced": False, "reason": None}
+                "output_price_cny": None, "blended_price": None, "source": None,
+                "priced": False, "status": "UNKNOWN", "reason": None}
         model_row = self.conn.execute(
-            "SELECT stage FROM canonical_model WHERE id=? AND active=1", (model_id,)
+            "SELECT stage FROM canonical_model WHERE id=?", (model_id,)
         ).fetchone()
         if model_row:
             base["stage"] = model_row["stage"]
         if provider_row is None or not provider_row["active"]:
             base["reason"] = "pricing provider is missing or inactive"
             return base
-        if model_row is None:
-            base["reason"] = "canonical model is missing or inactive"
-            return base
-
         price_provider_id = provider_row["id"]
         price_model_id = model_id
         price = self.conn.execute(
-            """SELECT input_price,cache_price,output_price,currency,source_kind,unpriced
+            """SELECT output_price_cny,output_price,source_kind,unpriced
                FROM provider_model_price
                WHERE provider_id=? AND model_id=? AND active=1 AND source_kind <> 'legacy-migration' AND legacy=0""",
             (price_provider_id, price_model_id),
@@ -1057,15 +1064,16 @@ class Store:
             base["reason"] = "provider model price is explicitly unpriced"
             return base
 
-        # Price rows contain only the fixed Provider+Model rate. The only
-        # multiplier is applied later, when a concrete API-key mapping is known.
-        components = [round(float(price[key]), 10)
-                      for key in ("input_price", "cache_price", "output_price")]
+        # Price rows have one CNY output rate. Keep component aliases in the
+        # internal response for older callers, but derive every one from it.
+        output_price = float(price["output_price_cny"] if price["output_price_cny"] is not None else price["output_price"])
+        components = [round(output_price, 10)] * 3
         base.update({
-            "currency": price["currency"], "input_price": components[0],
+            "currency": "CNY", "input_price": components[0],
             "cache_price": components[1], "output_price": components[2],
-            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
-            "source": price["source_kind"], "priced": True,
+            "output_price_cny": output_price,
+            "blended_price": output_price,
+            "source": "pricing", "priced": True, "status": "priced",
         })
         return base
 
@@ -1083,22 +1091,21 @@ class Store:
                 "SELECT stage FROM canonical_model WHERE id=? AND active=1", (model_id,)
             ).fetchone()
             return {
-                "model": model_id, "stage": model_row["stage"] if model_row else None, "currency": None,
+                "model": model_id, "stage": model_row["stage"] if model_row else None, "currency": "CNY",
                 "input_price": None, "cache_price": None, "output_price": None,
-                "blended_price": None, "multiplier": None, "source": None,
-                "priced": False, "reason": "key-model mapping is missing or disabled",
+                "output_price_cny": None, "blended_price": None, "multiplier": None, "source": None,
+                "priced": False, "status": "UNKNOWN", "reason": "key-model mapping is missing or disabled",
             }
         resolved = self.effective_pricing(mapping["target_provider_id"], mapping["target_model_id"])
         if not resolved["priced"]:
             return resolved | {"model": model_id, "mapping_id": mapping["id"], "mapping_multiplier": mapping["multiplier"],
                                "reason": resolved["reason"] or "mapped Provider+Model price is unpriced"}
         multiplier = float(mapping["multiplier"])
-        components = [round(float(resolved[key]) * multiplier, 10)
-                      for key in ("input_price", "cache_price", "output_price")]
+        components = [round(float(resolved["output_price_cny"]) * multiplier, 10)] * 3
         return resolved | {
             "model": model_id,
             "input_price": components[0], "cache_price": components[1], "output_price": components[2],
-            "blended_price": round(components[0] * 0.04 + components[1] * 0.16 + components[2] * 0.80, 10),
+            "output_price_cny": components[2], "blended_price": components[2], "status": "priced",
             "multiplier": multiplier, "mapping_id": mapping["id"],
             "mapping_multiplier": multiplier, "mapped_provider_id": mapping["target_provider_id"],
             "mapped_model": mapping["target_model_id"],
@@ -1109,104 +1116,18 @@ class Store:
                          *, source_name: str | None = None, source_url: str | None = None,
                          source_evidence: str | None = None) -> int:
         raise ValueError('relay price bindings have been removed; create an explicit relay Provider+Model price')
-        relay = self.conn.execute(
-            "SELECT provider_type,active FROM pricing_provider WHERE id=?", (relay_provider_id,)
-        ).fetchone()
-        benchmark = self.conn.execute(
-            "SELECT active FROM pricing_provider WHERE id=?", (benchmark_provider_id,)
-        ).fetchone()
-        model = self.conn.execute(
-            "SELECT active FROM canonical_model WHERE id=?", (relay_model_id,)
-        ).fetchone()
-        benchmark_model = self.conn.execute(
-            "SELECT active FROM canonical_model WHERE id=?", (benchmark_model_id,)
-        ).fetchone()
-        price = self.conn.execute(
-            """SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1""",
-            (benchmark_provider_id, benchmark_model_id),
-        ).fetchone()
-        if not relay or relay['provider_type'] != 'relay' or not relay['active'] or not benchmark or not benchmark['active'] or not model or not model['active'] or not benchmark_model or not benchmark_model['active'] or not price:
-            raise sqlite3.IntegrityError('relay binding requires active referenced objects and benchmark price')
-        with self.conn:
-            cursor = self.conn.execute(
-                """INSERT INTO relay_price_binding(
-                   relay_provider_id,relay_model_id,benchmark_provider_id,benchmark_model_id,source_name,source_url,source_evidence,active
-                ) VALUES(?,?,?,?,?,?,?,1)""",
-                (relay_provider_id, relay_model_id, benchmark_provider_id, benchmark_model_id, source_name, source_url, source_evidence),
-            )
-            self.record_configuration_change(
-                f'relay-binding:{cursor.lastrowid}', None,
-                {'relay_provider_id': relay_provider_id, 'relay_model_id': relay_model_id,
-                 'benchmark_provider_id': benchmark_provider_id, 'benchmark_model_id': benchmark_model_id,
-                 'source_name': source_name, 'source_url': source_url, 'source_evidence': source_evidence,
-                 'active': True}, source='pricing',
-            )
-        return int(cursor.lastrowid)
 
     def update_relay_price_binding(self, binding_id: int, *, benchmark_provider_id: int,
                                    benchmark_model_id: str, source_name: str | None = None,
                                    source_url: str | None = None,
                                    source_evidence: str | None = None) -> bool:
         raise ValueError('relay price bindings have been removed; update the explicit relay Provider+Model price')
-        current = self.conn.execute(
-            "SELECT relay_provider_id,relay_model_id,active FROM relay_price_binding WHERE id=?",
-            (binding_id,),
-        ).fetchone()
-        if current is None:
-            return False
-        benchmark = self.conn.execute(
-            "SELECT active FROM pricing_provider WHERE id=?", (benchmark_provider_id,)
-        ).fetchone()
-        benchmark_model = self.conn.execute(
-            "SELECT active FROM canonical_model WHERE id=?", (benchmark_model_id,)
-        ).fetchone()
-        price = self.conn.execute(
-            "SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
-            (benchmark_provider_id, benchmark_model_id),
-        ).fetchone()
-        if not benchmark or not benchmark['active'] or not benchmark_model or not benchmark_model['active'] or not price:
-            raise sqlite3.IntegrityError('relay binding requires active benchmark provider, model, and price')
-        before = dict(self.conn.execute("SELECT * FROM relay_price_binding WHERE id=?", (binding_id,)).fetchone())
-        with self.conn:
-            self.conn.execute(
-                "UPDATE relay_price_binding SET benchmark_provider_id=?,benchmark_model_id=?,source_name=?,source_url=?,source_evidence=?,active=1 WHERE id=?",
-                (benchmark_provider_id, benchmark_model_id, source_name, source_url, source_evidence, binding_id),
-            )
-            after = dict(self.conn.execute("SELECT * FROM relay_price_binding WHERE id=?", (binding_id,)).fetchone())
-            self.record_configuration_change(f'relay-binding:{binding_id}', before, after, source='pricing')
-        return True
 
     def relay_price_bindings(self, *, active: bool | None = None) -> list[dict]:
         return []
-        clause = '' if active is None else ' WHERE b.active=?'
-        params = () if active is None else (int(active),)
-        rows = self.conn.execute(
-            """SELECT b.*,rp.provider_key relay_provider_key,bp.provider_key benchmark_provider_key
-               FROM relay_price_binding b
-               JOIN pricing_provider rp ON rp.id=b.relay_provider_id
-               JOIN pricing_provider bp ON bp.id=b.benchmark_provider_id""" + clause +
-            " ORDER BY b.id", params
-        ).fetchall()
-        return [dict(row) | {'active': bool(row['active'])} for row in rows]
 
     def deactivate_relay_price_binding(self, relay_provider_id: int, relay_model_id: str) -> bool:
         return False
-        row = self.conn.execute(
-            "SELECT * FROM relay_price_binding WHERE relay_provider_id=? AND relay_model_id=? AND active=1",
-            (relay_provider_id, relay_model_id),
-        ).fetchone()
-        if row is None:
-            return False
-        with self.conn:
-            changed = bool(self.conn.execute(
-                "UPDATE relay_price_binding SET active=0 WHERE relay_provider_id=? AND relay_model_id=? AND active=1",
-                (relay_provider_id, relay_model_id),
-            ).rowcount)
-            if changed:
-                self.record_configuration_change(
-                    f'relay-binding:{row["id"]}', dict(row), dict(row) | {'active': 0}, source='pricing',
-                )
-            return changed
 
     def migrate_pricing(self) -> dict:
         version = PRICING_MIGRATION_VERSION
@@ -1242,27 +1163,42 @@ class Store:
                     "INSERT OR REPLACE INTO pricing_migration(version,status,started_at,completed_at,error) VALUES(?,?,?,?,NULL)",
                     (version, 'running', started, None),
                 )
-                model_directory = self.model_directory()
                 provider_rows = self.conn.execute(
                     "SELECT s.* FROM source_provider s JOIN policy p USING(fingerprint)"
                 ).fetchall()
                 for row in provider_rows:
                     source = json.loads(row['source_json']) if row['source_json'] else {}
-                    provider_type = 'relay' if row['provider_type'] == 'relay' or source.get('provider_type') == 'relay' else 'direct'
-                    host = normalize_hostname(row['base_url']) or row['base_url'].lower()
-                    key = f"key-source:{provider_type}:{host}"
-                    self.conn.execute(
-                        "INSERT OR IGNORE INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
-                        (key, row['name'], provider_type, 1.0),
+                    provider_type = canonical_provider_type(
+                        row['pricing_provider_type'] or source.get('provider_type') or row['provider_type'],
+                        base_url=row['base_url'], models=json.loads(row['models_json']),
                     )
-                    provider_id = self.conn.execute("SELECT id FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()[0]
+                    if provider_type is None:
+                        continue
+                    key = provider_type
+                    provider_row = self.conn.execute(
+                        "SELECT id FROM pricing_provider WHERE provider_key=? AND provider_type=?",
+                        (key, provider_type),
+                    ).fetchone()
+                    if provider_row is None:
+                        provider_row = self.conn.execute(
+                            "SELECT id FROM pricing_provider WHERE provider_type=? AND active=1 ORDER BY id LIMIT 1",
+                            (provider_type,),
+                        ).fetchone()
+                    if provider_row is None:
+                        self.conn.execute(
+                            "INSERT INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
+                            (key, row['name'], provider_type, 1.0),
+                        )
+                        provider_row = self.conn.execute("SELECT id FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()
+                    provider_id = provider_row['id']
+                    self.conn.execute("UPDATE pricing_provider SET active=1 WHERE id=?", (provider_id,))
                     self.conn.execute(
-                        "UPDATE source_provider SET pricing_provider_id=? WHERE fingerprint=?",
-                        (provider_id, row['fingerprint']),
+                        "UPDATE source_provider SET pricing_provider_id=?,pricing_provider_type=? WHERE fingerprint=?",
+                        (provider_id, provider_type, row['fingerprint']),
                     )
                     for raw_model in json.loads(row['models_json']):
                         model_id = canonicalize(str(raw_model))
-                        if model_id == 'unavailable' or model_id not in model_directory:
+                        if model_id == 'unavailable':
                             continue
                         target_id = provider_id
                         target_model = model_id
@@ -1271,24 +1207,26 @@ class Store:
                             (provider_id, model_id),
                         ).fetchone()
                         if not existing_price:
-                            pricing = provider_pricing(row['base_url'], model_id, {})
-                            has_provider_seed = pricing.get('price_source') == 'official-provider'
-                            values = [pricing.get(key, 0) for key in ('official_input_price', 'official_cache_price', 'official_output_price')]
+                            legacy_price = self.conn.execute(
+                                """SELECT p.output_price_cny,p.output_price,p.unpriced
+                                   FROM provider_model_price p JOIN pricing_provider old ON old.id=p.provider_id
+                                   WHERE old.provider_key LIKE 'key-source:%' AND p.model_id=? AND p.active=1
+                                   ORDER BY p.id DESC LIMIT 1""",
+                                (model_id,),
+                            ).fetchone()
+                            preserved_output = legacy_price['output_price_cny'] if legacy_price and legacy_price['output_price_cny'] is not None else legacy_price['output_price'] if legacy_price else DEFAULT_OUTPUT_PRICE_CNY
                             self.insert_provider_model_price(
                                 provider_id=provider_id, model_id=model_id, source_kind=provider_type,
-                                input_price=values[0], cache_price=values[1], output_price=values[2],
-                                currency=pricing.get('currency', 'USD'),
-                                source_name='fixed-provider-snapshot' if has_provider_seed else 'migration-unpriced',
-                                source_url=OFFICIAL_PRICE_SNAPSHOT['source_url'] if has_provider_seed else None,
-                                source_evidence='Fixed endpoint-specific provider snapshot' if has_provider_seed else 'No endpoint-specific price was supplied; intentionally unpriced',
-                                verified_at=OFFICIAL_PRICE_SNAPSHOT['verified_at'] if has_provider_seed else None,
-                                unpriced=not any(value > 0 for value in values),
+                                output_price_cny=preserved_output,
+                                source_name='pricing-domain-migration',
+                                source_evidence='Preserved existing Provider+Model price during CPA identity migration' if legacy_price else 'Default CNY output price for a migrated CPA combination',
+                                unpriced=bool(legacy_price['unpriced']) if legacy_price else False,
                             )
                         current_mapping = self.conn.execute(
                             "SELECT target_provider_id,multiplier FROM key_model_mapping WHERE fingerprint=? AND model_id=? AND enabled=1",
                             (row['fingerprint'], model_id),
                         ).fetchone()
-                        mapping_multiplier = float(current_mapping['multiplier']) if current_mapping and current_mapping['target_provider_id'] == provider_id else 1.0
+                        mapping_multiplier = float(current_mapping['multiplier']) if current_mapping else 1.0
                         self.upsert_key_model_mapping(
                             row['fingerprint'], model_id, target_provider_id=target_id,
                             target_model_id=target_model, multiplier=mapping_multiplier, enabled=True,
@@ -1327,13 +1265,13 @@ class Store:
     def ensure_health_targets(self, now: datetime | None = None) -> list[tuple[str, str]]:
         """Create health rows for newly discovered usable Provider/model pairs."""
         stamp = self._timestamp(now)
-        model_directory = set(self.model_directory())
+        canonical_models = set(self.canonical_models())
         rows = self.conn.execute("SELECT fingerprint,models_json FROM source_provider").fetchall()
         created = []
         with self.conn:
             for row in rows:
                 for model in json.loads(row["models_json"]):
-                    if model not in model_directory:
+                    if model not in canonical_models:
                         continue
                     inserted = self.conn.execute(
                         "INSERT OR IGNORE INTO provider_health(fingerprint,model,next_probe_at,updated_at) VALUES(?,?,?,?)",
@@ -1344,6 +1282,7 @@ class Store:
         return created
 
     def health(self, fingerprint: str, model: str) -> dict:
+        fingerprint = self._resolve_single_key_identifier(fingerprint)
         row = self.conn.execute("SELECT * FROM provider_health WHERE fingerprint=? AND model=?", (fingerprint, model)).fetchone()
         if row is None:
             return {"state": "unknown", "consecutive_failures": 0, "backoff_level": 0}
@@ -1356,6 +1295,7 @@ class Store:
                       ttft_ms: float | None = None, immediate_open: bool = False,
                       now: datetime | None = None) -> dict:
         """Apply passive or probe evidence without touching ordinary call statistics."""
+        fingerprint = self._resolve_single_key_identifier(fingerprint)
         stamp = self._timestamp(now)
         current = self.health(fingerprint, model)
         if not real and current.get("last_real_attempt") and current["last_real_attempt"] > stamp:
@@ -1408,45 +1348,11 @@ class Store:
                      responded: bool, first_token: bool, model_matched: bool, ttfb_ms: float | None,
                      ttft_ms: float | None, duration_ms: float | None, error_type: str | None,
                      error: str | None, now: datetime | None = None) -> None:
+        fingerprint = self._resolve_single_key_identifier(fingerprint)
         with self.conn:
             self.conn.execute("""INSERT INTO probe_event(fingerprint,model,tier,mode,reachable,responded,first_token,model_matched,ttfb_ms,ttft_ms,duration_ms,error_type,error,created_at)
                 VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?,?)""", (fingerprint, model, tier, mode, int(reachable), int(responded), int(first_token), int(model_matched), ttfb_ms, ttft_ms, duration_ms, error_type, error, self._timestamp(now)))
 
-    def health_results(self, tier: str, fingerprint: str | None = None, model: str | None = None) -> list[dict]:
-        clauses = ["c.stage=?"]; params: list[object] = [tier]
-        if fingerprint: clauses.append("h.fingerprint=?"); params.append(fingerprint)
-        if model: clauses.append("h.model=?"); params.append(model)
-        rows = self.conn.execute("""SELECT h.*,s.name,p.note,e.id probe_id,e.ttft_ms probe_ttft_ms,e.error_type probe_error_type,e.created_at probe_at
-            FROM provider_health h JOIN source_provider s USING(fingerprint) JOIN policy p USING(fingerprint)
-            JOIN canonical_model c ON c.id=h.model AND c.active=1
-            LEFT JOIN probe_event e ON e.id=(SELECT id FROM probe_event WHERE fingerprint=h.fingerprint AND model=h.model ORDER BY id DESC LIMIT 1)
-            WHERE """ + " AND ".join(clauses) + " ORDER BY s.name,h.model", params).fetchall()
-        return [{"fingerprint": r["fingerprint"], "provider": r["name"], "note": r["note"], "model": r["model"], "state": r["state"], "consecutive_failures": r["consecutive_failures"], "backoff_level": r["backoff_level"], "last_real_attempt": r["last_real_attempt"], "last_real_success": r["last_real_success"], "last_probe_at": r["probe_at"] or r["last_probe_at"], "next_probe_at": r["next_probe_at"], "ttft_ms": r["probe_ttft_ms"], "error_type": r["probe_error_type"]} for r in rows]
-
-    def catalog(self):
-        return {
-            model: {"family": value["family"], "intellect": value["stage"]}
-            for model, value in self.model_directory().items()
-        }
-
-    def _assert_legacy_catalog_write_allowed(self, model: str) -> None:
-        raise ValueError('model-rate compatibility catalog has been removed')
-
-    def legacy_catalog_projection(self, model: str) -> dict:
-        del model
-        return {'status': 'removed', 'provider_count': 0}
-
-    def create_catalog(self, model, body):
-        del model, body
-        self._assert_legacy_catalog_write_allowed('removed')
-    def update_catalog(self, model, body):
-        del model, body
-        self._assert_legacy_catalog_write_allowed('removed')
-    def delete_catalog(self, model):
-        del model
-        self._assert_legacy_catalog_write_allowed('removed')
-    def apply_catalog_to_inventory(self):
-        self._assert_legacy_catalog_write_allowed('removed')
     def race_parallel_cap(self):
         value = self.conn.execute("SELECT value FROM broker_setting WHERE name='race_parallel_cap'").fetchone()[0]
         return int(value)
@@ -1634,7 +1540,7 @@ class Store:
                  SELECT provider_id,model_id FROM provider_model_price p
                  JOIN pricing_provider pp ON pp.id=p.provider_id
                  WHERE p.active=1 AND p.source_kind <> 'legacy-migration' AND p.legacy=0
-                   AND pp.provider_type <> 'legacy-migration'
+                   AND pp.provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra')
                  GROUP BY provider_id,model_id HAVING count(*) > 1
                )"""
         ).fetchone()[0]
@@ -1643,7 +1549,7 @@ class Store:
                JOIN pricing_provider pp ON pp.id=p.provider_id
                WHERE p.active=1 AND p.unpriced=1
                  AND p.source_kind <> 'legacy-migration' AND p.legacy=0
-                 AND pp.provider_type <> 'legacy-migration'"""
+                 AND pp.provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra')"""
         ).fetchone()[0]
         mapping_count = self.conn.execute(
             "SELECT count(*) FROM key_model_mapping WHERE enabled=1"
@@ -1657,27 +1563,22 @@ class Store:
                 AND p.model_id=m.target_model_id AND p.active=1
                 AND p.source_kind <> 'legacy-migration' AND p.legacy=0
                JOIN pricing_provider pp ON pp.id=p.provider_id
-                AND pp.provider_type <> 'legacy-migration'
+                AND pp.provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra')
                WHERE m.enabled=1 AND p.unpriced=1"""
         ).fetchone()[0]
         dangling_mappings = self.conn.execute(
             """SELECT count(*) FROM key_model_mapping m
             LEFT JOIN pricing_provider p ON p.id=m.target_provider_id AND p.active=1
-                AND p.provider_type <> 'legacy-migration'
-               LEFT JOIN canonical_model cm ON cm.id=m.model_id AND cm.active=1
-               LEFT JOIN canonical_model tm ON tm.id=m.target_model_id AND tm.active=1
+                AND p.provider_type IN ('openai','anthropic','deepseek','qwen','doubao','deepinfra')
+               LEFT JOIN canonical_model cm ON cm.id=m.model_id
+               LEFT JOIN canonical_model tm ON tm.id=m.target_model_id
             LEFT JOIN provider_model_price pp ON pp.provider_id=m.target_provider_id
                 AND pp.model_id=m.target_model_id AND pp.active=1
                 AND pp.source_kind <> 'legacy-migration' AND pp.legacy=0
                WHERE m.enabled=1 AND (p.id IS NULL OR cm.id IS NULL OR tm.id IS NULL OR pp.id IS NULL)"""
         ).fetchone()[0]
-        missing_source_evidence = self.conn.execute(
-            """SELECT count(*) FROM provider_model_price p JOIN pricing_provider pp ON pp.id=p.provider_id
-               WHERE p.active=1 AND p.unpriced=0
-                 AND p.source_kind <> 'legacy-migration' AND p.legacy=0
-                 AND pp.provider_type <> 'legacy-migration'
-                 AND (p.source_name IS NULL OR p.source_url IS NULL OR p.verified_at IS NULL)"""
-        ).fetchone()[0]
+        # Source provenance and currency are no longer pricing-domain gates.
+        missing_source_evidence = 0
         unsupported_currency_aggregation = self.conn.execute(
             "SELECT count(*) FROM observation WHERE cost IS NOT NULL AND NULLIF(trim(currency),'') IS NULL"
         ).fetchone()[0]
@@ -1938,12 +1839,6 @@ class Store:
                 VALUES(?,?,?,?,?,?) ON CONFLICT(fingerprint,model,contract) DO UPDATE SET
                 state=excluded.state,last_failure_class=excluded.last_failure_class,updated_at=excluded.updated_at""",
                 (fingerprint, model, contract, state, failure_class, self._timestamp()))
-    def catalog_counts(self):
-        rows=self.conn.execute('SELECT s.fingerprint,s.models_json,s.source_json,p.enabled,p.calibrated FROM source_provider s JOIN policy p USING(fingerprint)').fetchall(); counts={name:0 for name in self.model_directory()}
-        for name in counts:
-            counts[name]=len({r['fingerprint'] for r in rows if r['enabled'] and r['calibrated'] and json.loads(r['source_json']).get('inventory_status') == 'available' and name in json.loads(r['models_json'])})
-        return counts
-
     def _encrypt(self, value: str) -> bytes:
         nonce = __import__('os').urandom(12)
         return nonce + self.aes.encrypt(nonce, value.encode(), None)
@@ -2064,22 +1959,22 @@ class Store:
     def replace_source_snapshot(self, entries: list[dict], synced_at: str):
         rows = []
         site_notes = []
-        model_directory = self.model_directory()
         existing_rows = self.conn.execute("SELECT fingerprint,base_url,api_key,models_json FROM source_provider").fetchall()
         existing = {row["fingerprint"]: row for row in existing_rows}
         existing_policies = {row[0] for row in self.conn.execute("SELECT fingerprint FROM policy")}
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
-            from .catalog import PUBLIC_MODEL_IDS, canonicalize
+            pricing_type = canonical_provider_type(
+                entry.get("pricing_provider_type") or entry.get("provider_type") or "openai",
+                base_url=base_url, models=entry.get("models") or (),
+            )
+            if pricing_type is None:
+                raise ValueError("unsupported provider type")
+            from .catalog import canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
-            host = (urlsplit(base_url).hostname or "").lower()
-            public_provider = False
-            for domain, public_models in PUBLIC_MODEL_IDS.items():
-                if host == domain or host.endswith("." + domain):
-                    source_models = list(dict.fromkeys(source_models + list(public_models)))
-                    public_provider = True
-                    break
-            models = [model for model in source_models if model in model_directory]
+            # Inventory keeps the complete CPA model evidence. Routing still
+            # applies its capability/stage gate later; pricing must not.
+            models = [model for model in source_models if model != "unavailable"]
             # Stable fingerprints avoid decrypting credentials during ordinary
             # refreshes.  The fallback only supports one-time adoption of old
             # databases whose fingerprint included the previous model list.
@@ -2095,11 +1990,11 @@ class Store:
             unavailable = entry.get("inventory_status") == "unavailable" or source_models == ["unavailable"]
             # Model discovery is auxiliary evidence.  Never erase a known-good
             # route merely because a CPA /models refresh transiently fails.
-            if unavailable and prior is not None and not public_provider:
+            if unavailable and prior is not None:
                 prior_models = json.loads(prior["models_json"])
                 if prior_models:
                     source_models = prior_models
-                    models = [model for model in source_models if model in model_directory]
+                    models = [model for model in source_models if model != "unavailable"]
                     entry = entry | {"inventory_status": "stale"}
                     fp = prior["fingerprint"]
                 else:
@@ -2127,67 +2022,123 @@ class Store:
             name = str(entry.get("name") or (models[0] if models else "unavailable"))[:160]
             if api_key in name:
                 name = entry.get("provider_type", "openai")
-            rows.append((fp, name, base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
+            rows.append((fp, name, base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), pricing_type, self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
+        canonical_model_metadata = self.canonical_models()
+        current_models = {row[0]: set(json.loads(row[8])) for row in rows}
         preserved_mappings = [
             dict(item) for item in self.key_model_mappings()
-            if item["fingerprint"] in {row[0] for row in rows}
+            if item["fingerprint"] in current_models
+            and item["model_id"] in current_models[item["fingerprint"]]
         ]
         with self.conn:
             self.conn.execute("CREATE TEMP TABLE incoming AS SELECT * FROM source_provider WHERE 0")
-            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) VALUES(?,?,?,?,?,?,?,?,?,?,?)", rows)
+            self.conn.executemany("INSERT INTO incoming(fingerprint,name,base_url,api_key,provider_type,pricing_provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) VALUES(?,?,?,?,?,?,?,?,?,?,?,?)", rows)
             # source_provider is replaced atomically.  Mapping rows are
             # relationship data and are rebuilt from the new snapshot below;
             # remove them first so the foreign key cannot block the replace.
             self.conn.execute("DELETE FROM key_model_mapping")
             self.conn.execute("DELETE FROM source_provider")
-            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) SELECT fingerprint,name,base_url,api_key,provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id FROM incoming")
+            self.conn.execute("INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,pricing_provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id) SELECT fingerprint,name,base_url,api_key,provider_type,pricing_provider_type,request_headers,api_key_mask,models_json,source_json,synced_at,site_id FROM incoming")
             self.conn.execute("DELETE FROM route_block WHERE fingerprint NOT IN (SELECT fingerprint FROM incoming)")
             self.conn.execute("DROP TABLE incoming")
             self.conn.executemany("INSERT OR IGNORE INTO policy(fingerprint) VALUES(?)", [(r[0],) for r in rows])
-            self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[10],) for r in rows])
+            self.conn.executemany("INSERT OR IGNORE INTO site_policy(site_id) VALUES(?)", [(r[11],) for r in rows])
+            active_pairs = {
+                (row[5], model)
+                for row in rows
+                for model in json.loads(row[8])
+                if model != 'unavailable'
+            }
+            pricing_ids = [
+                row['id'] for row in self.conn.execute(
+                    "SELECT id FROM pricing_provider WHERE provider_key IN (?,?,?,?,?,?)",
+                    tuple(sorted(PROVIDER_TYPES)),
+                )
+            ]
+            if pricing_ids:
+                placeholders = ','.join('?' for _ in pricing_ids)
+                if active_pairs:
+                    self.conn.execute(
+                        f"UPDATE provider_model_price SET active=0 WHERE provider_id IN ({placeholders}) AND active=1 AND (provider_id,model_id) NOT IN ({','.join('(?,?)' for _ in active_pairs)})",
+                        (*pricing_ids, *[part for pair in sorted(active_pairs) for part in pair]),
+                    )
+                else:
+                    self.conn.execute(
+                        f"UPDATE provider_model_price SET active=0 WHERE provider_id IN ({placeholders}) AND active=1",
+                        tuple(pricing_ids),
+                    )
             self.conn.executemany(
                 "UPDATE policy SET calibrated=? WHERE fingerprint=?",
-                [(int(any(model in model_directory for model in json.loads(r[7]))), r[0]) for r in rows if r[0] not in existing_policies],
+                [(int(any(model in canonical_model_metadata for model in json.loads(r[8]))), r[0]) for r in rows if r[0] not in existing_policies],
             )
             # A site name is a useful first-run label, but never overwrite an
             # operator's policy note during a later CPA refresh.
             self.conn.executemany("UPDATE policy SET note=? WHERE fingerprint=? AND note=''", site_notes)
-            for row in self.conn.execute("""SELECT s.fingerprint,s.base_url,s.provider_type,s.name,s.models_json
+            for row in self.conn.execute("""SELECT s.fingerprint,s.base_url,s.provider_type,s.pricing_provider_type,s.name,s.models_json
                                                FROM source_provider s JOIN policy p USING(fingerprint)"""):
-                provider_type = 'relay' if row['provider_type'] == 'relay' else 'direct'
-                host = normalize_hostname(row['base_url']) or row['base_url'].lower()
-                key = f"key-source:{provider_type}:{host}"
-                self.conn.execute(
-                    "INSERT OR IGNORE INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
-                    (key, row['name'], provider_type, 1.0),
+                provider_type = canonical_provider_type(
+                    row['pricing_provider_type'] or row['provider_type'],
+                    base_url=row['base_url'], models=json.loads(row['models_json']),
                 )
-                provider_id = self.conn.execute("SELECT id FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()[0]
-                self.conn.execute("UPDATE source_provider SET pricing_provider_id=? WHERE fingerprint=?", (provider_id, row['fingerprint']))
+                if provider_type is None:
+                    raise ValueError("unsupported provider type")
+                key = provider_type
+                provider_row = self.conn.execute(
+                    "SELECT id,provider_key FROM pricing_provider WHERE provider_key=? AND provider_type=?",
+                    (key, provider_type),
+                ).fetchone()
+                if provider_row is None:
+                    provider_row = self.conn.execute(
+                        "SELECT id,provider_key FROM pricing_provider WHERE provider_type=? AND active=1 ORDER BY id LIMIT 1",
+                        (provider_type,),
+                    ).fetchone()
+                if provider_row is None:
+                    self.conn.execute(
+                        "INSERT INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES(?,?,?,?,1)",
+                        (key, row['name'], provider_type, 1.0),
+                    )
+                    provider_row = self.conn.execute("SELECT id,provider_key FROM pricing_provider WHERE provider_key=?", (key,)).fetchone()
+                provider_id = provider_row['id']
+                self.conn.execute("UPDATE pricing_provider SET active=1 WHERE id=?", (provider_id,))
+                self.conn.execute("UPDATE source_provider SET pricing_provider_id=?,pricing_provider_type=? WHERE fingerprint=?", (provider_id, provider_type, row['fingerprint']))
                 for model_id in json.loads(row['models_json']):
                     model_id = canonicalize(model_id)
-                    if model_id not in model_directory:
+                    if model_id == 'unavailable':
                         continue
                     target_id, target_model = provider_id, model_id
-                    mapping_multiplier = 1.0
-                    if not self.conn.execute(
+                    prior_mapping = next(
+                        (item for item in preserved_mappings
+                         if item['fingerprint'] == row['fingerprint'] and item['model_id'] == model_id),
+                        None,
+                    )
+                    mapping_multiplier = float(prior_mapping['multiplier']) if prior_mapping else 1.0
+                    existing_price = self.conn.execute(
                         "SELECT 1 FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=1",
                         (provider_id, model_id),
-                    ).fetchone():
-                        pricing = provider_pricing(row['base_url'], model_id, {})
-                        has_provider_seed = pricing.get('price_source') == 'official-provider'
-                        values = [pricing.get(key, 0) for key in (
-                            'official_input_price', 'official_cache_price', 'official_output_price')]
-                        self.insert_provider_model_price(
-                            provider_id=provider_id, model_id=model_id,
-                            source_kind=provider_type,
-                            input_price=values[0], cache_price=values[1], output_price=values[2],
-                            currency=pricing.get('currency', 'USD'),
-                            source_name='fixed-provider-snapshot' if has_provider_seed else 'sync-unpriced',
-                            source_url=OFFICIAL_PRICE_SNAPSHOT['source_url'] if has_provider_seed else None,
-                            source_evidence='fixed endpoint-specific snapshot' if has_provider_seed else 'No endpoint-specific price was supplied; intentionally unpriced',
-                            verified_at=OFFICIAL_PRICE_SNAPSHOT['verified_at'] if has_provider_seed else None,
-                            unpriced=not any(value > 0 for value in values),
-                        )
+                    ).fetchone()
+                    if not existing_price:
+                        inactive_price = self.conn.execute(
+                            "SELECT id FROM provider_model_price WHERE provider_id=? AND model_id=? AND active=0 ORDER BY id DESC LIMIT 1",
+                            (provider_id, model_id),
+                        ).fetchone()
+                        if inactive_price:
+                            self.conn.execute("UPDATE provider_model_price SET active=1 WHERE id=?", (inactive_price['id'],))
+                        else:
+                            legacy_price = self.conn.execute(
+                                """SELECT p.output_price_cny,p.output_price,p.unpriced
+                                   FROM provider_model_price p JOIN pricing_provider old ON old.id=p.provider_id
+                                   WHERE old.provider_key LIKE 'key-source:%' AND p.model_id=? AND p.active=1
+                                   ORDER BY p.id DESC LIMIT 1""",
+                                (model_id,),
+                            ).fetchone()
+                            preserved_output = legacy_price['output_price_cny'] if legacy_price and legacy_price['output_price_cny'] is not None else legacy_price['output_price'] if legacy_price else DEFAULT_OUTPUT_PRICE_CNY
+                            self.insert_provider_model_price(
+                                provider_id=provider_id, model_id=model_id,
+                                output_price_cny=preserved_output,
+                                source_name='pricing-domain-migration' if legacy_price else 'cpa-sync-default',
+                                source_evidence='Preserved existing Provider+Model price during CPA identity migration' if legacy_price else 'Default CNY output price for a newly discovered CPA combination',
+                                unpriced=bool(legacy_price['unpriced']) if legacy_price else False,
+                            )
                     self.upsert_key_model_mapping(
                         row['fingerprint'], model_id, target_provider_id=target_id,
                         target_model_id=target_model, multiplier=mapping_multiplier, enabled=True,
@@ -2205,9 +2156,17 @@ class Store:
                         multiplier=float(mapping['multiplier']), enabled=bool(mapping['enabled']),
                     )
                 except (ValueError, sqlite3.IntegrityError):
-                    # The target may have been deliberately retired. Leave the
-                    # default mapping/unknown state explicit and actionable.
-                    continue
+                    # If an old target identity was retired, retain the
+                    # operator's multiplier on the newly derived mapping.
+                    fallback = self.conn.execute(
+                        "SELECT id FROM key_model_mapping WHERE fingerprint=? AND model_id=? AND enabled=1",
+                        (mapping['fingerprint'], mapping['model_id']),
+                    ).fetchone()
+                    if fallback:
+                        self.update_key_model_mapping(
+                            fallback['id'], multiplier=float(mapping['multiplier']),
+                            enabled=bool(mapping['enabled']),
+                        )
 
     @staticmethod
     def site_id(site_name: object, base_url: str) -> str:
@@ -2222,7 +2181,7 @@ class Store:
         ).fetchone()
         return row is None or row["state"] != "unsupported"
 
-    def _provider_from_row(self, row, model: str, model_directory: dict) -> Provider:
+    def _provider_from_row(self, row, model: str, canonical_model_metadata: dict) -> Provider:
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
         source = json.loads(row['source_json']) if row['source_json'] else {}
         model_aliases = source.get('model_aliases') or {}
@@ -2232,7 +2191,7 @@ class Store:
         pricing_by_model = {
             candidate: self.effective_key_pricing(row['fingerprint'], candidate)
             for candidate in source_models
-            if candidate in model_directory
+            if candidate in canonical_model_metadata
         }
         pricing = pricing_by_model.get(model) or self.effective_key_pricing(row['fingerprint'], model)
         pricing_by_model = pricing_by_model | {model: pricing}
@@ -2249,11 +2208,11 @@ class Store:
     def providers(self, tier: str, *, contract: str | None = None) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
         WHERE p.enabled=1 AND p.calibrated=1 ORDER BY s.id""").fetchall()
-        model_directory = self.model_directory()
+        canonical_model_metadata = self.canonical_models()
         result=[]
         for r in rows:
             blocked={row[0] for row in self.conn.execute('SELECT model FROM route_block WHERE fingerprint=?',(r['fingerprint'],))}
-            models=[m for m in json.loads(r['models_json']) if m in model_directory and model_directory[m]['stage'] == tier and m not in blocked]
+            models=[m for m in json.loads(r['models_json']) if m in canonical_model_metadata and canonical_model_metadata[m]['stage'] == tier and m not in blocked]
             if models and tier in json.loads(r['tiers_json']):
                 # A key can expose several catalog models in the same stage.  Health is
                 # per model, so make each routing candidate explicit rather than letting
@@ -2263,7 +2222,7 @@ class Store:
                         continue
                     if not self.health_allows_route(r['fingerprint'], model):
                         continue
-                    result.append(self._provider_from_row(r, model, model_directory))
+                    result.append(self._provider_from_row(r, model, canonical_model_metadata))
         return result
 
     def recovery_providers(self, tier: str, *, excluded_endpoints: set[tuple[str, str]], limit: int,
@@ -2310,35 +2269,13 @@ class Store:
         """Return one enabled inventory target, including open targets for recovery probes."""
         row = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel
             FROM source_provider s JOIN policy p USING(fingerprint) WHERE s.fingerprint=?""", (fingerprint,)).fetchone()
-        catalog = self.model_directory()
+        catalog = self.canonical_models()
         if row is None or not row['enabled'] or not row['calibrated'] or model not in json.loads(row['models_json']) or model not in catalog:
             return None
         tier = catalog[model]['stage']
         if tier not in json.loads(row['tiers_json']):
             return None
         return self._provider_from_row(row, model, catalog)
-
-    def key_test_providers(self) -> list[Provider]:
-        """Return every enabled, calibrated API-key/model probe target.
-
-        A key can expose several Codex models, and a successful probe of one
-        model does not establish that the other models work.  Keep each model
-        as its own Provider value so health and structured-contract evidence
-        remains scoped to the provider/model pair.
-        """
-        rows = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel
-            FROM source_provider s JOIN policy p USING(fingerprint) ORDER BY s.id""").fetchall()
-        catalog = self.model_directory()
-        result = []
-        for row in rows:
-            if not row['enabled'] or not row['calibrated']:
-                continue
-            tiers = set(json.loads(row['tiers_json']))
-            for model in json.loads(row['models_json']):
-                if model not in catalog or catalog[model]['stage'] not in tiers:
-                    continue
-                result.append(self._provider_from_row(row, model, catalog))
-        return result
 
     def try_acquire(self, provider: Provider) -> bool:
         active = self._inflight.get(provider.fingerprint, 0)
@@ -2472,57 +2409,150 @@ class Store:
         The routing inventory above intentionally remains rich because it is
         consumed by internal routing and migration code.  This projection is
         the only shape used by the Key console: it never includes endpoint
-        paths, provider/model inventory, pricing, or health statistics.
+        paths, provider/model inventory, pricing, or health statistics.  The
+        public row is one normalized hostname, not one credential.
         """
         if window not in ACCOUNTING_WINDOWS:
             raise ValueError("invalid window")
         rows = self.conn.execute(
-            """SELECT s.fingerprint,s.base_url,s.api_key_mask,s.source_json,
+            """SELECT s.id,s.fingerprint,s.base_url,s.api_key_mask,s.source_json,
                       p.enabled,p.note,p.max_parallel
                  FROM source_provider s JOIN policy p USING(fingerprint)
                  ORDER BY s.id"""
         ).fetchall()
-        resources = []
+        groups: dict[str, list[sqlite3.Row]] = {}
         for row in rows:
-            try:
-                source = json.loads(row["source_json"] or "{}")
-            except (TypeError, ValueError):
-                source = {}
-            inventory_status = source.get("inventory_status")
-            status = "disabled" if not row["enabled"] else (
-                "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
+            groups.setdefault(normalize_hostname(row["base_url"]) or "UNKNOWN", []).append(row)
+
+        resources = []
+        for hostname, members in sorted(groups.items(), key=lambda item: (item[0], item[1][0]["id"])):
+            member_fingerprints = [row["fingerprint"] for row in members]
+            public_identifier = member_fingerprints[0] if len(members) == 1 else hostname
+            accounting = self._merge_accounting(
+                [self.accounting(window=window, fingerprint=fingerprint) for fingerprint in member_fingerprints],
+                window=window,
             )
-            accounting = self.accounting(window=window, fingerprint=row["fingerprint"])
+            statuses = []
+            for row in members:
+                try:
+                    source = json.loads(row["source_json"] or "{}")
+                except (TypeError, ValueError):
+                    source = {}
+                inventory_status = source.get("inventory_status")
+                statuses.append("disabled" if not row["enabled"] else (
+                    "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
+                ))
+            distinct_statuses = set(statuses)
+            status = statuses[0] if len(distinct_statuses) == 1 else "mixed"
+            masks = list(dict.fromkeys((row["api_key_mask"] or "***") for row in members))
+            notes = list(dict.fromkeys(row["note"] for row in members if row["note"]))
             resources.append({
-                "fingerprint": row["fingerprint"],
-                "normalized_hostname": normalize_hostname(row["base_url"]),
+                # The normalized hostname is the stable group identifier. A
+                # caller may still address an individual legacy fingerprint;
+                # api_key_resource() resolves both forms during the cutover.
+                "fingerprint": public_identifier,
+                "normalized_hostname": hostname,
                 "status": status,
-                "note": row["note"],
-                "api_key_mask": row["api_key_mask"] or "***",
-                "max_parallel": row["max_parallel"],
+                "note": " · ".join(notes),
+                "api_key_mask": " · ".join(masks),
+                # The domain row represents the total available capacity of
+                # its credentials; individual policy limits remain editable
+                # through the group detail endpoint.
+                "max_parallel": sum(int(row["max_parallel"]) for row in members),
                 "window": window,
                 "total_tokens": accounting["total_tokens"],
                 "fee_buckets": accounting["fee_buckets"],
                 "edit": {
-                    "fingerprint": row["fingerprint"],
-                    "href": f"/admin/v1/keys/{row['fingerprint']}",
+                    "fingerprint": public_identifier,
+                    "href": f"/admin/v1/keys/{public_identifier}",
                 },
             })
         return resources
 
+    @staticmethod
+    def _merge_accounting(reports: list[dict], *, window: str) -> dict:
+        """Merge already-windowed accounting reports without rewriting history."""
+        fee_buckets: dict[str, dict] = {}
+        observed_calls = 0
+        for report in reports:
+            for currency, item in (report.get("fee_buckets") or {}).items():
+                target = fee_buckets.setdefault(currency, {
+                    "currency": currency, "tokens": 0, "total_tokens": 0,
+                    "fee": None, "total_fee": None, "calls": 0,
+                })
+                target["tokens"] += int(item.get("tokens", item.get("total_tokens", 0)) or 0)
+                target["total_tokens"] += int(item.get("total_tokens", item.get("tokens", 0)) or 0)
+                target["calls"] += int(item.get("calls", 0) or 0)
+                observed_calls += int(item.get("calls", 0) or 0)
+                fee = item.get("total_fee", item.get("fee"))
+                if isinstance(fee, (int, float)):
+                    target["fee"] = (target["fee"] or 0) + fee
+                    target["total_fee"] = target["fee"]
+        total_tokens = sum(item["total_tokens"] for item in fee_buckets.values())
+        return {
+            "window": window,
+            "total_tokens": total_tokens if observed_calls else None,
+            "token_total": total_tokens if observed_calls else None,
+            "fee_buckets": fee_buckets,
+            "fees_by_currency": {key: item["total_fee"] for key, item in fee_buckets.items()},
+            "tokens_by_currency": {key: item["total_tokens"] for key, item in fee_buckets.items()},
+        }
+
+    def _api_key_group_members(self, identifier: str) -> list[sqlite3.Row]:
+        """Resolve a normalized group id or an individual pre-cutover fingerprint."""
+        exact = self.conn.execute(
+            """SELECT s.id,s.fingerprint,s.base_url,s.api_key_mask,s.source_json,
+                      p.enabled,p.note,p.max_parallel
+                 FROM source_provider s JOIN policy p USING(fingerprint)
+                WHERE s.fingerprint=? ORDER BY s.id""", (identifier,)
+        ).fetchall()
+        if exact:
+            return exact
+        hostname = normalize_hostname(identifier) or "UNKNOWN"
+        rows = self.conn.execute(
+            """SELECT s.id,s.fingerprint,s.base_url,s.api_key_mask,s.source_json,
+                      p.enabled,p.note,p.max_parallel
+                 FROM source_provider s JOIN policy p USING(fingerprint)
+                ORDER BY s.id"""
+        ).fetchall()
+        return [
+            row for row in rows
+            if (normalize_hostname(row["base_url"]) or "UNKNOWN") == hostname
+        ]
+
+    def api_key_group_fingerprints(self, identifier: str) -> list[str]:
+        return [row["fingerprint"] for row in self._api_key_group_members(identifier)]
+
+    def _resolve_single_key_identifier(self, identifier: str) -> str:
+        """Accept the grouped API identifier for single-key operational calls."""
+        if self.conn.execute(
+            "SELECT 1 FROM source_provider WHERE fingerprint=?", (identifier,)
+        ).fetchone():
+            return identifier
+        members = self._api_key_group_members(identifier)
+        return members[0]["fingerprint"] if len(members) == 1 else identifier
+
     def api_key_resource(self, fingerprint: str, window: str = "24h", *, include_mappings: bool = False) -> dict | None:
         """Return one safe Key resource, optionally with mapping edit data."""
-        resource = next((item for item in self.api_key_resources(window) if item["fingerprint"] == fingerprint), None)
+        members = self._api_key_group_members(fingerprint)
+        if not members:
+            return None
+        hostname = normalize_hostname(members[0]["base_url"]) or "UNKNOWN"
+        resource = next((item for item in self.api_key_resources(window)
+                         if item["normalized_hostname"] == hostname), None)
         if resource is None:
             return None
         if include_mappings:
+            mappings = []
+            for member in members:
+                mappings.extend(self.key_model_mappings(fingerprint=member["fingerprint"], enabled=None))
             resource["edit"] = resource["edit"] | {
                 "mappings": [
                     {key: mapping[key] for key in (
                         "id", "model_id", "target_provider_id", "target_provider_key",
                         "target_model_id", "multiplier", "enabled",
                     )}
-                    for mapping in self.key_model_mappings(fingerprint=fingerprint, enabled=None)
+                    for mapping in mappings
                 ]
             }
         return resource
@@ -2569,14 +2599,29 @@ class Store:
             result.append(row)
         return result
 
-    def stage_test_providers(self, stage: str, model: str) -> list[Provider]:
-        """Return enabled Key/Model capability pairs for a Stage test."""
-        catalog = self.model_directory()
-        model = canonicalize(model)
-        if model not in catalog or catalog[model]["stage"] != stage:
-            return []
-        return [provider for row in self._stage_key_rows(stage, model, callable_only=True)
-                if (provider := self._provider_from_row(row, model, catalog)) is not None]
+    def stage_test_providers(self, stage: str) -> list[Provider]:
+        """Return enabled Key/Model capability pairs for a Stage test.
+
+        The console operates on a Stage, not an individual model, and expands
+        the operation to every current callable pair in that Stage.
+        """
+        catalog = self.canonical_models()
+        pairs = []
+        for candidate, metadata in catalog.items():
+            if metadata["stage"] != stage:
+                continue
+            pairs.extend((row, candidate) for row in self._stage_key_rows(stage, candidate, callable_only=True))
+        result = []
+        seen = set()
+        for row, candidate in pairs:
+            identity = (row["fingerprint"], candidate)
+            if identity in seen:
+                continue
+            seen.add(identity)
+            provider = self._provider_from_row(row, candidate, catalog)
+            if provider is not None:
+                result.append(provider)
+        return result
 
     def _stage_accounting(self, stage: str, model: str, window: str, fingerprints: list[str]) -> dict:
         if not fingerprints:
@@ -2612,55 +2657,177 @@ class Store:
                 "tokens_by_currency": {key: item["total_tokens"] for key, item in buckets.items()}}
 
     def stage_resources(self, window: str = "24h") -> list[dict]:
-        """Aggregate the Stage + canonical Model admin contract."""
+        """Aggregate one row per Stage with stable low/high price groups.
+
+        Models and credentials are deliberately collection details inside a
+        Stage row.  The only business grouping key is Stage; price bands are a
+        deterministic sub-group derived from the distinct CNY output prices.
+        """
         if window not in ACCOUNTING_WINDOWS:
             raise ValueError("invalid window")
-        models = self.conn.execute(
-            "SELECT id,stage,family FROM canonical_model WHERE active=1 ORDER BY stage,id"
-        ).fetchall()
+        canonical_model_metadata = self.canonical_models()
+        inventory_rows = self.conn.execute("SELECT fingerprint,models_json FROM source_provider ORDER BY id").fetchall()
+        models_by_stage: dict[str, set[str]] = {stage: set() for stage in ("standard", "smart", "expert")}
+        for inventory in inventory_rows:
+            try:
+                declared = json.loads(inventory["models_json"] or "[]")
+            except (TypeError, ValueError):
+                declared = []
+            for raw_model in declared:
+                model = canonicalize(str(raw_model))
+                metadata = canonical_model_metadata.get(model)
+                if metadata:
+                    models_by_stage[metadata["stage"]].add(model)
+
         resources = []
-        for model_row in models:
-            stage, model = model_row["stage"], model_row["id"]
-            matching = self._stage_key_rows(stage, model)
-            callable_matching = self._stage_key_rows(stage, model, callable_only=True)
-            fingerprints = [row["fingerprint"] for row in matching]
-            provider_types = sorted({row["provider_type"] for row in matching})
-            placeholders = ",".join("?" for _ in fingerprints)
-            stats = {"rate": None, "ttft": None}
-            if fingerprints:
-                stats_row = self.conn.execute(
-                    f"""SELECT avg(success) rate, avg(latency_ms) ttft
-                           FROM observation
-                          WHERE created_at >= datetime('now',?) AND tier=?
-                            AND COALESCE(actual_model,requested_model)=?
-                            AND fingerprint IN ({placeholders})""",
-                    [ACCOUNTING_WINDOWS[window], stage, model, *fingerprints],
-                ).fetchone()
-                stats = {"rate": stats_row["rate"], "ttft": stats_row["ttft"]}
-            latest = self.conn.execute(
-                f"""SELECT created_at,ttft_ms,
+        stage_order = {"standard": 0, "smart": 1, "expert": 2}
+        for stage in sorted(models_by_stage, key=stage_order.__getitem__):
+            models = sorted(models_by_stage[stage])
+            if not models:
+                continue
+            matching_by_pair = {}
+            callable_by_pair = {}
+            for model in models:
+                for row in self._stage_key_rows(stage, model):
+                    matching_by_pair[(row["fingerprint"], model)] = row
+                for row in self._stage_key_rows(stage, model, callable_only=True):
+                    callable_by_pair[(row["fingerprint"], model)] = row
+            matching = list(matching_by_pair.values())
+            fingerprints = sorted({row["fingerprint"] for row in matching})
+            callable_fingerprints = {row["fingerprint"] for row in callable_by_pair.values()}
+            provider_types = sorted({
+                canonical_provider_type(
+                    row["pricing_provider_type"] or row["provider_type"],
+                    base_url=row["base_url"], models=models,
+                ) or "UNKNOWN"
+                for row in matching
+            })
+            stats, accounting = self._stage_scope_stats(stage, models, fingerprints, window)
+            price_records = []
+            unknown_records = []
+            for fingerprint, model in sorted(matching_by_pair):
+                pricing = self.effective_key_pricing(fingerprint, model)
+                record = (fingerprint, model, pricing)
+                if pricing["priced"] and isinstance(pricing.get("output_price_cny"), (int, float)):
+                    price_records.append(record)
+                else:
+                    unknown_records.append(record)
+            distinct_prices = sorted({round(float(item[2]["output_price_cny"]), 10) for item in price_records})
+            if distinct_prices:
+                midpoint = len(distinct_prices) // 2
+                boundary = distinct_prices[midpoint] if len(distinct_prices) % 2 else (distinct_prices[midpoint - 1] + distinct_prices[midpoint]) / 2
+            else:
+                boundary = None
+            bands = {"low": [], "high": [], "unknown": unknown_records}
+            for record in price_records:
+                bands["low" if record[2]["output_price_cny"] <= boundary else "high"].append(record)
+
+            def band_payload(name: str, records: list[tuple[str, str, dict]]) -> dict:
+                band_models = sorted({record[1] for record in records})
+                band_fingerprints = sorted({record[0] for record in records})
+                band_stats, band_accounting = self._stage_scope_stats(stage, band_models, band_fingerprints, window)
+                prices = sorted({round(float(record[2]["output_price_cny"]), 10) for record in records if record[2].get("priced")})
+                latest = self._latest_stage_test(band_models, band_fingerprints)
+                return {
+                    "name": name,
+                    "models": band_models,
+                    "output_prices_cny": prices,
+                    "output_price_cny": prices[0] if len(prices) == 1 else None,
+                    "callable_key_count": len({fingerprint for fingerprint in band_fingerprints if fingerprint in callable_fingerprints}),
+                    "latest_test": latest,
+                    "technical_success_rate": band_stats["rate"],
+                    "avg_first_token_latency_ms": band_stats["ttft"],
+                    "total_tokens": band_accounting["total_tokens"],
+                    "fee_buckets": band_accounting["fee_buckets"],
+                }
+
+            resources.append({
+                "stage": stage,
+                "model": models[0] if len(models) == 1 else "UNKNOWN",
+                "family": " / ".join(sorted({canonical_model_metadata[model]["family"] for model in models})),
+                "provider_types": provider_types,
+                "callable_key_count": len(callable_fingerprints),
+                "latest_test": self._latest_stage_test(models, fingerprints),
+                "technical_success_rate": stats["rate"],
+                "avg_first_token_latency_ms": stats["ttft"],
+                "window": window,
+                "total_tokens": accounting["total_tokens"],
+                "fee_buckets": accounting["fee_buckets"],
+                "edit": {"stage": stage, "models": models},
+                "models": models,
+                "families": sorted({canonical_model_metadata[model]["family"] for model in models}),
+                "price_bands": {name: band_payload(name, records) for name, records in bands.items()},
+                "price_boundary_cny": boundary,
+            })
+        return resources
+
+    def _stage_scope_stats(self, stage: str, models: list[str], fingerprints: list[str], window: str) -> tuple[dict, dict]:
+        if not models or not fingerprints:
+            return {"rate": None, "ttft": None}, {
+                "window": window, "total_tokens": None, "token_total": None,
+                "fee_buckets": {}, "fees_by_currency": {}, "tokens_by_currency": {},
+            }
+        placeholders = ",".join("?" for _ in fingerprints)
+        rows = self.conn.execute(
+            f"""SELECT success,latency_ms,input_tokens,output_tokens,cost,currency,actual_model,requested_model
+                   FROM observation
+                  WHERE created_at >= datetime('now',?) AND tier=?
+                    AND fingerprint IN ({placeholders})""",
+            [ACCOUNTING_WINDOWS[window], stage, *fingerprints],
+        ).fetchall()
+        model_set = {canonicalize(model) for model in models}
+        rows = [row for row in rows if canonicalize(row["actual_model"] or row["requested_model"]) in model_set]
+        if not rows:
+            return {"rate": None, "ttft": None}, {
+                "window": window, "total_tokens": None, "token_total": None,
+                "fee_buckets": {}, "fees_by_currency": {}, "tokens_by_currency": {},
+            }
+        success_values = [float(row["success"]) for row in rows if row["success"] is not None]
+        latency_values = [float(row["latency_ms"]) for row in rows if row["latency_ms"] is not None]
+        buckets: dict[str, dict] = {}
+        for row in rows:
+            currency = str(row["currency"] or "UNKNOWN").strip().upper() or "UNKNOWN"
+            bucket = buckets.setdefault(currency, {
+                "currency": currency, "tokens": 0, "total_tokens": 0,
+                "fee": None, "total_fee": None, "calls": 0,
+            })
+            bucket["calls"] += 1
+            if row["input_tokens"] is not None and row["output_tokens"] is not None:
+                bucket["tokens"] += int(row["input_tokens"]) + int(row["output_tokens"])
+                bucket["total_tokens"] = bucket["tokens"]
+            if isinstance(row["cost"], (int, float)):
+                bucket["fee"] = (bucket["fee"] or 0) + float(row["cost"])
+                bucket["total_fee"] = bucket["fee"]
+        total_tokens = sum(item["total_tokens"] for item in buckets.values())
+        accounting = {
+            "window": window, "total_tokens": total_tokens, "token_total": total_tokens,
+            "fee_buckets": buckets,
+            "fees_by_currency": {key: item["total_fee"] for key, item in buckets.items()},
+            "tokens_by_currency": {key: item["total_tokens"] for key, item in buckets.items()},
+        }
+        return {
+            "rate": sum(success_values) / len(success_values) if success_values else None,
+            "ttft": sum(latency_values) / len(latency_values) if latency_values else None,
+        }, accounting
+
+    def _latest_stage_test(self, models: list[str], fingerprints: list[str]) -> dict | None:
+        if not models or not fingerprints:
+            return None
+        model_placeholders = ",".join("?" for _ in models)
+        fingerprint_placeholders = ",".join("?" for _ in fingerprints)
+        row = self.conn.execute(
+            f"""SELECT created_at,ttft_ms,
                               CASE WHEN first_token=1 AND model_matched=1 THEN 'succeeded'
                                    ELSE COALESCE(error_type,'failed') END status
                            FROM probe_event
-                          WHERE model=? {f'AND fingerprint IN ({placeholders})' if fingerprints else 'AND 1=0'}
+                          WHERE model IN ({model_placeholders})
+                            AND fingerprint IN ({fingerprint_placeholders})
                           ORDER BY id DESC LIMIT 1""",
-                [model, *fingerprints],
-            ).fetchone()
-            accounting = self._stage_accounting(stage, model, window, fingerprints)
-            resources.append({
-                "stage": stage, "model": model, "family": model_row["family"],
-                "provider_types": provider_types,
-                "callable_key_count": len(callable_matching),
-                "latest_test": None if latest is None else {
-                    "at": latest["created_at"], "status": latest["status"], "ttft_ms": latest["ttft_ms"],
-                },
-                "technical_success_rate": stats["rate"],
-                "avg_first_token_latency_ms": stats["ttft"],
-                "window": window, "total_tokens": accounting["total_tokens"],
-                "fee_buckets": accounting["fee_buckets"],
-                "edit": {"stage": stage, "model": model},
-            })
-        return resources
+            [*models, *fingerprints],
+        ).fetchone()
+        return None if row is None else {
+            "at": row["created_at"], "status": row["status"], "ttft_ms": row["ttft_ms"],
+        }
 
     def update_policy(self, fingerprint: str, body: dict):
         if not isinstance(body, dict) or set(body) - {"enabled", "calibrated", "note", "max_parallel", "tiers"}:
@@ -2672,6 +2839,8 @@ class Store:
         return True
 
     def observe(self, **data):
+        if data.get("fingerprint"):
+            data = data | {"fingerprint": self._resolve_single_key_identifier(data["fingerprint"])}
         payload = {
             'diagnostic_json': None, 'route_id': None, 'attempt_number': None,
             'started_ms': None, 'elapsed_ms': None, 'currency': None,

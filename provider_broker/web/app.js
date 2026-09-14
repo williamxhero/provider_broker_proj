@@ -4,13 +4,12 @@ const sortDefaults = {
   modelView: { key: "stage", direction: "asc" },
   models: { key: "id", direction: "asc" },
   pricing: { key: "provider", direction: "asc" },
-  probeResults: { key: "provider", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, model: null, pricing: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], stages: [], summary: {}, sorts: {}, probeResults: [], models: [], pricingItems: [] };
+const state = { cursor: "", provider: null, model: null, pricing: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], stages: [], summary: {}, sorts: {}, models: [], pricingItems: [] };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
-const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
+const empty = (value) => value === null || value === undefined || value === "" || value === "UNKNOWN" ? "n/a" : String(value);
 const cell = (value) => {
   const td = document.createElement("td");
   td.textContent = empty(value);
@@ -31,7 +30,7 @@ const formatMs = (value) => {
   if (value === null || value === undefined) return "n/a";
   return value >= 1000 ? `${(value / 1000).toFixed(1)} s` : `${Math.round(value)} ms`;
 };
-const formatPrice = (value) => value === null || value === undefined ? "n/a" : String(value);
+const formatPrice = (value) => value === null || value === undefined || value === "UNKNOWN" ? "n/a" : String(value);
 const formatMultiplier = (value) => value === null || value === undefined || !Number.isFinite(Number(value)) ? "n/a" : Number(value).toFixed(3);
 const formatCost = (value) => value === null || value === undefined || !Number.isFinite(Number(value))
   ? "n/a"
@@ -41,7 +40,7 @@ const formatTokens = (value) => value === null || value === undefined || !Number
   : new Intl.NumberFormat("en-US", { maximumFractionDigits: 0 }).format(Number(value));
 const formatFeeBuckets = (buckets) => {
   if (!buckets || typeof buckets !== "object" || !Object.keys(buckets).length) return "n/a";
-  return Object.entries(buckets).map(([currency, item]) => `${currency} ${item?.total_fee === null || item?.total_fee === undefined ? "n/a" : Number(item.total_fee).toFixed(6)}`).join(" · ");
+  return Object.entries(buckets).map(([currency, item]) => `${empty(currency)} ${item?.total_fee === null || item?.total_fee === undefined ? "n/a" : Number(item.total_fee).toFixed(6)}`).join(" · ");
 };
 
 function savePreferences() {
@@ -55,27 +54,6 @@ function restoreControls() {
   state.qualityWindow = preferences.qualityWindow || state.qualityWindow;
   state.sorts = { ...sortDefaults, ...(preferences.sorts || {}) };
   setQualityWindow(state.qualityWindow);
-  if (preferences.probeStage) byId("probe-stage").value = preferences.probeStage;
-}
-
-function renderProbeResults(items = state.probeResults) {
-  state.probeResults = items;
-  const table = byId("probe-results");
-  const columns = [{ key: "provider", label: "Provider" }, { key: "model", label: "模型" }, { key: "state", label: "健康" }, { key: "last_probe_at", label: "最近探针" }, { key: "ttft_ms", label: "TTFT" }, { key: "error_type", label: "结果" }];
-  const body = tableHead(table, columns, "probeResults", () => renderProbeResults());
-  sortItems(items, "probeResults", (item, key) => item[key]).forEach((item) => {
-    const row = document.createElement("tr");
-    [item.provider, item.model, item.state, formatShanghaiTime(item.last_probe_at), formatMs(item.ttft_ms), displayStatus(item.error_type) === "n/a" ? "成功" : displayStatus(item.error_type)].forEach((value) => row.append(cell(value)));
-    body.append(row);
-  });
-}
-
-async function loadProbeResults() {
-  const stage = byId("probe-stage").value;
-  preferences.probeStage = stage;
-  savePreferences();
-  const payload = await requestJson(`/admin/v1/health?stage=${encodeURIComponent(stage)}`);
-  renderProbeResults(payload.items);
 }
 
 function persistControl(id) {
@@ -289,15 +267,23 @@ function stageOrder(value) {
   return ({ standard: 0, smart: 1, expert: 2 })[value] ?? 99;
 }
 
+function formatPriceBand(band) {
+  if (!band || typeof band !== "object") return "n/a";
+  const prices = Array.isArray(band.output_prices_cny) ? band.output_prices_cny :
+    band.output_price_cny === null || band.output_price_cny === undefined ? [] : [band.output_price_cny];
+  return prices.length ? prices.map(formatPrice).join(" · ") : "n/a";
+}
+
 function renderModelView(payload = { items: state.stages }) {
   state.stages = payload.items || [];
   const table = byId("model-view");
-  const columns = [{ key: "stage", label: "Stage" }, { key: "model", label: "canonical Model" }, { key: "family", label: "family" }, { key: "provider_types", label: "Provider types" }, { key: "callable_key_count", label: "可调用 Key" }, { key: "latest_test", label: "最近测试" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_first_token_latency_ms", label: "平均首字延迟" }, { key: "total_tokens", label: `${state.qualityWindow} Token` }, { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "操作" }];
+  const columns = [{ key: "stage", label: "Stage" }, { key: "low_price", label: "低价输出 / 1M CNY" }, { key: "high_price", label: "高价输出 / 1M CNY" }, { key: "provider_types", label: "Provider types" }, { key: "callable_key_count", label: "可调用 Key" }, { key: "latest_test", label: "最近测试" }, { key: "technical_success_rate", label: "技术成功率" }, { key: "avg_first_token_latency_ms", label: "平均首字延迟" }, { key: "total_tokens", label: `${state.qualityWindow} Token` }, { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "操作" }];
   const body = tableHead(table, columns, "modelView", () => renderModelView({ items: state.stages }));
-  sortItems(state.stages, "modelView", (item, key) => key === "provider_types" ? item.provider_types.join(" ") : key === "latest_test" ? item.latest_test?.at : item[key]).forEach((item) => {
+  sortItems(state.stages, "modelView", (item, key) => key === "provider_types" ? (item.provider_types || []).join(" ") : key === "latest_test" ? item.latest_test?.at : key === "low_price" ? item.price_bands?.low?.output_price_cny : key === "high_price" ? item.price_bands?.high?.output_price_cny : item[key]).forEach((item) => {
     const row = document.createElement("tr");
     const latest = item.latest_test ? `${displayStatus(item.latest_test.status)} · ${formatShanghaiTime(item.latest_test.at)}` : "n/a";
-    [item.stage, item.model, item.family, item.provider_types.join(", "), item.callable_key_count, latest, formatPercent(item.technical_success_rate), formatMs(item.avg_first_token_latency_ms), formatTokens(item.total_tokens), formatFeeBuckets(item.fee_buckets)].forEach((value) => row.append(cell(value)));
+    const providers = (item.provider_types || []).map(empty).join(", ") || "n/a";
+    [item.stage, formatPriceBand(item.price_bands?.low), formatPriceBand(item.price_bands?.high), providers, item.callable_key_count, latest, formatPercent(item.technical_success_rate), formatMs(item.avg_first_token_latency_ms), formatTokens(item.total_tokens), formatFeeBuckets(item.fee_buckets)].forEach((value) => row.append(cell(value)));
     const action = document.createElement("td");
     const test = document.createElement("button"); test.type = "button"; test.className = "text-button"; test.textContent = "测试";
     test.addEventListener("click", () => testStage(item, test));
@@ -306,16 +292,16 @@ function renderModelView(payload = { items: state.stages }) {
 }
 
 async function testStage(item, button) {
-  const output = byId("proberesult");
+  const output = byId("stage-test-result");
   button.disabled = true;
-  output.textContent = `正在测试 ${item.stage} / ${item.model} 的启用 Key/Model pairs…`;
+  output.textContent = `正在测试 ${item.stage} 的启用 Key/Model pairs…`;
   try {
     const result = await requestJson("/admin/v1/stages/test", {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ stage: item.stage, model: item.model }),
+      body: JSON.stringify({ stage: item.stage }),
     });
     await loadStageView();
-    output.textContent = `测试完成：${result.items.filter((candidate) => candidate.state === "succeeded").length}/${result.items.length} 个 capability pair 成功`;
+    output.textContent = `测试完成：${result.succeeded_count || 0}/${result.tested_count || 0} 个 capability pair 成功`;
   } catch (error) {
     output.textContent = `Stage 测试失败：${error.message}`;
   } finally {
@@ -521,17 +507,6 @@ byId("save-routing").addEventListener("click", async () => {
   byId("hedge-delay-ms").value = result.hedge_delay_ms;
   byId("syncresult").textContent = `同价竞速 Key 数已设为 ${result.race_parallel_cap}，对冲延迟 ${result.hedge_delay_ms} ms`;
 });
-byId("probe-stage").addEventListener("change", () => loadProbeResults().catch(() => { byId("proberesult").textContent = "健康数据加载失败"; }));
-["race", "all"].forEach((mode) => byId(`probe-${mode}`).addEventListener("click", async () => {
-  const output = byId("proberesult");
-  output.textContent = "正在执行探针…";
-  try {
-    const result = await requestJson("/admin/v1/probes", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ stage: byId("probe-stage").value, mode }) });
-    output.textContent = `已完成 ${result.items.length} 个探针`;
-    await loadProbeResults();
-  } catch (_) { output.textContent = "探针执行失败"; }
-}));
-
 byId("pricing-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
