@@ -42,26 +42,14 @@
       <div class="table-wrap"><table id="probe-results"></table></div>
     </section>
 
-    <section aria-labelledby="model-directory-title" id="model-directory-section">
-      <div class="section-heading">
-        <div><p class="index">04 / MODEL DIRECTORY</p><h2 id="model-directory-title">Model 目录</h2></div>
-        <div class="section-actions"><button id="model-create" class="secondary" type="button">新增 Model</button></div>
-      </div>
-      <p class="field-help">这里只维护 canonical Model、Stage、family 与启停状态；价格、倍率、Relay 映射和 Key 能力属于独立资源。</p>
-      <div class="table-wrap"><table id="model-directory"></table></div>
-    </section>
-
     <section aria-labelledby="pricing-title" id="pricing-section">
       <div class="section-heading">
         <div><p class="index">05 / PROVIDER + MODEL PRICING</p><h2 id="pricing-title">Provider + Model 定价</h2></div>
-        <div class="section-actions"><button id="pricing-create" class="primary" type="button">新增价格行</button></div>
+        <div class="section-actions"></div>
       </div>
       <div class="filters pricing-filters">
-        <label>Provider<input id="pricing-filter-provider" type="search" placeholder="Key 或名称"></label>
+        <label>Provider<input id="pricing-filter-provider" type="search" placeholder="Provider"></label>
         <label>Model<input id="pricing-filter-model" type="search" placeholder="Model ID"></label>
-        <label>Stage<select id="pricing-filter-stage"><option value="">全部</option><option>standard</option><option>smart</option><option>expert</option></select></label>
-        <label>币种<input id="pricing-filter-currency" type="search" placeholder="USD"></label>
-        <label>状态<select id="pricing-filter-status"><option value="">全部</option><option value="priced">已定价</option><option value="unpriced">未定价</option></select></label>
       </div>
       <div class="table-wrap"><table id="pricing"></table></div>
     </section>
@@ -109,31 +97,13 @@
     </form>
   </aside>
 
-  <aside id="model-editor" class="editor" aria-labelledby="model-editor-title" hidden>
-    <form id="model-form">
-      <div class="editor-heading"><div><p class="index">MODEL DIRECTORY</p><h2 id="model-editor-title">Canonical Model</h2></div><button id="close-model-editor" type="button" aria-label="关闭">×</button></div>
-      <label>Model ID<input name="model" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}" required></label>
-      <label>family<input name="family" required></label>
-      <label>Stage<select name="stage"><option>standard</option><option>smart</option><option>expert</option></select></label>
-      <div class="editor-actions"><button id="model-deactivate" type="button" class="danger" hidden>停用 Model</button><button id="cancel-model-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
-    </form>
-  </aside>
-
   <aside id="pricing-editor" class="editor" aria-labelledby="pricing-editor-title" hidden>
     <form id="pricing-form">
       <div class="editor-heading"><div><p class="index">PRICING RECORD</p><h2 id="pricing-editor-title">Provider + Model 价格行</h2></div><button id="close-pricing-editor" type="button" aria-label="关闭">×</button></div>
       <label>Provider ID<input name="provider_id" type="number" min="1" required></label>
       <label>Model ID<input name="model_id" required></label>
-      <label>来源类型<select name="source_kind"><option>official</option><option>direct</option><option>relay</option></select></label>
-      <label>输入 / 1M<input name="input_price" type="number" min="0" step="0.0001" required></label>
-      <label>缓存输入 / 1M<input name="cache_price" type="number" min="0" step="0.0001" required></label>
-      <label>输出 / 1M<input name="output_price" type="number" min="0" step="0.0001" required></label>
-      <label>币种<input name="currency" value="USD" maxlength="12" required></label>
-      <label>来源名称<input name="source_name" maxlength="256"></label>
-      <label>来源 URL<input name="source_url" type="url"></label>
-      <label>来源证据<input name="source_evidence"></label>
-      <label>核验时间<input name="verified_at" type="text" placeholder="ISO 8601"></label>
-      <div class="editor-actions"><button id="pricing-deactivate" type="button" class="danger" hidden>停用价格行</button><button id="cancel-pricing-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+      <label>输出价格 / 1M CNY<input name="output_price_cny" type="number" min="0" step="0.0001" required></label>
+      <div class="editor-actions"><button id="cancel-pricing-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>
 

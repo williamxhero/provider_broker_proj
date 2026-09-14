@@ -698,6 +698,9 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert '中转站余额' not in page
     assert 'CPA 是唯一人工维护源' not in page
     assert 'client-secret' not in page and 'admin-secret' not in page
+    pricing_markup = page.split('id="pricing-section"', 1)[1].split('</section>', 1)[0]
+    assert 'Stage' not in pricing_markup and '来源' not in pricing_markup and '币种' not in pricing_markup
+    assert 'output_price_cny' in page
     css=await client.get('/static/styles.css')
     js=await client.get('/static/app.js')
     assert css.status == 200 and css.content_type == 'text/css'
@@ -773,7 +776,7 @@ async def test_catalog_rejects_incomplete_and_unknown_updates(client):
     assert (await client.patch('/admin/v1/catalog/private-model', json={})).status == 404
 
 
-async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_final_price(client):
+async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(client):
     headers = {'Authorization': 'Bearer admin-secret'}
     created_model = await client.post('/admin/v1/models', headers=headers, json={
         'model': 'api-model', 'stage': 'smart', 'family': 'API Family',
@@ -797,54 +800,39 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     provider = await provider_response.json()
 
     price_response = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
-        'input_price': 1, 'cache_price': 0.2, 'output_price': 4, 'currency': 'USD',
-        'source_name': 'Public price table',
-        'source_url': 'https://prices.example/api-direct',
-        'source_evidence': 'published pricing table',
-        'verified_at': '2026-09-12T00:00:00Z',
+        'provider_id': provider['id'], 'model_id': 'api-model', 'output_price_cny': 4,
     })
     assert price_response.status == 201
     assert (await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
-        'input_price': 1, 'cache_price': .2, 'output_price': 4, 'currency': 'USD', 'multiplier': 2,
+        'provider_id': provider['id'], 'model_id': 'api-model', 'output_price_cny': 4, 'multiplier': 2,
     })).status == 400
     duplicate = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
-        'input_price': 1, 'cache_price': .2, 'output_price': 4, 'currency': 'USD',
+        'provider_id': provider['id'], 'model_id': 'api-model', 'output_price_cny': 4,
     })
     assert duplicate.status == 409
 
     listed = await client.get('/admin/v1/pricing?provider=api-direct&model=api-model&currency=USD', headers=headers)
     item = (await listed.json())['items'][0]
-    assert item['provider']['type'] == 'direct'
-    assert item['provider']['inventory_models'] == []
-    assert item['model'] == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
-    assert item['base_price'] == {'input': 1, 'cache': .2, 'output': 4, 'currency': 'USD'}
-    assert item['final_price'] == {'input': 1.0, 'cache': .2, 'output': 4.0, 'blended': 3.272, 'currency': 'USD'}
-    assert item['source'] == {
-        'name': 'Public price table', 'kind': 'direct', 'type': 'direct', 'url': 'https://prices.example/api-direct',
-        'evidence': 'published pricing table', 'verified_at': '2026-09-12T00:00:00Z',
+    assert item == {
+        'id': item['id'], 'active': True,
+        'provider': {'id': provider['id'], 'name': 'API Direct', 'provider_key': 'api-direct'},
+        'model': {'id': 'api-model'}, 'output_price_cny': 4.0,
     }
-    assert item['unpriced'] is False and item['active'] is True
+    assert not {'stage', 'source', 'source_kind', 'source_name', 'source_url', 'source_evidence', 'currency'} & item.keys()
     events = await client.get('/admin/v1/configuration-events', headers=headers)
     assert any(event['setting'] == 'pricing:%s:api-model' % provider['id'] and event['source'] == 'pricing' for event in (await events.json())['items'])
 
     invalid = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
-        'input_price': -1, 'cache_price': 0, 'output_price': 1, 'currency': 'USD',
+        'provider_id': provider['id'], 'model_id': 'api-model', 'output_price_cny': -1,
     })
     assert invalid.status == 400
     legacy_write = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'legacy-migration',
-        'input_price': 0, 'cache_price': 0, 'output_price': 0, 'currency': 'USD', 'legacy': True,
+        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct', 'output_price_cny': 1,
     })
     assert legacy_write.status == 400
 
     updated = await client.put(f"/admin/v1/pricing/{provider['id']}/api-model", headers=headers, json={
-        'source_kind': 'direct', 'input_price': 2, 'cache_price': .4, 'output_price': 8,
-        'source_name': 'Updated price table',
-        'currency': 'USD', 'source_url': 'https://prices.example/api-direct?v=2',
+        'output_price_cny': 8,
     })
     assert updated.status == 200
     assert (await client.delete(f"/admin/v1/pricing/{provider['id']}/api-model", headers=headers)).status == 204
@@ -867,17 +855,13 @@ async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without
     assert 'multiplier' not in await relay.json()
     assert (await client.post('/admin/v1/pricing/bindings', headers=headers, json={})).status == 404
     direct_price = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': relay_id, 'model_id': model, 'source_kind': 'relay',
-        'input_price': .2, 'cache_price': .02, 'output_price': 1.2, 'currency': 'USD',
-        'source_name': 'Relay terms', 'source_url': 'https://relay.example/pricing',
-        'source_evidence': 'endpoint-specific terms', 'verified_at': '2026-09-12T00:00:00Z',
+        'provider_id': relay_id, 'model_id': model, 'output_price_cny': 8.4,
     })
     assert direct_price.status == 201
     relay_view = await client.get('/admin/v1/pricing?provider=api-relay&model=gpt-5.6-luna', headers=headers)
     relay_item = (await relay_view.json())['items'][0]
-    assert relay_item['base_price'] == {'input': .2, 'cache': .02, 'output': 1.2, 'currency': 'USD'}
-    assert relay_item['final_price']['input'] == .2
-    assert 'binding' not in relay_item
+    assert relay_item['output_price_cny'] == 8.4
+    assert not {'stage', 'source', 'base_price', 'final_price', 'binding'} & relay_item.keys()
     assert (await client.get('/admin/v1/pricing/bindings', headers=headers)).status == 404
 
 
@@ -887,20 +871,13 @@ async def test_cpa_sync_preserves_provider_model_price_configuration(client, cpa
     store = client.app['store']
     inventory = (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]
     provider_id = store.conn.execute('SELECT pricing_provider_id FROM source_provider WHERE fingerprint=?', (inventory['fingerprint'],)).fetchone()[0]
-    body = {
-        'provider_id': provider_id, 'model_id': 'gpt-5.6-luna', 'source_kind': 'direct',
-        'input_price': 7, 'cache_price': .7, 'output_price': 21, 'currency': 'USD',
-        'source_url': 'https://operator.example/pricing', 'source_evidence': 'operator override',
-        'verified_at': '2026-09-12T01:00:00Z',
-    }
-    assert (await client.put(f'/admin/v1/pricing/{provider_id}/gpt-5.6-luna', headers=headers, json={key: value for key, value in body.items() if key not in {'provider_id', 'model_id'}})).status == 200
+    assert (await client.put(f'/admin/v1/pricing/{provider_id}/gpt-5.6-luna', headers=headers, json={'output_price_cny': 21})).status == 200
     cpa.app['config']['providers'][0]['name'] = 'CPA renamed provider'
     assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
     rows = (await (await client.get('/admin/v1/pricing?model=gpt-5.6-luna', headers=headers)).json())['items']
     row = next(item for item in rows if item['provider']['id'] == provider_id)
-    assert row['base_price'] == {'input': 7, 'cache': .7, 'output': 21, 'currency': 'USD'}
-    assert row['source']['evidence'] == 'operator override'
-    assert 'multiplier' not in row['provider']
+    assert row['output_price_cny'] == 21.0
+    assert not {'stage', 'source', 'base_price', 'final_price', 'currency'} & row.keys()
 
 
 async def test_catalog_deletions_survive_a_store_restart(client):

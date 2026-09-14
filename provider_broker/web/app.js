@@ -216,41 +216,6 @@ function closeEditor() {
   state.provider = null;
 }
 
-function openModelEditor(model) {
-  state.model = model || null;
-  const form = byId("model-form");
-  form.reset();
-  form.elements.model.value = model?.id || "";
-  form.elements.model.readOnly = Boolean(model);
-  form.elements.family.value = model?.family || "";
-  form.elements.stage.value = model?.stage || "standard";
-  byId("model-deactivate").hidden = !model || model.active === false;
-  byId("model-editor").hidden = false;
-  form.elements.model.focus();
-}
-
-function closeModelEditor() {
-  byId("model-editor").hidden = true;
-  state.model = null;
-}
-
-function renderModelDirectory(items = state.models) {
-  state.models = items;
-  const table = byId("model-directory");
-  const columns = [{ key: "id", label: "Model" }, { key: "stage", label: "Stage" }, { key: "family", label: "family" }, { key: "active", label: "状态" }, { label: "操作" }];
-  const body = tableHead(table, columns, "models", () => renderModelDirectory());
-  sortItems(items, "models", (item, key) => key === "active" ? (item.active ? 0 : 1) : item[key]).forEach((item) => {
-    const row = document.createElement("tr");
-    if (!item.active) row.className = "inactive-row";
-    [item.id, item.stage, item.family, item.active ? "启用" : "已停用"].forEach((value) => row.append(cell(value)));
-    const action = document.createElement("td");
-    const edit = document.createElement("button");
-    edit.type = "button"; edit.className = "text-button"; edit.textContent = "编辑";
-    edit.addEventListener("click", () => openModelEditor(item));
-    action.append(edit); row.append(action); body.append(row);
-  });
-}
-
 function openPricingEditor(item) {
   state.pricing = item || null;
   const form = byId("pricing-form");
@@ -258,16 +223,7 @@ function openPricingEditor(item) {
   form.elements.provider_id.value = item?.provider?.id || "";
   form.elements.model_id.value = item?.model?.id || "";
   form.elements.model_id.readOnly = Boolean(item);
-  form.elements.source_kind.value = item?.source?.kind || "direct";
-  form.elements.input_price.value = item?.base_price?.input ?? "";
-  form.elements.cache_price.value = item?.base_price?.cache ?? "";
-  form.elements.output_price.value = item?.base_price?.output ?? "";
-  form.elements.currency.value = item?.base_price?.currency || "USD";
-  form.elements.source_name.value = item?.source?.name || "";
-  form.elements.source_url.value = item?.source?.url || "";
-  form.elements.source_evidence.value = item?.source?.evidence || "";
-  form.elements.verified_at.value = item?.source?.verified_at || "";
-  byId("pricing-deactivate").hidden = !item || !item.active;
+  form.elements.output_price_cny.value = item?.output_price_cny ?? "";
   byId("pricing-editor").hidden = false;
   form.elements.provider_id.focus();
 }
@@ -280,20 +236,12 @@ function closePricingEditor() {
 function renderPricing(items = state.pricingItems) {
   state.pricingItems = items;
   const table = byId("pricing");
-  const columns = [{ key: "provider", label: "Provider" }, { key: "provider_type", label: "Provider 类型" }, { key: "inventory", label: "库存关系" }, { key: "model", label: "Model" }, { key: "stage", label: "Stage" }, { key: "base", label: "输入 / 缓存 / 输出" }, { key: "currency", label: "币种" }, { key: "final", label: "最终输入 / 缓存 / 输出 / 加权" }, { key: "source", label: "来源" }, { key: "status", label: "状态" }, { label: "操作" }];
+  const columns = [{ key: "provider", label: "Provider" }, { key: "model", label: "Model" }, { key: "price", label: "输出价格 / 1M CNY" }, { label: "操作" }];
   const body = tableHead(table, columns, "pricing", () => renderPricing());
-  sortItems(items, "pricing", (item, key) => ({ provider: item.provider.name, provider_type: item.provider.type, inventory: item.provider.inventory_models.join(" "), model: item.model.id, stage: item.model.stage, base: item.base_price.input, currency: item.base_price.currency, final: item.final_price?.blended, source: item.source.evidence, status: item.status }[key])).forEach((item) => {
+  sortItems(items, "pricing", (item, key) => ({ provider: item.provider.name, model: item.model.id, price: item.output_price_cny }[key])).forEach((item) => {
     const row = document.createElement("tr");
-    if (!item.active || item.unpriced) row.className = "inactive-row";
-    const base = item.base_price;
-    const final = item.final_price;
-    const source = item.source;
-    [item.provider.name, item.provider.type, item.provider.inventory_models.join(", "), item.model.id, item.model.stage,
-      `${formatPrice(base.input)} / ${formatPrice(base.cache)} / ${formatPrice(base.output)}`,
-      base.currency,
-      final ? `${formatPrice(final.input)} / ${formatPrice(final.cache)} / ${formatPrice(final.output)} / ${formatPrice(final.blended)}` : (item.reason || "未定价"),
-      `${empty(source.name)} · ${empty(source.type || source.kind)} · ${empty(source.evidence)} · ${empty(source.url)} · ${empty(source.verified_at)}`,
-      item.active ? (item.unpriced ? "未定价" : "已定价") : "已停用"].forEach((value) => row.append(cell(value)));
+    if (!item.active) row.className = "inactive-row";
+    [item.provider.name, item.model.id, formatPrice(item.output_price_cny)].forEach((value) => row.append(cell(value)));
     const action = document.createElement("td");
     const edit = document.createElement("button");
     edit.type = "button"; edit.className = "text-button"; edit.textContent = "编辑";
@@ -306,16 +254,9 @@ async function loadPricingViews() {
   const query = new URLSearchParams({
     provider: byId("pricing-filter-provider").value,
     model: byId("pricing-filter-model").value,
-    stage: byId("pricing-filter-stage").value,
-    currency: byId("pricing-filter-currency").value,
-    status: byId("pricing-filter-status").value,
   });
   [...query.keys()].forEach((key) => { if (!query.get(key)) query.delete(key); });
-  const [models, prices] = await Promise.all([
-    requestJson(`/admin/v1/models?include_inactive=true`),
-    requestJson(`/admin/v1/pricing?${query}`),
-  ]);
-  renderModelDirectory(models.items);
+  const prices = await requestJson(`/admin/v1/pricing?${query}`);
   renderPricing(prices.items);
 }
 
@@ -591,53 +532,24 @@ byId("probe-stage").addEventListener("change", () => loadProbeResults().catch(()
   } catch (_) { output.textContent = "探针执行失败"; }
 }));
 
-byId("model-create").addEventListener("click", () => openModelEditor());
-byId("model-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const body = { stage: form.elements.stage.value, family: form.elements.family.value };
-  if (state.model) {
-    await requestJson(`/admin/v1/models/${encodeURIComponent(state.model.id)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  } else {
-    await requestJson("/admin/v1/models", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, model: form.elements.model.value }) });
-  }
-  closeModelEditor(); await loadPricingViews();
-});
-byId("model-deactivate").addEventListener("click", async () => {
-  await requestJson(`/admin/v1/models/${encodeURIComponent(state.model.id)}`, { method: "DELETE" });
-  closeModelEditor(); await loadPricingViews();
-});
-["close-model-editor", "cancel-model-editor"].forEach((id) => byId(id).addEventListener("click", closeModelEditor));
-
-byId("pricing-create").addEventListener("click", () => openPricingEditor());
 byId("pricing-form").addEventListener("submit", async (event) => {
   event.preventDefault();
   const form = event.currentTarget;
-  const body = {
-    source_kind: form.elements.source_kind.value,
-    input_price: Number(form.elements.input_price.value), cache_price: Number(form.elements.cache_price.value),
-    output_price: Number(form.elements.output_price.value), currency: form.elements.currency.value,
-    source_name: form.elements.source_name.value || null, source_url: form.elements.source_url.value || null, source_evidence: form.elements.source_evidence.value || null,
-    verified_at: form.elements.verified_at.value || null,
-  };
+  const outputPrice = Number(form.elements.output_price_cny.value);
+  const body = { output_price_cny: outputPrice };
   const providerId = form.elements.provider_id.value;
   const modelId = encodeURIComponent(form.elements.model_id.value);
   const endpoint = state.pricing ? `/admin/v1/pricing/${providerId}/${modelId}` : "/admin/v1/pricing";
   await requestJson(endpoint, { method: state.pricing ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(state.pricing ? body : { ...body, provider_id: Number(providerId), model_id: form.elements.model_id.value }) });
   closePricingEditor(); await loadPricingViews();
 });
-byId("pricing-deactivate").addEventListener("click", async () => {
-  await requestJson(`/admin/v1/pricing/${state.pricing.provider.id}/${encodeURIComponent(state.pricing.model.id)}`, { method: "DELETE" });
-  closePricingEditor(); await loadPricingViews();
-});
 ["close-pricing-editor", "cancel-pricing-editor"].forEach((id) => byId(id).addEventListener("click", closePricingEditor));
 
-["pricing-filter-provider", "pricing-filter-model", "pricing-filter-currency"].forEach((id) => byId(id).addEventListener("input", () => {
+[
+  "pricing-filter-provider", "pricing-filter-model",
+].forEach((id) => byId(id).addEventListener("input", () => {
   clearTimeout(state.pricingTimer); state.pricingTimer = setTimeout(() => loadPricingViews().catch(() => {}), 250);
 }));
-byId("pricing-filter-stage").addEventListener("change", () => loadPricingViews().catch(() => {}));
-byId("pricing-filter-status").addEventListener("change", () => loadPricingViews().catch(() => {}));
-
 byId("sync").addEventListener("click", async () => {
   const output = byId("syncresult");
   output.textContent = "正在同步…";

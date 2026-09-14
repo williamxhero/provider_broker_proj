@@ -94,7 +94,7 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
         assert page.locator("main > section:has(#route-audit-title)").count() == 1
         browser.close()
 
-def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_path):
+def test_pricing_console_shows_only_provider_model_and_cny_price(tmp_path):
     with LiveBroker(tmp_path / "pricing-console.sqlite3") as broker, sync_playwright() as playwright:
         seeded = threading.Event()
         def seed():
@@ -118,12 +118,14 @@ def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_pat
         browser = playwright.chromium.launch()
         page = browser.new_page()
         page.goto(broker.url)
-        page.locator("#model-directory").get_by_text("console-model", exact=True).wait_for()
         page.locator("#pricing").get_by_text("console-model", exact=True).first.wait_for()
         assert page.evaluate("window.__injected") is None
         assert page.locator("#pricing img, #pricing svg, #pricing script").count() == 0
-        assert "Console price list" in page.locator("#pricing").inner_text()
-        assert "Evidence <script>window.__injected=2</script>" in page.locator("#pricing").inner_text()
-        assert page.locator("#model-directory-section input[name=official_input_price]").count() == 0
+        assert page.locator("#pricing").get_by_text("4", exact=True).count() == 1
+        headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#pricing thead th").all_inner_texts()]
+        assert headers == ["Provider", "Model", "输出价格 / 1M CNY", "操作"]
+        assert "Console price list" not in page.locator("#pricing").inner_text()
+        assert "Evidence <script>window.__injected=2</script>" not in page.locator("#pricing").inner_text()
+        assert page.locator("#model-directory-section").count() == 0
         assert page.locator("#pricing-bindings").count() == 0
         browser.close()

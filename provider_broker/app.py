@@ -589,19 +589,36 @@ async def deactivate_pricing_provider_api(request):
 
 
 def _valid_price_body(body):
-    required = {'source_kind', 'input_price', 'cache_price', 'output_price', 'currency'}
-    optional = {'source_name', 'source_url', 'source_evidence', 'verified_at'}
     numeric = lambda value: type(value) in (int, float) and math.isfinite(value) and value >= 0
-    return (
-        isinstance(body, dict) and required <= set(body) and set(body) <= required | optional
-        and body['source_kind'] in ('official', 'direct', 'relay')
-        and all(numeric(body[name]) for name in ('input_price', 'cache_price', 'output_price'))
-        and isinstance(body['currency'], str) and re.fullmatch(r'[A-Za-z]{3,8}', body['currency'].strip())
-        and all(name not in body or body[name] is None or isinstance(body[name], str) for name in ('source_name', 'source_url', 'source_evidence', 'verified_at'))
-        and all(name not in body or body[name] is None or len(body[name]) <= limit for name, limit in (('source_name', 256), ('source_url', 2048), ('source_evidence', 4096), ('verified_at', 64)))
-        and (body.get('source_url') is None or body['source_url'].startswith('https://'))
-        and (body.get('verified_at') is None or _valid_iso_timestamp(body['verified_at']))
-    )
+    return isinstance(body, dict) and set(body) == {'output_price_cny'} and numeric(body['output_price_cny'])
+
+
+def _price_write_values(body):
+    """Adapt the single public CNY price to the legacy storage columns."""
+    value = float(body['output_price_cny'])
+    return {
+        'source_kind': 'direct',
+        'input_price': value,
+        'cache_price': value,
+        'output_price': value,
+        'currency': 'CNY',
+        'unpriced': value <= 0,
+    }
+
+
+def _pricing_public_payload(item):
+    """Expose only the user-facing Provider+Model pricing contract."""
+    return {
+        'id': item['id'],
+        'active': bool(item['active']),
+        'provider': {
+            'id': item['provider']['id'],
+            'name': item['provider']['name'],
+            'provider_key': item['provider']['provider_key'],
+        },
+        'model': {'id': item['model']['id']},
+        'output_price_cny': item['base_price']['output'],
+    }
 
 
 def _valid_iso_timestamp(value):
@@ -618,22 +635,17 @@ async def pricing_api(request):
         status = request.query.get('status')
         if status not in (None, 'priced', 'unpriced'):
             return web.json_response({'error': 'invalid pricing status'}, status=400)
-        stage = request.query.get('stage')
-        if stage is not None and stage not in ('standard', 'smart', 'expert'):
-            return web.json_response({'error': 'invalid stage'}, status=400)
-        currency = request.query.get('currency')
-        currency = currency.strip().upper() if currency else None
-        return web.json_response({'items': store.pricing_entries(
+        return web.json_response({'items': [_pricing_public_payload(item) for item in store.pricing_entries(
             provider=request.query.get('provider'), model=request.query.get('model'),
-            stage=stage, currency=currency,
             include_inactive=request.query.get('include_inactive') == 'true', status=status,
-        )})
+        )]})
     body = await request.json()
     if not isinstance(body, dict) or type(body.get('provider_id')) is not int or not isinstance(body.get('model_id'), str) or not re.fullmatch(r'[A-Za-z0-9][A-Za-z0-9._-]{0,127}', body.get('model_id', '')) or not _valid_price_body({key: value for key, value in body.items() if key not in ('provider_id', 'model_id')}):
         return web.json_response({'error': 'invalid provider model price'}, status=400)
-    body = body | {'model_id': canonicalize(body['model_id']), 'currency': body['currency'].strip().upper()}
+    write_body = _price_write_values(body)
+    write_body |= {'provider_id': body['provider_id'], 'model_id': canonicalize(body['model_id'])}
     try:
-        price_id = store.insert_provider_model_price(**body)
+        price_id = store.insert_provider_model_price(**write_body)
     except ValueError as exc:
         return web.json_response({'error': str(exc)}, status=400)
     except sqlite3.IntegrityError as exc:
@@ -649,7 +661,7 @@ async def update_pricing_api(request):
         provider_id = int(request.match_info['provider_id'])
     except ValueError:
         return web.json_response({'error': 'invalid provider id'}, status=400)
-    body = body | {'provider_id': provider_id, 'model_id': canonicalize(request.match_info['model_id']), 'currency': body['currency'].strip().upper()}
+    body = _price_write_values(body) | {'provider_id': provider_id, 'model_id': canonicalize(request.match_info['model_id'])}
     try:
         price_id = request.app['store'].upsert_provider_model_price(**body)
     except ValueError as exc:
