@@ -70,20 +70,28 @@ def cpa_cell(cpa_url: str, cpa_key: str, model: str, contract: str) -> dict:
 
 
 def broker_cell(broker_url: str, model: str, contract: str, *, runs: int = 1) -> dict:
-    status, inventory = request(broker_url.rstrip("/") + "/admin/v1/providers?window=24h")
-    providers = (inventory or {}).get("providers") if status == 200 else None
-    target = next((item for item in providers or [] if item.get("enabled") and item.get("calibrated") and model in item.get("models", [])), None)
+    # Key resources deliberately omit model inventory and fingerprints.  The
+    # Stage resource is the release-facing capability summary, and its test
+    # endpoint performs the enabled Key/Model selection server-side.
+    stage = TIERS.get(model, "smart")
+    status, stage_inventory = request(broker_url.rstrip("/") + "/admin/v1/stages?window=24h")
+    stages = (stage_inventory or {}).get("items") if status == 200 else None
+    target = next((item for item in stages or []
+                   if isinstance(item, dict) and item.get("stage") == stage and item.get("model") == model
+                   and type(item.get("callable_key_count")) is int
+                   and item["callable_key_count"] > 0), None)
     if not target:
         return {"path": "broker_direct", "contract": contract, "model": model, "state": "failed", "reason": "no_enabled_target", "runs": 0, "passed_runs": 0}
-    payload = {
-        "stage": TIERS.get(model, "smart"), "mode": "all", "fingerprint": target["fingerprint"], "model": model,
-        "timeout_ms": 60_000, "concurrency": 1, "contract": contract, "record": False,
-    }
+    payload = {"stage": stage, "model": model}
     started = time.monotonic()
     items = []
     for _ in range(runs):
-        status, data = request(broker_url.rstrip("/") + "/admin/v1/probes", payload=payload)
-        item = ((data or {}).get("items") or [{}])[0]
+        status, data = request(broker_url.rstrip("/") + "/admin/v1/stages/test", payload=payload)
+        results = (data or {}).get("items") if status == 200 else None
+        results = [result for result in results if isinstance(result, dict)] if isinstance(results, list) else []
+        item = next((result for result in results if result.get("state") == "succeeded"), None)
+        if item is None:
+            item = results[0] if results else {}
         items.append((status, item))
     status, item = items[-1]
     passed_runs = sum(1 for cell_status, cell in items if cell_status == 200 and cell.get("state") == "succeeded")
@@ -97,7 +105,7 @@ def broker_cell(broker_url: str, model: str, contract: str, *, runs: int = 1) ->
 
 
 def structured_gate_passes(outcomes: list[dict]) -> bool:
-    """Require one real fixed target to pass all of its consecutive runs."""
+    """Require one Stage/Model cell to pass all of its configured runs."""
     return any(
         item.get("path") == "broker_direct"
         and item.get("contract") == "structured"

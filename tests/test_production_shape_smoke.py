@@ -10,14 +10,15 @@ def test_sized_prompt_matches_real_character_and_utf8_shape_without_original_tex
     assert "Return exactly one JSON object" in prompt
 
 
-def test_structured_canary_requires_three_successes_on_the_same_target(monkeypatch):
+def test_structured_canary_uses_stage_contract_for_three_successful_runs(monkeypatch):
     calls = []
 
     def fake_request(url, *, payload=None, headers=None, timeout=70):
-        if url.endswith("/providers?window=24h"):
-            return 200, {"providers": [{"enabled": True, "calibrated": True, "models": ["gpt-5.6-luna"], "fingerprint": "fp"}]}
+        if url.endswith("/stages?window=24h"):
+            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable_key_count": 1}]}
+        assert url.endswith("/stages/test")
         calls.append(payload)
-        return 200, {"items": [{"state": "succeeded"}]}
+        return 200, {"stage": "standard", "model": "gpt-5.6-luna", "items": [{"state": "succeeded"}]}
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)
     result = broker_cell("http://broker", "gpt-5.6-luna", "structured", runs=3)
@@ -25,13 +26,13 @@ def test_structured_canary_requires_three_successes_on_the_same_target(monkeypat
     assert result["state"] == "succeeded"
     assert result["runs"] == result["passed_runs"] == 3
     assert len(calls) == 3
-    assert {call["fingerprint"] for call in calls} == {"fp"}
+    assert calls == [{"stage": "standard", "model": "gpt-5.6-luna"}] * 3
 
 
 def test_structured_canary_fails_when_no_enabled_target_exists(monkeypatch):
     def fake_request(url, *, payload=None, headers=None, timeout=70):
-        if url.endswith("/providers?window=24h"):
-            return 200, {"providers": []}
+        if url.endswith("/stages?window=24h"):
+            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable_key_count": 0}]}
         raise AssertionError("probe must not run without a target")
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)
