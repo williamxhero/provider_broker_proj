@@ -200,9 +200,9 @@ def test_cpa_openai_compatibility_key_entries_and_model_aliases_are_supported():
 
 
 def test_public_provider_inventory_uses_builtin_model_ids_without_endpoint_ids():
-    assert _public_model_ids("https://api.deepseek.com/v1", ["deepseek-v4-flash", "deepseek-v4-pro"]) == {
-        "deepseek-v4-flash": "deepseek-v4-flash",
-        "deepseek-v4-pro": "deepseek-v4-pro",
+    assert _public_model_ids("https://api.deepseek.com/v1", ["deepseek-v4-flash-0731", "deepseek-v4.1-flash"]) == {
+        "deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
     }
     assert _public_model_ids("https://ark.cn-beijing.volces.com/api/v3", ["doubao-seed-2.0-lite"]) == {
         "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",

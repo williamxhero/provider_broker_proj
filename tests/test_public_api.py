@@ -650,15 +650,21 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     assert duplicate.status == 409
 
     listed = await client.get('/admin/v1/pricing?provider=api-openai&model=api-model&currency=CNY', headers=headers)
+    assert (await listed.json())['items'] == []
+    approved_price = await client.post('/admin/v1/pricing', headers=headers, json={
+        'provider_id': provider['id'], 'model_id': 'gpt-5.6-luna', 'output_price_cny': 4,
+    })
+    assert approved_price.status == 201
+    listed = await client.get('/admin/v1/pricing?provider=api-openai&model=gpt-5.6-luna&currency=CNY', headers=headers)
     item = (await listed.json())['items'][0]
     assert item == {
         'id': item['id'], 'active': True,
         'provider': {'id': provider['id'], 'name': 'API OpenAI', 'provider_key': 'api-openai'},
-        'model': {'id': 'api-model'}, 'output_price_cny': 4.0,
+        'model': {'id': 'gpt-5.6-luna'}, 'output_price_cny': 4.0,
     }
     assert not {'stage', 'source', 'source_kind', 'source_name', 'source_url', 'source_evidence', 'currency'} & item.keys()
     events = await client.get('/admin/v1/configuration-events', headers=headers)
-    assert any(event['setting'] == 'pricing:%s:api-model' % provider['id'] and event['source'] == 'pricing' for event in (await events.json())['items'])
+    assert any(event['setting'] == 'pricing:%s:gpt-5.6-luna' % provider['id'] and event['source'] == 'pricing' for event in (await events.json())['items'])
 
     invalid = await client.post('/admin/v1/pricing', headers=headers, json={
         'provider_id': provider['id'], 'model_id': 'api-model', 'output_price_cny': -1,
@@ -669,13 +675,15 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     })
     assert legacy_write.status == 400
 
-    updated = await client.put(f"/admin/v1/pricing/{provider['id']}/api-model", headers=headers, json={
+    updated = await client.put(f"/admin/v1/pricing/{provider['id']}/gpt-5.6-luna", headers=headers, json={
         'output_price_cny': 8,
     })
     assert updated.status == 200
-    assert (await client.delete(f"/admin/v1/pricing/{provider['id']}/api-model", headers=headers)).status == 204
+    assert (await client.delete(f"/admin/v1/pricing/{provider['id']}/gpt-5.6-luna", headers=headers)).status == 204
     inactive = await client.get('/admin/v1/pricing?provider=api-openai&include_inactive=true', headers=headers)
-    assert (await inactive.json())['items'][0]['active'] is False
+    inactive_items = (await inactive.json())['items']
+    assert {item['model']['id'] for item in inactive_items} == {'gpt-5.6-luna'}
+    assert inactive_items[0]['active'] is False
 
 
 async def test_pricing_api_validates_removed_binding_api_and_exposes_inventory_without_legacy_writes(client, cpa):

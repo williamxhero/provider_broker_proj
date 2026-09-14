@@ -1,16 +1,9 @@
-from provider_broker.catalog import CATALOG, canonicalize
+from provider_broker.catalog import APPROVED_STAGE_MODELS, CATALOG, canonicalize
 from provider_broker.db import Store
 from provider_broker.upstream import model_fulfills
 
 
-APPROVED_STAGES = {
-    "standard": {"doubao-seed-2.0-lite"},
-    "smart": {
-        "glm-5.3-flash", "deepseek-v4-flash", "qwen3.8-flash-next",
-        "doubao-seed-2.1-turbo", "doubao-seed-2.1-pro",
-    },
-    "expert": {"glm-5.3", "deepseek-v4-pro"},
-}
+APPROVED_STAGES = {stage: set(models) for stage, models in APPROVED_STAGE_MODELS.items()}
 
 
 def test_approved_catalog_entries_have_explicit_stage_and_output_price():
@@ -27,9 +20,9 @@ def test_approved_catalog_entries_have_explicit_stage_and_output_price():
 
 def test_approved_aliases_canonicalize_deterministically():
     aliases = {
-        "DeepSeek_V4_Flash": "deepseek-v4-flash",
-        "deepseek-v4-1-flash": "deepseek-v4-flash",
-        "deepseek-reasoner": "deepseek-v4-flash",
+        "DeepSeek_V4_Flash": "deepseek-v4-flash-0731",
+        "deepseek-v4-1-flash": "deepseek-v4.1-flash",
+        "deepseek-reasoner": "deepseek-v4.1-flash",
         "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
         "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
         "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
@@ -50,8 +43,8 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
         "inventory_status": "available",
     }], "2026-09-12T00:00:00+00:00")
 
-    assert {provider.models[0] for provider in store.providers("standard")} == set()
-    assert {provider.models[0] for provider in store.providers("smart")} == {"deepseek-v4-flash"}
+    assert {provider.models[0] for provider in store.providers("standard")} == {"deepseek-v4-flash-0731"}
+    assert {provider.models[0] for provider in store.providers("smart")} == set()
     assert {provider.models[0] for provider in store.providers("expert")} == {"glm-5.3"}
     assert "unknown-provider-model" in store.inventory()[0]["models"]
     assert all("unknown-provider-model" not in provider.models for provider in store.providers("smart"))
@@ -73,8 +66,8 @@ def test_legacy_catalog_writes_are_removed_and_fixed_directory_is_stable(tmp_pat
 
 
 def test_model_fulfillment_requires_known_model_and_never_downgrades():
-    assert model_fulfills("deepseek-v4-flash", "glm-5.3-flash")
-    assert model_fulfills("deepseek-v4-pro", "glm-5.3")
+    assert model_fulfills("deepseek-v4-flash-0731", "glm-5.3-flash")
+    assert model_fulfills("deepseek-v4.1-flash", "glm-5.3")
     assert model_fulfills("glm-5.3", "glm-5.3")
     assert not model_fulfills("glm-5.3", "glm-5.3-flash")
     assert not model_fulfills("deepseek-v4-flash-0731", "unrecognized-model")

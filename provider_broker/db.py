@@ -13,6 +13,8 @@ from urllib.parse import urlsplit
 from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 
 from .catalog import (
+    APPROVED_MODEL_IDS,
+    APPROVED_STAGE_MODELS,
     OFFICIAL_PRICE_SNAPSHOT,
     OFFICIAL_PROVIDER_SNAPSHOTS,
     canonicalize,
@@ -40,11 +42,7 @@ STAGE_RESOURCE_FIELDS = frozenset({
 # The management console intentionally exposes the three routing stages, not
 # every model discovered in a provider's inventory.  Runtime routing may still
 # use the wider canonical catalog.
-STAGE_MODELS = {
-    "standard": "gpt-5.6-luna",
-    "smart": "gpt-5.6-terra",
-    "expert": "gpt-5.6-sol",
-}
+STAGE_MODELS = APPROVED_STAGE_MODELS
 
 
 def broker_release_version() -> str:
@@ -968,6 +966,7 @@ class Store:
         model_map = {
             row['id']: {'id': row['id'], 'stage': row['stage'], 'family': row['family'], 'active': bool(row['active'])}
             for row in model_rows
+            if row['id'] in APPROVED_MODEL_IDS
         }
         if model:
             model_id = canonicalize(model)
@@ -2614,11 +2613,14 @@ class Store:
         routing may still enumerate the wider canonical catalog separately.
         """
         catalog = self.canonical_models()
-        candidate = STAGE_MODELS.get(stage)
-        if candidate is None or candidate not in catalog:
+        candidates = STAGE_MODELS.get(stage)
+        if not candidates:
             return []
         pairs = []
-        pairs.extend((row, candidate) for row in self._stage_key_rows(stage, candidate, callable_only=True))
+        for candidate in candidates:
+            if candidate not in catalog:
+                continue
+            pairs.extend((row, candidate) for row in self._stage_key_rows(stage, candidate, callable_only=True))
         result = []
         seen = set()
         for row, candidate in pairs:
@@ -2677,55 +2679,55 @@ class Store:
         resources = []
         stage_order = ("standard", "smart", "expert")
         for stage in stage_order:
-            model = STAGE_MODELS[stage]
-            metadata = canonical_model_metadata.get(model)
-            if metadata is None:
-                continue
-            for row in rows:
-                try:
-                    declared = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
-                    tiers = set(json.loads(row["tiers_json"] or "[]"))
-                    source = json.loads(row["source_json"] or "{}")
-                except (TypeError, ValueError):
-                    declared, tiers, source = set(), set(), {}
-                if model not in declared or stage not in tiers:
+            for model in STAGE_MODELS[stage]:
+                metadata = canonical_model_metadata.get(model)
+                if metadata is None:
                     continue
-                fingerprint = row["fingerprint"]
-                accounting = self.accounting(window=window, fingerprint=fingerprint, stage=stage, model=model)
-                stats, _ = self._stage_scope_stats(stage, [model], [fingerprint], window)
-                callable_now = any(
-                    item["fingerprint"] == fingerprint
-                    for item in self._stage_key_rows(stage, model, callable_only=True)
-                )
-                latest = self._latest_stage_test([model], [fingerprint])
-                inventory_status = source.get("inventory_status")
-                status = "disabled" if not row["enabled"] else (
-                    "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
-                )
-                provider_type = canonical_provider_type(
-                    row["pricing_provider_type"] or row["provider_type"],
-                    base_url=row["base_url"],
-                ) or "UNKNOWN"
-                resources.append({
-                    "stage": stage,
-                    "fingerprint": fingerprint,
-                    "note": row["note"],
-                    "model": model,
-                    "family": metadata["family"],
-                    "provider_type": provider_type,
-                    "normalized_hostname": normalize_hostname(row["base_url"]) or "UNKNOWN",
-                    "api_key_mask": row["api_key_mask"] or "***",
-                    "status": status,
-                    "max_parallel": row["max_parallel"],
-                    "callable": callable_now,
-                    "latest_test": latest,
-                    "technical_success_rate": stats["rate"],
-                    "avg_first_token_latency_ms": stats["ttft"],
-                    "window": window,
-                    "total_tokens": accounting["total_tokens"],
-                    "fee_buckets": accounting["fee_buckets"],
-                    "edit": {"fingerprint": fingerprint, "href": f"/admin/v1/keys/{fingerprint}"},
-                })
+                for row in rows:
+                    try:
+                        declared = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
+                        tiers = set(json.loads(row["tiers_json"] or "[]"))
+                        source = json.loads(row["source_json"] or "{}")
+                    except (TypeError, ValueError):
+                        declared, tiers, source = set(), set(), {}
+                    if model not in declared or stage not in tiers:
+                        continue
+                    fingerprint = row["fingerprint"]
+                    accounting = self.accounting(window=window, fingerprint=fingerprint, stage=stage, model=model)
+                    stats, _ = self._stage_scope_stats(stage, [model], [fingerprint], window)
+                    callable_now = any(
+                        item["fingerprint"] == fingerprint
+                        for item in self._stage_key_rows(stage, model, callable_only=True)
+                    )
+                    latest = self._latest_stage_test([model], [fingerprint])
+                    inventory_status = source.get("inventory_status")
+                    status = "disabled" if not row["enabled"] else (
+                        "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
+                    )
+                    provider_type = canonical_provider_type(
+                        row["pricing_provider_type"] or row["provider_type"],
+                        base_url=row["base_url"],
+                    ) or "UNKNOWN"
+                    resources.append({
+                        "stage": stage,
+                        "fingerprint": fingerprint,
+                        "note": row["note"],
+                        "model": model,
+                        "family": metadata["family"],
+                        "provider_type": provider_type,
+                        "normalized_hostname": normalize_hostname(row["base_url"]) or "UNKNOWN",
+                        "api_key_mask": row["api_key_mask"] or "***",
+                        "status": status,
+                        "max_parallel": row["max_parallel"],
+                        "callable": callable_now,
+                        "latest_test": latest,
+                        "technical_success_rate": stats["rate"],
+                        "avg_first_token_latency_ms": stats["ttft"],
+                        "window": window,
+                        "total_tokens": accounting["total_tokens"],
+                        "fee_buckets": accounting["fee_buckets"],
+                        "edit": {"fingerprint": fingerprint, "href": f"/admin/v1/keys/{fingerprint}"},
+                    })
         return resources
 
     def _stage_scope_stats(self, stage: str, models: list[str], fingerprints: list[str], window: str) -> tuple[dict, dict]:

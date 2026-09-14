@@ -33,8 +33,8 @@ _CPA_CONFIG_SECTIONS = {
 # name when Ark does not expose a useful /models inventory.
 _PUBLIC_MODEL_IDS = {
     "deepseek.com": {
-        "deepseek-v4-flash": "deepseek-v4-flash",
-        "deepseek-v4-pro": "deepseek-v4-pro",
+        "deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
+        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
     },
     "volces.com": {
         "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",

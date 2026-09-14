@@ -117,13 +117,13 @@ def test_pricing_console_shows_only_provider_model_and_cny_price(tmp_path):
         seeded = threading.Event()
         def seed():
             store = broker.app["store"]
-            store.create_canonical_model("console-model", stage="smart", family="Console family")
+            console_model = "gpt-5.6-luna"
             provider_id = store.create_pricing_provider(
                 "console-openai", provider_type="openai",
                 name="Console <img src=x onerror=window.__injected=1>",
             )
             store.insert_provider_model_price(
-                provider_id=provider_id, model_id="console-model", output_price_cny=4,
+                provider_id=provider_id, model_id=console_model, output_price_cny=4,
                 source_name="Console price list", source_url="https://prices.invalid/console",
                 source_evidence="Evidence <script>window.__injected=2</script>",
                 verified_at="2026-09-12T00:00:00Z",
@@ -135,7 +135,7 @@ def test_pricing_console_shows_only_provider_model_and_cny_price(tmp_path):
         browser = playwright.chromium.launch()
         page = browser.new_page()
         page.goto(broker.url)
-        page.locator("#pricing").get_by_text("console-model", exact=True).first.wait_for()
+        page.locator("#pricing").get_by_text("gpt-5.6-luna", exact=True).first.wait_for()
         assert page.evaluate("window.__injected") is None
         assert page.locator("#pricing img, #pricing svg, #pricing script").count() == 0
         assert page.locator("#pricing").get_by_text("4", exact=True).count() == 1

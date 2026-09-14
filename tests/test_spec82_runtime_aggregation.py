@@ -2,6 +2,7 @@ import json
 from pathlib import Path
 
 from provider_broker.db import Store
+from provider_broker.catalog import APPROVED_STAGE_MODELS
 from provider_broker.upstream import estimate_cost_details
 
 
@@ -121,21 +122,22 @@ def test_stage_resources_are_one_row_per_fixed_model_and_api_key(tmp_path):
     assert not any(item["model"] in {"standard-low", "standard-high"} for item in stages)
 
 
-def test_stage_resources_use_only_the_three_approved_primary_models(tmp_path):
+def test_stage_resources_use_the_complete_approved_stage_model_mapping(tmp_path):
     store = make_store(tmp_path)
     add_inventory(store, [{
         "name": "All models", "base_url": "https://all.vendor.example.com/v1",
         "api_key": "all-stage-secret", "provider_type": "openai",
         "models": [
-            "gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.5",
-            "claude-sonnet-5", "claude-opus-5", "deepseek-v4-flash",
+            *[model for models in APPROVED_STAGE_MODELS.values() for model in models],
+            "gpt-5.6", "unknown-provider-model",
         ], "inventory_status": "available",
     }])
 
     stages = store.stage_resources("24h")
 
     assert [(item["stage"], item["model"]) for item in stages] == [
-        ("standard", "gpt-5.6-luna"),
-        ("smart", "gpt-5.6-terra"),
-        ("expert", "gpt-5.6-sol"),
+        (stage, model)
+        for stage, models in APPROVED_STAGE_MODELS.items()
+        for model in models
     ]
+    assert "unknown-provider-model" not in {item["model"] for item in stages}
