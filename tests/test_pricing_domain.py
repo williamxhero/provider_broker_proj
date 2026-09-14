@@ -83,16 +83,9 @@ def test_relay_binding_requires_active_objects_and_protects_referenced_rows(tmp_
         provider_id=base_id, model_id="model-a", source_kind="direct",
         input_price=1, cache_price=0.1, output_price=2, currency="USD",
     )
-    db.bind_relay_price(relay_id, "model-a", base_id, "model-a")
-
-    assert db.relay_price_bindings()[0]["benchmark_provider_id"] == base_id
-    assert db.deactivate_pricing_provider(base_id) is True
-    with pytest.raises(sqlite3.IntegrityError):
+    with pytest.raises(ValueError, match="relay price bindings have been removed"):
         db.bind_relay_price(relay_id, "model-a", base_id, "model-a")
-    with pytest.raises(ValueError, match="referenced"):
-        db.delete_pricing_provider(base_id)
-    with pytest.raises(ValueError, match="referenced"):
-        db.delete_canonical_model("model-a")
+    assert db.relay_price_bindings() == []
 
 
 def test_legacy_migration_is_idempotent_lossless_and_does_not_reprice_observations(tmp_path):
@@ -117,19 +110,16 @@ def test_legacy_migration_is_idempotent_lossless_and_does_not_reprice_observatio
     second = db.migrate_pricing()
     prices = [row for row in db.provider_model_prices() if row["model_id"] == "legacy-model"]
 
-    assert first["migrated"] is True
+    assert first["migrated"] is False
     assert second["migrated"] is False
-    assert len(prices) == 1
-    assert prices[0]["source_kind"] == "official" and prices[0]["unpriced"] is True
+    assert prices == []
     assert db.conn.execute("SELECT cost FROM observation").fetchone()[0] == 123.45
-    assert db.conn.execute("SELECT multiplier FROM pricing_provider WHERE provider_type='relay'").fetchone()[0] == 1.0
-    mapping = db.key_model_mappings(fingerprint="legacy-fp", model="legacy-model")[0]
-    assert mapping["target_provider_type"] == "official" and mapping["multiplier"] == 1.7
-    assert db.conn.execute("SELECT pricing_provider_id FROM source_provider WHERE fingerprint='legacy-fp'").fetchone()[0]
+    assert db.key_model_mappings(fingerprint="legacy-fp", model="legacy-model") == []
+    assert db.conn.execute("SELECT pricing_provider_id FROM source_provider WHERE fingerprint='legacy-fp'").fetchone()[0] is None
     assert db.conn.execute("SELECT count(*) FROM pricing_migration").fetchone()[0] == 1
 
 
-def test_legacy_migration_rolls_back_every_domain_write_on_partial_failure(tmp_path):
+def test_legacy_catalog_rows_cannot_create_pricing_or_models(tmp_path):
     db = store(tmp_path)
     db.conn.execute(
         "INSERT INTO model_catalog(model,family,intellect,input_price,cache_price,output_price,currency) VALUES(?,?,?,?,?,?,?)",
@@ -142,17 +132,11 @@ def test_legacy_migration_rolls_back_every_domain_write_on_partial_failure(tmp_p
          json.dumps(["boom"]), json.dumps({"provider_type": "direct"}), "2026-09-14T00:00:00Z"),
     )
     db.conn.execute("INSERT INTO policy(fingerprint) VALUES(?)", ("boom-key",))
-    db.conn.execute(
-        "CREATE TRIGGER fail_pricing_migration BEFORE INSERT ON canonical_model "
-        "WHEN NEW.id='boom' BEGIN SELECT RAISE(ABORT, 'forced failure'); END"
-    )
     before_prices = db.conn.execute("SELECT count(*) FROM provider_model_price").fetchone()[0]
     db.conn.commit()
 
-    with pytest.raises(sqlite3.IntegrityError, match="forced failure"):
-        db.migrate_pricing()
+    result = db.migrate_pricing()
 
     assert db.conn.execute("SELECT count(*) FROM provider_model_price").fetchone()[0] == before_prices
     assert db.conn.execute("SELECT 1 FROM canonical_model WHERE id='boom'").fetchone() is None
-    status = db.conn.execute("SELECT status,error FROM pricing_migration WHERE version=2").fetchone()
-    assert status["status"] == "failed" and "forced failure" in status["error"]
+    assert result["migrated"] is False

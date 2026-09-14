@@ -65,8 +65,8 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
         else:
             rows = store.health_results(tier, fingerprint, model)
             candidates = [store.probe_provider(row["fingerprint"], row["model"]) for row in rows]
-    catalog = store.catalog()
-    candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("intellect") == tier)
+    catalog = store.model_directory()
+    candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("stage") == tier)
                   and (not fingerprint or candidate.fingerprint == fingerprint) and (not model or candidate.models[0] == model)]
     if mode == "race" and targets is None:
         if any(hasattr(candidate, "price_currency") for candidate in candidates):
@@ -98,7 +98,7 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
 
     async def one(provider):
         requested_model = provider.models[0]
-        candidate_tier = catalog[requested_model]["intellect"]
+        candidate_tier = catalog[requested_model]["stage"]
         started = (clock or (lambda: datetime.now(UTC)))()
         result = {"fingerprint": provider.fingerprint, "provider": provider.name, "model": requested_model,
                   "state": "failed", "error_type": None, "ttfb_ms": None, "ttft_ms": None, "duration_ms": None}
@@ -166,8 +166,8 @@ async def scheduler(app):
                 for fingerprint, model in due:
                     provider = store.probe_provider(fingerprint, model)
                     if provider:
-                        catalog = store.catalog()[model]
-                        await run_probe(store, tier=catalog["intellect"], mode="all", fingerprint=fingerprint, model=model,
+                        catalog = store.model_directory()[model]
+                        await run_probe(store, tier=catalog["stage"], mode="all", fingerprint=fingerprint, model=model,
                                         timeout_ms=settings.probe_timeout_ms, concurrency=settings.probe_concurrency, clock=clock)
             await asyncio.sleep(max(1, settings.health_scheduler_seconds))
     except asyncio.CancelledError:

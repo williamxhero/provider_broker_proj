@@ -1,15 +1,13 @@
 const byId = (id) => document.getElementById(id);
 const sortDefaults = {
   providers: { key: "note", direction: "asc" },
-  catalog: { key: "model", direction: "asc" },
   modelView: { key: "stage", direction: "asc" },
   models: { key: "id", direction: "asc" },
   pricing: { key: "provider", direction: "asc" },
-  bindings: { key: "relay", direction: "asc" },
   probeResults: { key: "provider", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, catalogModel: null, model: null, pricing: null, binding: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], stages: [], catalog: {}, summary: {}, sorts: {}, probeResults: [], models: [], pricingItems: [] };
+const state = { cursor: "", provider: null, model: null, pricing: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], stages: [], summary: {}, sorts: {}, probeResults: [], models: [], pricingItems: [] };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" ? "n/a" : String(value);
@@ -218,33 +216,6 @@ function closeEditor() {
   state.provider = null;
 }
 
-function openCatalogEditor(model, item) {
-  state.catalogModel = model || null;
-  const form = byId("catalog-form");
-  form.reset();
-  form.elements.model.value = model || "";
-  form.elements.model.readOnly = Boolean(model);
-  form.elements.family.value = item?.family || "";
-  form.elements.intellect.value = item?.intellect || "standard";
-  form.elements.official_input_price.value = item?.official_input_price ?? "";
-  form.elements.official_cache_price.value = item?.official_cache_price ?? "";
-  form.elements.official_output_price.value = item?.official_output_price ?? "";
-  updateBlendedPrice();
-  byId("catalog-delete").hidden = !model;
-  byId("catalog-editor").hidden = false;
-  form.elements.model.focus();
-}
-
-function updateBlendedPrice() {
-  const form = byId("catalog-form");
-  const input = Number(form.elements.official_input_price.value);
-  const cached = Number(form.elements.official_cache_price.value);
-  const output = Number(form.elements.official_output_price.value);
-  form.elements.blended_price.value = [input, cached, output].every(Number.isFinite)
-    ? (input * 0.04 + cached * 0.16 + output * 0.80).toFixed(6)
-    : "";
-}
-
 function openModelEditor(model) {
   state.model = model || null;
   const form = byId("model-form");
@@ -291,7 +262,6 @@ function openPricingEditor(item) {
   form.elements.input_price.value = item?.base_price?.input ?? "";
   form.elements.cache_price.value = item?.base_price?.cache ?? "";
   form.elements.output_price.value = item?.base_price?.output ?? "";
-  form.elements.multiplier.value = item?.final_price?.multiplier ?? 1;
   form.elements.currency.value = item?.base_price?.currency || "USD";
   form.elements.source_name.value = item?.source?.name || "";
   form.elements.source_url.value = item?.source?.url || "";
@@ -310,9 +280,9 @@ function closePricingEditor() {
 function renderPricing(items = state.pricingItems) {
   state.pricingItems = items;
   const table = byId("pricing");
-  const columns = [{ key: "provider", label: "Provider" }, { key: "provider_type", label: "Provider 类型" }, { key: "inventory", label: "库存关系" }, { key: "model", label: "Model" }, { key: "stage", label: "Stage" }, { key: "base", label: "输入 / 缓存 / 输出" }, { key: "currency", label: "币种" }, { key: "multiplier", label: "倍率" }, { key: "final", label: "最终输入 / 缓存 / 输出 / 加权" }, { key: "source", label: "来源" }, { key: "status", label: "状态" }, { label: "操作" }];
+  const columns = [{ key: "provider", label: "Provider" }, { key: "provider_type", label: "Provider 类型" }, { key: "inventory", label: "库存关系" }, { key: "model", label: "Model" }, { key: "stage", label: "Stage" }, { key: "base", label: "输入 / 缓存 / 输出" }, { key: "currency", label: "币种" }, { key: "final", label: "最终输入 / 缓存 / 输出 / 加权" }, { key: "source", label: "来源" }, { key: "status", label: "状态" }, { label: "操作" }];
   const body = tableHead(table, columns, "pricing", () => renderPricing());
-  sortItems(items, "pricing", (item, key) => ({ provider: item.provider.name, provider_type: item.provider.type, inventory: item.provider.inventory_models.join(" "), model: item.model.id, stage: item.model.stage, base: item.base_price.input, currency: item.base_price.currency, multiplier: item.final_price?.multiplier, final: item.final_price?.blended, source: item.source.evidence, status: item.status }[key])).forEach((item) => {
+  sortItems(items, "pricing", (item, key) => ({ provider: item.provider.name, provider_type: item.provider.type, inventory: item.provider.inventory_models.join(" "), model: item.model.id, stage: item.model.stage, base: item.base_price.input, currency: item.base_price.currency, final: item.final_price?.blended, source: item.source.evidence, status: item.status }[key])).forEach((item) => {
     const row = document.createElement("tr");
     if (!item.active || item.unpriced) row.className = "inactive-row";
     const base = item.base_price;
@@ -320,7 +290,7 @@ function renderPricing(items = state.pricingItems) {
     const source = item.source;
     [item.provider.name, item.provider.type, item.provider.inventory_models.join(", "), item.model.id, item.model.stage,
       `${formatPrice(base.input)} / ${formatPrice(base.cache)} / ${formatPrice(base.output)}`,
-      base.currency, formatMultiplier(final?.multiplier),
+      base.currency,
       final ? `${formatPrice(final.input)} / ${formatPrice(final.cache)} / ${formatPrice(final.output)} / ${formatPrice(final.blended)}` : (item.reason || "未定价"),
       `${empty(source.name)} · ${empty(source.type || source.kind)} · ${empty(source.evidence)} · ${empty(source.url)} · ${empty(source.verified_at)}`,
       item.active ? (item.unpriced ? "未定价" : "已定价") : "已停用"].forEach((value) => row.append(cell(value)));
@@ -332,45 +302,6 @@ function renderPricing(items = state.pricingItems) {
   });
 }
 
-function renderPricingBindings(items = []) {
-  const table = byId("pricing-bindings");
-  const columns = [{ key: "relay", label: "Relay Model" }, { key: "benchmark", label: "基准 Provider + Model" }, { key: "source", label: "绑定来源" }, { key: "active", label: "状态" }, { label: "操作" }];
-  const body = tableHead(table, columns, "bindings", () => renderPricingBindings(items));
-  items.forEach((item) => {
-    const row = document.createElement("tr");
-    if (!item.active) row.className = "inactive-row";
-    [item.relay.provider_key + " · " + item.relay.model_id, item.benchmark.provider_key + " · " + item.benchmark.model_id, `${empty(item.source.name)} · ${empty(item.source.evidence)} · ${empty(item.source.url)}`, item.active ? "启用" : "已停用"].forEach((value) => row.append(cell(value)));
-    const action = document.createElement("td");
-    const edit = document.createElement("button");
-    edit.type = "button"; edit.className = "text-button"; edit.textContent = "编辑";
-    edit.addEventListener("click", () => openBindingEditor(item));
-    action.append(edit); row.append(action);
-    body.append(row);
-  });
-}
-
-function openBindingEditor(item) {
-  state.binding = item || null;
-  const form = byId("binding-form");
-  form.reset();
-  form.elements.relay_provider_id.value = item?.relay?.provider_id || "";
-  form.elements.relay_model_id.value = item?.relay?.model_id || "";
-  form.elements.benchmark_provider_id.value = item?.benchmark?.provider_id || "";
-  form.elements.benchmark_model_id.value = item?.benchmark?.model_id || "";
-  form.elements.source_name.value = item?.source?.name || "";
-  form.elements.source_url.value = item?.source?.url || "";
-  form.elements.source_evidence.value = item?.source?.evidence || "";
-  ["relay_provider_id", "relay_model_id"].forEach((name) => { form.elements[name].readOnly = Boolean(item); });
-  byId("binding-deactivate").hidden = !item || !item.active;
-  byId("binding-editor").hidden = false;
-  form.elements.relay_provider_id.focus();
-}
-
-function closeBindingEditor() {
-  byId("binding-editor").hidden = true;
-  state.binding = null;
-}
-
 async function loadPricingViews() {
   const query = new URLSearchParams({
     provider: byId("pricing-filter-provider").value,
@@ -380,19 +311,12 @@ async function loadPricingViews() {
     status: byId("pricing-filter-status").value,
   });
   [...query.keys()].forEach((key) => { if (!query.get(key)) query.delete(key); });
-  const [models, prices, bindings] = await Promise.all([
+  const [models, prices] = await Promise.all([
     requestJson(`/admin/v1/models?include_inactive=true`),
     requestJson(`/admin/v1/pricing?${query}`),
-    requestJson(`/admin/v1/pricing/bindings`),
   ]);
   renderModelDirectory(models.items);
   renderPricing(prices.items);
-  renderPricingBindings(bindings.items);
-}
-
-function closeCatalogEditor() {
-  byId("catalog-editor").hidden = true;
-  state.catalogModel = null;
 }
 
 function renderProviders(payload) {
@@ -418,27 +342,6 @@ function renderProviders(payload) {
 
 function providerDomain(baseUrl) {
   try { return new URL(baseUrl).origin; } catch (_) { return baseUrl; }
-}
-
-function renderCatalog(payload) {
-  state.catalog = payload.catalog;
-  const table = byId("catalog");
-  const columns = [{ key: "model", label: "模型 ID" }, { key: "family", label: "模型家族" }, { key: "intellect", label: "stage" }, { key: "official_input_price", label: "输入 / 1M" }, { key: "official_cache_price", label: "缓存输入 / 1M" }, { key: "official_output_price", label: "输出 / 1M" }, { key: "blended_price", label: "整合价 / 1M" }, { key: "available_provider_count", label: "可用 Key" }, { label: "操作" }];
-  const body = tableHead(table, columns, "catalog", () => renderCatalog({ catalog: state.catalog }));
-  const entries = sortItems(Object.entries(payload.catalog).map(([model, item]) => ({ model, ...item })), "catalog", (item, key) => key === "intellect" ? stageOrder(item.intellect) : item[key]);
-  entries.forEach((item) => {
-    const row = document.createElement("tr");
-    [item.model, item.family, item.intellect, formatPrice(item.official_input_price), formatPrice(item.official_cache_price), formatPrice(item.official_output_price), formatPrice(item.blended_price), item.available_provider_count].forEach((value) => row.append(cell(value)));
-    const action = document.createElement("td");
-    const edit = document.createElement("button");
-    edit.type = "button";
-    edit.className = "text-button";
-    edit.textContent = "编辑";
-    edit.addEventListener("click", () => openCatalogEditor(item.model, item));
-    action.append(edit);
-    row.append(action);
-    body.append(row);
-  });
 }
 
 function stageOrder(value) {
@@ -625,16 +528,14 @@ async function loadStageView() {
 }
 
 async function load() {
-  const [summary, providers, catalog, routing, stages] = await Promise.all([
+  const [summary, providers, routing, stages] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
-    requestJson("/admin/v1/catalog"),
     requestJson("/admin/v1/routing"),
     requestJson(`/admin/v1/stages?window=${encodeURIComponent(state.qualityWindow)}`),
   ]);
   renderSummary(summary);
   renderProviders(providers);
-  renderCatalog(catalog);
   renderModelView(stages);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
@@ -662,7 +563,6 @@ byId("policy").addEventListener("submit", async (event) => {
     id: Number(row.dataset.mappingId),
     target_provider_id: Number(row.querySelector('[name="target_provider_id"]').value),
     target_model_id: row.querySelector('[name="target_model_id"]').value,
-    multiplier: Number(row.querySelector('[name="multiplier"]').value),
     enabled: row.querySelector('[name="enabled"]').checked,
   }));
   await requestJson(`/admin/v1/keys/${encodeURIComponent(state.provider.fingerprint)}?window=${encodeURIComponent(state.qualityWindow)}`, {
@@ -691,37 +591,6 @@ byId("probe-stage").addEventListener("change", () => loadProbeResults().catch(()
   } catch (_) { output.textContent = "探针执行失败"; }
 }));
 
-byId("catalog-create").addEventListener("click", () => openCatalogEditor());
-byId("catalog-apply").addEventListener("click", async () => {
-  const result = await requestJson("/admin/v1/catalog/apply", { method: "POST" });
-  await load();
-  byId("syncresult").textContent = `已应用目录：${result.providers} 个 Key，保留 ${result.retained_models} 个模型，移除 ${result.removed_models} 个模型`;
-});
-["official_input_price", "official_cache_price", "official_output_price"].forEach((name) => byId("catalog-form").elements[name].addEventListener("input", updateBlendedPrice));
-byId("catalog-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const body = {
-    family: form.elements.family.value,
-    intellect: form.elements.intellect.value,
-    official_input_price: Number(form.elements.official_input_price.value),
-    official_cache_price: Number(form.elements.official_cache_price.value),
-    official_output_price: Number(form.elements.official_output_price.value),
-  };
-  if (state.catalogModel) {
-    await requestJson(`/admin/v1/catalog/${encodeURIComponent(state.catalogModel)}`, { method: "PUT", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  } else {
-    await requestJson("/admin/v1/catalog", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ ...body, model: form.elements.model.value }) });
-  }
-  closeCatalogEditor();
-  await load();
-});
-byId("catalog-delete").addEventListener("click", async () => {
-  await requestJson(`/admin/v1/catalog/${encodeURIComponent(state.catalogModel)}`, { method: "DELETE" });
-  closeCatalogEditor();
-  await load();
-});
-
 byId("model-create").addEventListener("click", () => openModelEditor());
 byId("model-form").addEventListener("submit", async (event) => {
   event.preventDefault();
@@ -748,7 +617,6 @@ byId("pricing-form").addEventListener("submit", async (event) => {
     source_kind: form.elements.source_kind.value,
     input_price: Number(form.elements.input_price.value), cache_price: Number(form.elements.cache_price.value),
     output_price: Number(form.elements.output_price.value), currency: form.elements.currency.value,
-    multiplier: Number(form.elements.multiplier.value),
     source_name: form.elements.source_name.value || null, source_url: form.elements.source_url.value || null, source_evidence: form.elements.source_evidence.value || null,
     verified_at: form.elements.verified_at.value || null,
   };
@@ -764,35 +632,11 @@ byId("pricing-deactivate").addEventListener("click", async () => {
 });
 ["close-pricing-editor", "cancel-pricing-editor"].forEach((id) => byId(id).addEventListener("click", closePricingEditor));
 
-byId("binding-create").addEventListener("click", () => openBindingEditor());
-byId("binding-form").addEventListener("submit", async (event) => {
-  event.preventDefault();
-  const form = event.currentTarget;
-  const fields = {
-    relay_provider_id: Number(form.elements.relay_provider_id.value), relay_model_id: form.elements.relay_model_id.value,
-    benchmark_provider_id: Number(form.elements.benchmark_provider_id.value), benchmark_model_id: form.elements.benchmark_model_id.value,
-    source_name: form.elements.source_name.value || null, source_url: form.elements.source_url.value || null, source_evidence: form.elements.source_evidence.value || null,
-  };
-  const endpoint = state.binding ? `/admin/v1/pricing/bindings/${state.binding.id}` : "/admin/v1/pricing/bindings";
-  const body = state.binding
-    ? { benchmark_provider_id: fields.benchmark_provider_id, benchmark_model_id: fields.benchmark_model_id, source_name: fields.source_name, source_url: fields.source_url, source_evidence: fields.source_evidence }
-    : fields;
-  await requestJson(endpoint, { method: state.binding ? "PUT" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
-  closeBindingEditor(); await loadPricingViews();
-});
-byId("binding-deactivate").addEventListener("click", async () => {
-  await requestJson(`/admin/v1/pricing/bindings/${state.binding.id}`, { method: "DELETE" });
-  closeBindingEditor(); await loadPricingViews();
-});
-["close-binding-editor", "cancel-binding-editor"].forEach((id) => byId(id).addEventListener("click", closeBindingEditor));
-
 ["pricing-filter-provider", "pricing-filter-model", "pricing-filter-currency"].forEach((id) => byId(id).addEventListener("input", () => {
   clearTimeout(state.pricingTimer); state.pricingTimer = setTimeout(() => loadPricingViews().catch(() => {}), 250);
 }));
 byId("pricing-filter-stage").addEventListener("change", () => loadPricingViews().catch(() => {}));
 byId("pricing-filter-status").addEventListener("change", () => loadPricingViews().catch(() => {}));
-byId("close-catalog-editor").addEventListener("click", closeCatalogEditor);
-byId("cancel-catalog-editor").addEventListener("click", closeCatalogEditor);
 
 byId("sync").addEventListener("click", async () => {
   const output = byId("syncresult");

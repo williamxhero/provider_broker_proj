@@ -50,7 +50,10 @@ def test_effective_relay_key_price_uses_mapping_and_binding_is_not_required(tmp_
         provider_id=benchmark_id, model_id="benchmark-model", source_kind="direct",
         input_price=2.0, cache_price=0.5, output_price=8.0, currency="CNY",
     )
-    db.bind_relay_price(relay_id, "relay-model", benchmark_id, "benchmark-model")
+    db.insert_provider_model_price(
+        provider_id=relay_id, model_id="relay-model", source_kind="relay",
+        input_price=2.0, cache_price=0.5, output_price=8.0, currency="CNY",
+    )
     db.conn.execute(
         "INSERT INTO source_provider(fingerprint,name,base_url,api_key,provider_type,models_json,source_json,synced_at) "
         "VALUES(?,?,?,?,?,?,?,?)",

@@ -46,14 +46,12 @@ def test_legacy_catalog_write_is_rejected_when_provider_prices_are_ambiguous(tmp
             input_price=price, cache_price=0.1, output_price=price * 2, currency="USD", multiplier=1.0,
         )
 
-    with pytest.raises(ValueError, match="ambiguous"):
+    with pytest.raises(ValueError, match="compatibility catalog has been removed"):
         db.update_catalog("shared-model", {
             "family": "Shared", "intellect": "smart",
             "official_input_price": 3.0, "official_cache_price": 0.3, "official_output_price": 6.0,
         })
-    assert db.legacy_catalog_projection("shared-model") == {
-        "status": "conflict", "provider_count": 2,
-    }
+    assert db.legacy_catalog_projection("shared-model") == {"status": "removed", "provider_count": 0}
 
 
 def test_pricing_startup_health_reports_migration_and_integrity_gates(tmp_path):
@@ -61,9 +59,9 @@ def test_pricing_startup_health_reports_migration_and_integrity_gates(tmp_path):
     health = db.pricing_health()
 
     assert health["migration"]["status"] == "completed"
-    assert health["migration"]["version"] == 2
+    assert health["migration"]["version"] == 3
     assert health["duplicate_active"] == 0
-    assert health["dangling_bindings"] == 0
+    assert "dangling_bindings" not in health
     assert "unpriced_active" in health
     assert health["startup_ready"] is True
 

@@ -21,7 +21,7 @@ def test_key_model_mapping_is_unique_and_is_the_only_runtime_multiplier(tmp_path
     }], "2026-09-14T00:00:00Z")
     fingerprint = db.conn.execute("SELECT fingerprint FROM source_provider").fetchone()[0]
     official_id = db.conn.execute(
-        "SELECT id FROM pricing_provider WHERE provider_key='official-catalog'"
+        "SELECT id FROM pricing_provider WHERE provider_key='official-seed'"
     ).fetchone()[0]
     mapping_id = db.upsert_key_model_mapping(
         fingerprint, "gpt-5.6", target_provider_id=official_id,
@@ -34,7 +34,7 @@ def test_key_model_mapping_is_unique_and_is_the_only_runtime_multiplier(tmp_path
     resolved = db.effective_key_pricing(fingerprint, "gpt-5.6")
     assert resolved["mapping_id"] == mapping_id
     assert resolved["multiplier"] == 1.25
-    assert resolved["input_price"] == 5.0
+    assert resolved["input_price"] == db.effective_pricing(official_id, "gpt-5.6-sol")["input_price"] * 1.25
     with pytest.raises(sqlite3.IntegrityError):
         db.create_key_model_mapping(
             fingerprint, "gpt-5.6-sol", target_provider_id=official_id,
@@ -42,7 +42,7 @@ def test_key_model_mapping_is_unique_and_is_the_only_runtime_multiplier(tmp_path
         )
 
 
-def test_relay_mapping_targets_official_row_and_missing_mapping_is_unknown(tmp_path):
+def test_relay_mapping_has_an_explicit_endpoint_price_and_missing_mapping_is_unknown(tmp_path):
     db = make_store(tmp_path)
     db.replace_source_snapshot([{
         "name": "relay", "base_url": "https://relay.example/v1", "api_key": "relay-secret",
@@ -51,8 +51,9 @@ def test_relay_mapping_targets_official_row_and_missing_mapping_is_unknown(tmp_p
     }], "2026-09-14T00:00:00Z")
     fingerprint, = db.conn.execute("SELECT fingerprint FROM source_provider").fetchone()
     mapping = db.key_model_mappings(fingerprint=fingerprint)[0]
-    assert mapping["target_provider_key"] == "official-openai"
-    assert db.effective_key_pricing(fingerprint, "gpt-5.6-sol")["priced"] is True
+    assert mapping["target_provider_key"] == "key-source:relay:relay.example"
+    assert db.effective_key_pricing(fingerprint, "gpt-5.6-sol")["priced"] is False
+    assert db.effective_key_pricing(fingerprint, "gpt-5.6-sol")["reason"] == "provider model price is explicitly unpriced"
     assert db.effective_key_pricing(fingerprint, "gpt-5.6-luna")["reason"] == "key-model mapping is missing or disabled"
 
 

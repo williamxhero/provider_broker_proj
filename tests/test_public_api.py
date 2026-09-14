@@ -693,7 +693,7 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     page=await response.text()
     assert 'href="/static/styles.css"' in page
     assert 'src="/static/app.js"' in page
-    for label in ('最近同步','从 CPA 手动同步','API Key','Stage + canonical Model','模型费率','调用质量','调用记录','1h','24h','7d','30d'):
+    for label in ('最近同步','从 CPA 手动同步','API Key','Stage + canonical Model','Provider + Model 价格','调用质量','调用记录','1h','24h','7d','30d'):
         assert label in page
     assert '中转站余额' not in page
     assert 'CPA 是唯一人工维护源' not in page
@@ -756,52 +756,21 @@ async def test_codex_sync_uses_cpa_headers_and_v1_base_url_for_responses(client,
 
 
 async def test_catalog_is_explicit_and_unknown_models_are_not_priced(client):
-    response=await client.get('/admin/v1/catalog',headers={'Authorization':'Bearer admin-secret'})
-    catalog=(await response.json())['catalog']
-    assert catalog['gpt-5.6-luna'] == {'family':'OpenAI GPT-5.6','intellect':'standard','official_input_price':.2,'official_cache_price':.02,'official_output_price':1.2,'blended_price':.9712,'available_provider_count':0}
-    assert catalog['gpt-5.6-terra']['intellect'] == 'smart'
-    assert catalog['gpt-5.6-sol']['intellect'] == 'expert'
-    assert catalog['claude-opus-5']['official_output_price'] == 25
-    assert catalog['claude-opus-4-8']['intellect'] == 'expert'
-    assert catalog['claude-sonnet-5']['intellect'] == 'smart'
-    assert 'luna' not in catalog and 'private-model' not in catalog
+    response = await client.get('/admin/v1/catalog', headers={'Authorization': 'Bearer admin-secret'})
+    assert response.status == 404
 
 
 async def test_catalog_can_create_a_model_with_an_explicit_stage(client):
-    body = {
-        'model': 'gpt-custom-route', 'family': 'Internal GPT', 'intellect': 'smart',
-        'official_input_price': 1.0, 'official_cache_price': 0.1, 'official_output_price': 3.0,
-    }
-    created = await client.post('/admin/v1/catalog', json=body)
-
-    assert created.status == 201
-    catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
-    assert catalog['gpt-custom-route'] == {key: value for key, value in body.items() if key != 'model'} | {'blended_price': 2.456, 'available_provider_count': 0}
+    assert (await client.post('/admin/v1/catalog', json={})).status == 404
 
 
 async def test_catalog_stage_update_and_delete_control_routing(client, cpa):
-    await client.post('/admin/v1/sync')
-    catalog = (await (await client.get('/admin/v1/catalog')).json())['catalog']
-    changed = catalog['gpt-5.6-luna'] | {'intellect': 'smart'}
-    changed.pop('available_provider_count')
-    changed.pop('blended_price')
-
-    assert (await client.put('/admin/v1/catalog/gpt-5.6-luna', json=changed)).status == 200
-    generated = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'stage', 'intellect': 'standard'})
-    assert generated.status == 200
-    assert (await generated.json())['fulfilled_intellect'] == 'smart'
-
-    assert (await client.delete('/admin/v1/catalog/gpt-5.6-luna')).status == 204
-    assert 'gpt-5.6-luna' not in (await (await client.get('/admin/v1/catalog')).json())['catalog']
-    unavailable = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'deleted', 'intellect': 'standard'})
-    assert unavailable.status == 503
+    assert (await client.put('/admin/v1/catalog/gpt-5.6-luna', json={})).status == 404
+    assert (await client.delete('/admin/v1/catalog/gpt-5.6-luna')).status == 404
 
 
 async def test_catalog_rejects_incomplete_and_unknown_updates(client):
-    bad=await client.patch('/admin/v1/catalog/private-model',json={'family':'x','intellect':'expert'})
-    assert bad.status == 400
-    body={'family':'private','intellect':'expert','official_input_price':1.0,'official_cache_price':.1,'official_output_price':2.0}
-    assert (await client.patch('/admin/v1/catalog/private-model',json=body)).status == 404
+    assert (await client.patch('/admin/v1/catalog/private-model', json={})).status == 404
 
 
 async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_final_price(client):
@@ -817,9 +786,12 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     assert api_model == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
     assert not {'input_price', 'cache_price', 'output_price'} & api_model.keys()
 
+    assert (await client.post('/admin/v1/pricing/providers', headers=headers, json={
+        'provider_key': 'legacy-provider-field', 'name': 'Rejected', 'provider_type': 'direct', 'multiplier': 2,
+    })).status == 400
+
     provider_response = await client.post('/admin/v1/pricing/providers', headers=headers, json={
         'provider_key': 'api-direct', 'name': 'API Direct', 'provider_type': 'direct',
-        'multiplier': 9.0,
     })
     assert provider_response.status == 201
     provider = await provider_response.json()
@@ -827,13 +799,16 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     price_response = await client.post('/admin/v1/pricing', headers=headers, json={
         'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
         'input_price': 1, 'cache_price': 0.2, 'output_price': 4, 'currency': 'USD',
-        'multiplier': 1.25,
         'source_name': 'Public price table',
         'source_url': 'https://prices.example/api-direct',
         'source_evidence': 'published pricing table',
         'verified_at': '2026-09-12T00:00:00Z',
     })
     assert price_response.status == 201
+    assert (await client.post('/admin/v1/pricing', headers=headers, json={
+        'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
+        'input_price': 1, 'cache_price': .2, 'output_price': 4, 'currency': 'USD', 'multiplier': 2,
+    })).status == 400
     duplicate = await client.post('/admin/v1/pricing', headers=headers, json={
         'provider_id': provider['id'], 'model_id': 'api-model', 'source_kind': 'direct',
         'input_price': 1, 'cache_price': .2, 'output_price': 4, 'currency': 'USD',
@@ -846,11 +821,10 @@ async def test_pricing_api_keeps_model_metadata_separate_and_returns_auditable_f
     assert item['provider']['inventory_models'] == []
     assert item['model'] == {'id': 'api-model', 'stage': 'smart', 'family': 'API Family', 'active': True}
     assert item['base_price'] == {'input': 1, 'cache': .2, 'output': 4, 'currency': 'USD'}
-    assert item['final_price'] == {'input': 1.0, 'cache': .2, 'output': 4.0, 'blended': 3.272, 'currency': 'USD', 'multiplier': 1.0}
+    assert item['final_price'] == {'input': 1.0, 'cache': .2, 'output': 4.0, 'blended': 3.272, 'currency': 'USD'}
     assert item['source'] == {
         'name': 'Public price table', 'kind': 'direct', 'type': 'direct', 'url': 'https://prices.example/api-direct',
         'evidence': 'published pricing table', 'verified_at': '2026-09-12T00:00:00Z',
-        'legacy': False,
     }
     assert item['unpriced'] is False and item['active'] is True
     events = await client.get('/admin/v1/configuration-events', headers=headers)
@@ -886,50 +860,25 @@ async def test_pricing_api_validates_relay_binding_and_exposes_inventory_without
     provider = store.conn.execute('SELECT pricing_provider_id FROM source_provider WHERE fingerprint=?', (inventory['fingerprint'],)).fetchone()[0]
     model = 'gpt-5.6-luna'
     relay = await client.post('/admin/v1/pricing/providers', headers=headers, json={
-        'provider_key': 'api-relay', 'name': 'API Relay', 'provider_type': 'relay', 'multiplier': 1.1,
+        'provider_key': 'api-relay', 'name': 'API Relay', 'provider_type': 'relay',
     })
     assert relay.status == 201
     relay_id = (await relay.json())['id']
-    benchmark_price = await client.post('/admin/v1/pricing', headers=headers, json={
-        'provider_id': provider, 'model_id': model, 'source_kind': 'direct',
+    assert 'multiplier' not in await relay.json()
+    assert (await client.post('/admin/v1/pricing/bindings', headers=headers, json={})).status == 404
+    direct_price = await client.post('/admin/v1/pricing', headers=headers, json={
+        'provider_id': relay_id, 'model_id': model, 'source_kind': 'relay',
         'input_price': .2, 'cache_price': .02, 'output_price': 1.2, 'currency': 'USD',
+        'source_name': 'Relay terms', 'source_url': 'https://relay.example/pricing',
+        'source_evidence': 'endpoint-specific terms', 'verified_at': '2026-09-12T00:00:00Z',
     })
-    assert benchmark_price.status == 201
-    binding = await client.post('/admin/v1/pricing/bindings', headers=headers, json={
-        'relay_provider_id': relay_id, 'relay_model_id': model,
-        'benchmark_provider_id': provider, 'benchmark_model_id': model,
-        'source_name': 'Relay terms',
-        'source_url': 'https://relay.example/pricing', 'source_evidence': 'relay terms',
-    })
-    assert binding.status == 201
-    bindings = await client.get('/admin/v1/pricing/bindings', headers=headers)
-    assert (await bindings.json())['items'][0]['benchmark']['provider_id'] == provider
+    assert direct_price.status == 201
     relay_view = await client.get('/admin/v1/pricing?provider=api-relay&model=gpt-5.6-luna', headers=headers)
     relay_item = (await relay_view.json())['items'][0]
     assert relay_item['base_price'] == {'input': .2, 'cache': .02, 'output': 1.2, 'currency': 'USD'}
-    assert relay_item['final_price'] is None and relay_item['status'] == 'unpriced'
-
-    conflict = await client.post('/admin/v1/pricing/bindings', headers=headers, json={
-        'relay_provider_id': relay_id, 'relay_model_id': model,
-        'benchmark_provider_id': provider, 'benchmark_model_id': model,
-    })
-    assert conflict.status == 409
-
-    binding_id = (await bindings.json())['items'][0]['id']
-    changed_binding = await client.put(f'/admin/v1/pricing/bindings/{binding_id}', headers=headers, json={
-        'benchmark_provider_id': provider, 'benchmark_model_id': model,
-        'source_url': 'https://relay.example/pricing?v=2', 'source_evidence': 'updated terms',
-    })
-    assert changed_binding.status == 200
-    assert (await changed_binding.json())['source'] == {
-        'name': 'Relay terms', 'url': 'https://relay.example/pricing?v=2', 'evidence': 'updated terms',
-    }
-    assert (await client.delete(f'/admin/v1/pricing/bindings/{binding_id}', headers=headers)).status == 204
-    inactive_binding = await client.get('/admin/v1/pricing/bindings?include_inactive=true', headers=headers)
-    assert (await inactive_binding.json())['items'][0]['active'] is False
-
-    pricing_provider = store.conn.execute('SELECT id FROM pricing_provider WHERE id=?', (provider,)).fetchone()[0]
-    assert pricing_provider == provider
+    assert relay_item['final_price']['input'] == .2
+    assert 'binding' not in relay_item
+    assert (await client.get('/admin/v1/pricing/bindings', headers=headers)).status == 404
 
 
 async def test_cpa_sync_preserves_provider_model_price_configuration(client, cpa):
@@ -944,55 +893,34 @@ async def test_cpa_sync_preserves_provider_model_price_configuration(client, cpa
         'source_url': 'https://operator.example/pricing', 'source_evidence': 'operator override',
         'verified_at': '2026-09-12T01:00:00Z',
     }
-    assert (await client.post('/admin/v1/pricing', headers=headers, json=body)).status == 201
+    assert (await client.put(f'/admin/v1/pricing/{provider_id}/gpt-5.6-luna', headers=headers, json={key: value for key, value in body.items() if key not in {'provider_id', 'model_id'}})).status == 200
     cpa.app['config']['providers'][0]['name'] = 'CPA renamed provider'
     assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
     rows = (await (await client.get('/admin/v1/pricing?model=gpt-5.6-luna', headers=headers)).json())['items']
     row = next(item for item in rows if item['provider']['id'] == provider_id)
     assert row['base_price'] == {'input': 7, 'cache': .7, 'output': 21, 'currency': 'USD'}
     assert row['source']['evidence'] == 'operator override'
-    assert row['provider']['multiplier'] == 1.0
+    assert 'multiplier' not in row['provider']
 
 
 async def test_catalog_deletions_survive_a_store_restart(client):
-    assert (await client.delete('/admin/v1/catalog/gpt-5.5')).status == 204
+    assert (await client.delete('/admin/v1/catalog/gpt-5.5')).status == 404
 
     reopened = Store(client.app['settings'].database_path, client.app['settings'].key_bytes())
 
     try:
-        assert 'gpt-5.5' not in reopened.catalog()
+        assert 'gpt-5.5' in reopened.model_directory()
     finally:
         reopened.conn.close()
 
 
 async def test_catalog_provider_count_reflects_synced_inventory(client, cpa):
     headers={'Authorization':'Bearer admin-secret'}
-    before=(await (await client.get('/admin/v1/catalog',headers=headers)).json())['catalog']
-    assert before['gpt-5.6-luna']['available_provider_count'] == 0
-    await client.post('/admin/v1/sync',headers=headers)
-    after=(await (await client.get('/admin/v1/catalog',headers=headers)).json())['catalog']
-    assert after['gpt-5.6-luna']['available_provider_count'] == 1
+    assert (await client.get('/admin/v1/catalog', headers=headers)).status == 404
 
 
 async def test_catalog_apply_prunes_existing_inventory_and_future_sync(client, cpa):
-    headers = {'Authorization': 'Bearer admin-secret'}
-    cpa.app['upstream_app']['models'] = ['gpt-5.6-luna', 'private-model']
-    await client.post('/admin/v1/sync', headers=headers)
-    store = client.app['store']
-    provider = (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]
-    assert (await client.patch(f"/admin/v1/policy/{provider['fingerprint']}", headers=headers, json={'note': 'preserved', 'multiplier': .45})).status == 200
-    with store.conn:
-        store.conn.execute("UPDATE source_provider SET models_json=?", (json.dumps(['gpt-5.6-luna', 'private-model']),))
-
-    applied = await client.post('/admin/v1/catalog/apply', headers=headers)
-
-    assert await applied.json() == {'providers': 1, 'removed_models': 1, 'retained_models': 1}
-    assert (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]['models'] == ['gpt-5.6-luna']
-    cpa.app['config'] = {'codex-api-key': [{'base_url': cpa.app['upstream'], 'api_key': 'provider-secret'}]}
-    assert (await client.post('/admin/v1/sync', headers=headers)).status == 200
-    refreshed = (await (await client.get('/admin/v1/inventory', headers=headers)).json())['providers'][0]
-    assert refreshed['models'] == ['gpt-5.6-luna']
-    assert (refreshed['note'], refreshed['multiplier']) == ('preserved', .45)
+    assert (await client.post('/admin/v1/catalog/apply', headers={'Authorization': 'Bearer admin-secret'})).status == 404
 
 
 async def test_summary_and_provider_stats_use_mixed_observations(client, cpa):
@@ -1184,7 +1112,7 @@ async def test_medium_effort_gets_a_larger_first_output_budget(client, cpa):
 
 
 def test_price_bands_mix_models_and_split_all_key_prices_at_the_median():
-    providers = [SimpleNamespace(price_group=price, id=index, models=[model]) for index, (price, model) in enumerate(((100, 'luna'), (110, 'terra'), (115, 'nova'), (400, 'sol')))]
+    providers = [SimpleNamespace(price_group=price, price_currency='USD', price_comparable=True, id=index, models=[model]) for index, (price, model) in enumerate(((100, 'luna'), (110, 'terra'), (115, 'nova'), (400, 'sol')))]
 
     bands = price_bands(providers)
 
@@ -1234,7 +1162,7 @@ async def test_management_summary_providers_and_validated_policy(client, cpa):
     providers=await client.get('/admin/v1/providers',headers=headers)
     row=(await providers.json())['providers'][0]
     assert row['api_key_mask'].endswith('ret') and 'provider-secret' not in str(row)
-    changed=await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'note':'fast lane','multiplier':1.2,'enabled':True,'max_parallel':3})
+    changed=await client.patch('/admin/v1/policy/'+row['fingerprint'],headers=headers,json={'note':'fast lane','enabled':True,'max_parallel':3})
     assert changed.status == 200
     echoed=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
     assert (echoed['note'],echoed['max_parallel']) == ('fast lane',3)
