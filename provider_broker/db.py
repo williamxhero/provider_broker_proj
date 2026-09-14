@@ -27,6 +27,15 @@ ROUTING_POLICY_VERSION = "v1"
 DELIVERY_MODES = {"non_stream", "plain_stream", "validated_stream"}
 PRICING_MIGRATION_VERSION = 2
 ACCOUNTING_WINDOWS = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}
+API_KEY_RESOURCE_FIELDS = frozenset({
+    "fingerprint", "normalized_hostname", "status", "note", "api_key_mask",
+    "max_parallel", "window", "total_tokens", "fee_buckets", "edit",
+})
+STAGE_RESOURCE_FIELDS = frozenset({
+    "stage", "model", "family", "provider_types", "callable_key_count",
+    "latest_test", "technical_success_rate", "avg_first_token_latency_ms",
+    "window", "total_tokens", "fee_buckets", "edit",
+})
 
 
 def broker_release_version() -> str:
@@ -2631,6 +2640,202 @@ class Store:
                 'last_test_status': latest['status'] if latest else None,
             })
         return inventory
+
+    def api_key_resources(self, window: str = "24h") -> list[dict]:
+        """Return the credential-facing admin contract.
+
+        The routing inventory above intentionally remains rich because it is
+        consumed by internal routing and migration code.  This projection is
+        the only shape used by the Key console: it never includes endpoint
+        paths, provider/model inventory, pricing, or health statistics.
+        """
+        if window not in ACCOUNTING_WINDOWS:
+            raise ValueError("invalid window")
+        rows = self.conn.execute(
+            """SELECT s.fingerprint,s.base_url,s.api_key_mask,s.source_json,
+                      p.enabled,p.note,p.max_parallel
+                 FROM source_provider s JOIN policy p USING(fingerprint)
+                 ORDER BY s.id"""
+        ).fetchall()
+        resources = []
+        for row in rows:
+            try:
+                source = json.loads(row["source_json"] or "{}")
+            except (TypeError, ValueError):
+                source = {}
+            inventory_status = source.get("inventory_status")
+            status = "disabled" if not row["enabled"] else (
+                "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
+            )
+            accounting = self.accounting(window=window, fingerprint=row["fingerprint"])
+            resources.append({
+                "fingerprint": row["fingerprint"],
+                "normalized_hostname": normalize_hostname(row["base_url"]),
+                "status": status,
+                "note": row["note"],
+                "api_key_mask": row["api_key_mask"] or "***",
+                "max_parallel": row["max_parallel"],
+                "window": window,
+                "total_tokens": accounting["total_tokens"],
+                "fee_buckets": accounting["fee_buckets"],
+                "edit": {
+                    "fingerprint": row["fingerprint"],
+                    "href": f"/admin/v1/keys/{row['fingerprint']}",
+                },
+            })
+        return resources
+
+    def api_key_resource(self, fingerprint: str, window: str = "24h", *, include_mappings: bool = False) -> dict | None:
+        """Return one safe Key resource, optionally with mapping edit data."""
+        resource = next((item for item in self.api_key_resources(window) if item["fingerprint"] == fingerprint), None)
+        if resource is None:
+            return None
+        if include_mappings:
+            resource["edit"] = resource["edit"] | {
+                "mappings": [
+                    {key: mapping[key] for key in (
+                        "id", "model_id", "target_provider_id", "target_provider_key",
+                        "target_model_id", "multiplier", "enabled",
+                    )}
+                    for mapping in self.key_model_mappings(fingerprint=fingerprint, enabled=None)
+                ]
+            }
+        return resource
+
+    def _stage_key_rows(self, stage: str, model: str, *, callable_only: bool = False) -> list[sqlite3.Row]:
+        """Find configured keys declaring a canonical Stage/Model pair.
+
+        Aggregates use every declared key so historical evidence does not
+        disappear when a key is disabled or its inventory refresh goes stale;
+        callable counts and manual tests opt into the stricter live filter.
+        """
+        model = canonicalize(model)
+        rows = self.conn.execute(
+            """SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel,p.multiplier
+                 FROM source_provider s JOIN policy p USING(fingerprint)"""
+        ).fetchall()
+        result = []
+        for row in rows:
+            try:
+                models = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
+                tiers = set(json.loads(row["tiers_json"] or "[]"))
+                source = json.loads(row["source_json"] or "{}")
+            except (TypeError, ValueError):
+                models, tiers, source = set(), set(), {}
+            if model not in models or stage not in tiers:
+                continue
+            if not callable_only:
+                result.append(row)
+                continue
+            if not row["enabled"] or not row["calibrated"] or source.get("inventory_status") not in (None, "available", "stale"):
+                continue
+            site = self.conn.execute(
+                "SELECT enabled FROM site_policy WHERE site_id=?", (row["site_id"],)
+            ).fetchone()
+            if site is not None and not site["enabled"]:
+                continue
+            blocked = self.conn.execute(
+                "SELECT 1 FROM route_block WHERE fingerprint=? AND model=?", (row["fingerprint"], model)
+            ).fetchone()
+            if blocked:
+                continue
+            if self.health(row["fingerprint"], model)["state"] == "open":
+                continue
+            result.append(row)
+        return result
+
+    def stage_test_providers(self, stage: str, model: str) -> list[Provider]:
+        """Return enabled Key/Model capability pairs for a Stage test."""
+        catalog = self.catalog()
+        model = canonicalize(model)
+        if model not in catalog or catalog[model]["intellect"] != stage:
+            return []
+        return [provider for row in self._stage_key_rows(stage, model, callable_only=True)
+                if (provider := self._provider_from_row(row, model, catalog)) is not None]
+
+    def _stage_accounting(self, stage: str, model: str, window: str, fingerprints: list[str]) -> dict:
+        if not fingerprints:
+            return {"window": window, "boundary": ACCOUNTING_WINDOWS[window], "stage": stage,
+                    "model": canonicalize(model), "total_tokens": 0, "token_total": 0,
+                    "fee_buckets": {}, "fees_by_currency": {}, "tokens_by_currency": {}}
+        placeholders = ",".join("?" for _ in fingerprints)
+        rows = self.conn.execute(
+            f"""SELECT COALESCE(NULLIF(upper(currency),''),'UNKNOWN') currency,
+                         COALESCE(sum(CASE WHEN input_tokens IS NOT NULL AND output_tokens IS NOT NULL
+                                         THEN input_tokens + output_tokens ELSE 0 END),0) total_tokens,
+                         sum(cost) total_fee, count(*) calls
+                    FROM observation
+                   WHERE created_at >= datetime('now',?) AND tier=?
+                     AND COALESCE(actual_model,requested_model)=?
+                     AND fingerprint IN ({placeholders})
+                   GROUP BY 1 ORDER BY 1""",
+            [ACCOUNTING_WINDOWS[window], stage, canonicalize(model), *fingerprints],
+        ).fetchall()
+        buckets = {
+            row["currency"]: {
+                "currency": row["currency"], "tokens": int(row["total_tokens"] or 0),
+                "total_tokens": int(row["total_tokens"] or 0), "fee": row["total_fee"],
+                "total_fee": row["total_fee"], "calls": int(row["calls"] or 0),
+            }
+            for row in rows
+        }
+        total_tokens = sum(item["total_tokens"] for item in buckets.values())
+        return {"window": window, "boundary": ACCOUNTING_WINDOWS[window], "stage": stage,
+                "model": canonicalize(model), "total_tokens": total_tokens, "token_total": total_tokens,
+                "fee_buckets": buckets,
+                "fees_by_currency": {key: item["total_fee"] for key, item in buckets.items()},
+                "tokens_by_currency": {key: item["total_tokens"] for key, item in buckets.items()}}
+
+    def stage_resources(self, window: str = "24h") -> list[dict]:
+        """Aggregate the Stage + canonical Model admin contract."""
+        if window not in ACCOUNTING_WINDOWS:
+            raise ValueError("invalid window")
+        models = self.conn.execute(
+            "SELECT id,stage,family FROM canonical_model WHERE active=1 ORDER BY stage,id"
+        ).fetchall()
+        resources = []
+        for model_row in models:
+            stage, model = model_row["stage"], model_row["id"]
+            matching = self._stage_key_rows(stage, model)
+            callable_matching = self._stage_key_rows(stage, model, callable_only=True)
+            fingerprints = [row["fingerprint"] for row in matching]
+            provider_types = sorted({row["provider_type"] for row in matching})
+            placeholders = ",".join("?" for _ in fingerprints)
+            stats = {"rate": None, "ttft": None}
+            if fingerprints:
+                stats_row = self.conn.execute(
+                    f"""SELECT avg(success) rate, avg(latency_ms) ttft
+                           FROM observation
+                          WHERE created_at >= datetime('now',?) AND tier=?
+                            AND COALESCE(actual_model,requested_model)=?
+                            AND fingerprint IN ({placeholders})""",
+                    [ACCOUNTING_WINDOWS[window], stage, model, *fingerprints],
+                ).fetchone()
+                stats = {"rate": stats_row["rate"], "ttft": stats_row["ttft"]}
+            latest = self.conn.execute(
+                f"""SELECT created_at,ttft_ms,
+                              CASE WHEN first_token=1 AND model_matched=1 THEN 'succeeded'
+                                   ELSE COALESCE(error_type,'failed') END status
+                           FROM probe_event
+                          WHERE model=? {f'AND fingerprint IN ({placeholders})' if fingerprints else 'AND 1=0'}
+                          ORDER BY id DESC LIMIT 1""",
+                [model, *fingerprints],
+            ).fetchone()
+            accounting = self._stage_accounting(stage, model, window, fingerprints)
+            resources.append({
+                "stage": stage, "model": model, "family": model_row["family"],
+                "provider_types": provider_types,
+                "callable_key_count": len(callable_matching),
+                "latest_test": None if latest is None else {
+                    "at": latest["created_at"], "status": latest["status"], "ttft_ms": latest["ttft_ms"],
+                },
+                "technical_success_rate": stats["rate"],
+                "avg_first_token_latency_ms": stats["ttft"],
+                "window": window, "total_tokens": accounting["total_tokens"],
+                "fee_buckets": accounting["fee_buckets"],
+                "edit": {"stage": stage, "model": model},
+            })
+        return resources
 
     def update_policy(self, fingerprint: str, body: dict):
         with self.conn:

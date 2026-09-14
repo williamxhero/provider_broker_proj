@@ -23,8 +23,8 @@
 
     <section aria-labelledby="providers-title">
       <div class="section-heading">
-        <div><p class="index">02 / ROUTING</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><button id="test-all-keys" class="primary" type="button">一键测试</button><div class="sync-control"><button id="sync" class="secondary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
+        <div><p class="index">02 / CREDENTIALS</p><h2 id="providers-title">API Key</h2></div>
+        <div class="section-actions"><div class="sync-control"><button id="sync" class="secondary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
       </div>
       <output id="syncresult" class="notice" aria-live="polite"></output>
       <div class="table-wrap"><table id="providers"></table></div>
@@ -32,9 +32,10 @@
 
     <section aria-labelledby="model-view-title">
       <div class="section-heading">
-        <div><p class="index">03 / STAGE VIEW</p><h2 id="model-view-title">Stage视角</h2></div>
+        <div><p class="index">03 / STAGE VIEW</p><h2 id="model-view-title">Stage + canonical Model</h2></div>
         <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
+      <p class="field-help">每行对应一个 Stage + canonical Model；测试只触达启用且当前可调用的 Key/Model capability pair，并在完成后刷新本行聚合指标。</p>
       <div class="table-wrap"><table id="model-view"></table></div>
       <div class="section-actions"><label>健康 Stage<select id="probe-stage"><option value="standard">standard</option><option value="smart">smart</option><option value="expert">expert</option></select></label><button id="probe-race" class="secondary" type="button">竞速探针</button><button id="probe-all" class="secondary" type="button">全量探针</button></div>
       <output id="proberesult" class="notice" aria-live="polite"></output>
@@ -46,7 +47,7 @@
         <div><p class="index">04 / MODEL DIRECTORY</p><h2 id="model-directory-title">Model 目录</h2></div>
         <div class="section-actions"><button id="model-create" class="secondary" type="button">新增 Model</button></div>
       </div>
-      <p class="field-help">这里只维护 canonical Model、Stage 与 family；Provider 价格、倍率和来源在下方独立管理。</p>
+      <p class="field-help">这里只维护 canonical Model、Stage、family 与启停状态；价格、倍率、Relay 映射和 Key 能力属于独立资源。</p>
       <div class="table-wrap"><table id="model-directory"></table></div>
     </section>
 
@@ -87,29 +88,32 @@
       <div class="table-wrap"><table id="calls"></table></div>
       <button id="next" class="secondary" type="button">下一页</button>
     </section>
-  </main>
-
     <section aria-labelledby="analytics-title">
       <div class="section-heading"><div><p class="index">07 / ANALYTICS</p><h2 id="analytics-title">Cohort analytics</h2></div></div>
       <div class="table-wrap"><table id="analytics"></table></div>
     </section>
 
     <section aria-labelledby="route-audit-title">
-      <div class="section-heading"><div><p class="index">07 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
+      <div class="section-heading"><div><p class="index">08 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
       <output id="telemetry-health" class="notice" aria-live="polite"></output>
       <div class="table-wrap"><table id="routes"></table></div>
       <pre id="route-detail" class="notice"></pre>
     </section>
+  </main>
 
   <aside id="editor" class="editor" aria-labelledby="editor-title" hidden>
     <form id="policy">
       <div class="editor-heading"><div><p class="index">POLICY</p><h2 id="editor-title">编辑 API Key</h2></div><button id="close-editor" type="button" aria-label="关闭">×</button></div>
       <p id="editor-source" class="source-note"></p>
-      <label>备注<input name="note" type="text"></label>
-      <label>倍率<input name="multiplier" type="number" min="0.001" step="0.001" required></label>
+      <label>备注<input name="note" type="text" maxlength="256"></label>
       <label class="toggle"><input name="enabled" type="checkbox">启用</label>
       <label>单 Key 并发上限<input name="max_parallel" type="number" min="1" max="32" step="1" required></label>
       <p class="field-help">此 Key 同时在飞的上游请求上限；达到上限时不会被抽入竞速，以保护上游配额。它不影响一次竞速会随机抽几个 Key。</p>
+      <div>
+        <h3>Key + Model mappings</h3>
+        <p class="field-help">仅可编辑已存在映射的目标 Provider/Model、倍率与启用状态；Key fingerprint 与 canonical Model 不可改。</p>
+        <div id="key-mappings" class="mapping-list"></div>
+      </div>
       <div class="editor-actions"><button id="cancel-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>

@@ -46,17 +46,17 @@ def sanitize_error(value: object) -> str | None:
 async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = None,
                     model: str | None = None, timeout_ms: int = 15_000,
                     concurrency: int = 2, contract: str = "structured", record: bool = True,
-                    clock=None) -> list[dict]:
+                    clock=None, targets=None) -> list[dict]:
     """Probe selected inventory targets with the exact streaming transport used by routing."""
     if tier not in ("standard", "smart", "expert", "all") or mode not in ("race", "all") or tier == "all" and mode != "all":
         raise ValueError("invalid probe request")
     if contract not in ("plain", "structured"):
         raise ValueError("invalid probe contract")
     now = (clock or (lambda: datetime.now(UTC)))()
-    candidates = store.providers(tier) if mode == "race" else []
-    if tier == "all":
+    candidates = list(targets) if targets is not None else (store.providers(tier) if mode == "race" else [])
+    if targets is None and tier == "all":
         candidates = store.key_test_providers()
-    elif mode == "all":
+    elif targets is None and mode == "all":
         # A filtered manual probe must always reach its explicit target, including
         # an open circuit. Due-target preselection can otherwise select another
         # row and leave the requested target with an empty result.
@@ -68,7 +68,7 @@ async def run_probe(store, *, tier: str, mode: str, fingerprint: str | None = No
     catalog = store.catalog()
     candidates = [candidate for candidate in candidates if candidate and (tier == "all" or catalog.get(candidate.models[0], {}).get("intellect") == tier)
                   and (not fingerprint or candidate.fingerprint == fingerprint) and (not model or candidate.models[0] == model)]
-    if mode == "race":
+    if mode == "race" and targets is None:
         if any(hasattr(candidate, "price_currency") for candidate in candidates):
             # Price is only an ordering signal inside one currency.  Keep the
             # lowest band from every currency, plus unknown-price candidates,

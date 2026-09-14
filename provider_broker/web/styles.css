@@ -69,6 +69,12 @@ button:disabled { opacity: .38; cursor: not-allowed; transform: none; }
 .toggle { display: flex; align-items: center; gap: .7rem; } .toggle input { min-height: auto; }
 .editor-actions { display: flex; justify-content: flex-end; gap: .8rem; margin-top: 1rem; } .editor-actions .secondary { margin-top: 0; }
 .field-help { margin: -.7rem 0 .1rem; color: var(--muted); font-size: .75rem; line-height: 1.5; }
+.mapping-list { display: grid; gap: .65rem; }
+.mapping-row { display: grid; grid-template-columns: minmax(6rem, 1fr) 5rem minmax(7rem, 1fr) 5rem auto; align-items: center; gap: .45rem; }
+.mapping-row > span { overflow: hidden; text-overflow: ellipsis; font: .75rem/1.2 ui-monospace, SFMono-Regular, Consolas, monospace; }
+.mapping-row input { min-height: 2rem; width: 100%; padding: .35rem .45rem; }
+.mapping-row .toggle { display: flex; align-items: center; gap: .25rem; white-space: nowrap; }
+@media (max-width: 620px) { .mapping-row { grid-template-columns: 1fr 1fr; } .mapping-row > span { grid-column: 1 / -1; } }
 .danger { margin-right: auto; min-height: 2.7rem; padding: .65rem 1.1rem; border: 1px solid var(--critical); border-radius: .18rem; background: transparent; color: var(--critical); }
 @keyframes rise { from { opacity: 0; transform: translateY(10px); } }
 @keyframes slide { from { opacity: 0; transform: translateX(24px); } }

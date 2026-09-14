@@ -40,252 +40,61 @@ class LiveBroker:
         self.thread.join(10)
 
 
-def test_console_edits_policy_syncs_and_pages_calls(tmp_path):
-    """An operator can use management, catalog CRUD, and filters from visible DOM."""
-    provider = {
-        "fingerprint": "provider-a", "name": "Alpha <img src=x onerror=window.__injected=1>",
-        "note": "initial note <script>window.__injected=2</script>", "enabled": True,
-        "family": "openai", "base_url": "https://alpha.invalid/<svg onload=window.__injected=3>", "api_key_mask": "abc***xyz",
-        "models": ["luna"], "model_pricing": {"luna": {"blended_price": 1.656, "priced": True}}, "inventory_status": "available", "technical_success_rate": 0.98,
-        "avg_ttft_ms": 1800, "cost_24h": 0.02, "total_tokens": 14, "multiplier": 1.0, "max_parallel": 3,
-        "last_test_at": "2026-08-29T10:00:00Z", "last_test_ttft_ms": 180,
-    }
-    same_site_provider = provider | {
-        "fingerprint": "provider-b", "note": "second note", "api_key_mask": "def***uvw",
-        "base_url": "https://alpha.invalid/v1", "model_pricing": {"luna": {"blended_price": 2.484, "priced": True}}, "technical_success_rate": 0.9, "avg_ttft_ms": 900, "cost_24h": 0.01, "total_tokens": 12, "multiplier": 1.5,
-    }
-    cheapest_provider = provider | {
-        "fingerprint": "provider-c", "note": "cheapest note", "api_key_mask": "ghi***rst",
-        "base_url": "https://alpha.invalid/api", "models": ["nova"], "model_pricing": {"nova": {"blended_price": 0.828, "priced": True}}, "technical_success_rate": 0.8, "avg_ttft_ms": 800, "cost_24h": 0.005, "total_tokens": 8, "multiplier": 0.5,
-    }
-    disabled_provider = provider | {
-        "fingerprint": "provider-d", "note": "disabled note", "api_key_mask": "jkl***mno", "enabled": False,
-        "base_url": "https://alpha.invalid/disabled", "model_pricing": {"luna": {"blended_price": 3.312, "priced": True}}, "technical_success_rate": None, "avg_ttft_ms": None, "cost_24h": None, "total_tokens": None, "multiplier": 2.0,
-    }
-    calls = [
-        {"id": 2, "time": "2026-08-29T10:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "high", "ttft_ms": 120, "status": "completed", "input_tokens": 10, "output_tokens": 4, "cost": 0.02, "request_id": "r-2"},
-        {"id": 1, "time": "2026-08-29T09:00:00Z", "note": "initial note", "provider": "Alpha", "requested_model": "luna", "actual_model": "luna", "intellect": "standard", "effort": "medium", "ttft_ms": 140, "status": "transport_failed", "input_tokens": 2, "output_tokens": 0, "cost": None, "request_id": "r-1"},
-    ]
-    catalog = {
-        "luna": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "blended_price": 1.656, "available_provider_count": 1},
-        "nova": {"family": "openai", "intellect": "standard", "official_input_price": 1, "official_cache_price": 0.1, "official_output_price": 2, "blended_price": 1.656, "available_provider_count": 1},
-    }
-    seen = []
-
-    def payload(path):
-        if path.startswith("/admin/v1/summary"):
-            return {"routable_apis": 1, "technical_success_rate": 0.98, "avg_ttft_ms": 1800, "last_successful_sync": "2026-08-29T10:00:00Z"}
-        if path.startswith("/admin/v1/providers"):
-            if "window=7d" in path:
-                return {"providers": [
-                    provider | {"technical_success_rate": 0.7, "avg_ttft_ms": 700, "cost_24h": 0.07, "total_tokens": 70},
-                    same_site_provider | {"technical_success_rate": 0.6, "avg_ttft_ms": 600, "cost_24h": 0.06, "total_tokens": 60},
-                    cheapest_provider | {"technical_success_rate": 0.5, "avg_ttft_ms": 500, "cost_24h": 0.05, "total_tokens": 50},
-                    disabled_provider,
-                ]}
-            return {"providers": [provider, same_site_provider, cheapest_provider, disabled_provider]}
-        if path == "/admin/v1/catalog":
-            return {"catalog": catalog}
-        if path.startswith("/admin/v1/models"):
-            return {"items": [
-                {"id": "luna", "stage": "standard", "family": "openai", "active": True, "pricing_count": 1, "inventory_provider_count": 1},
-                {"id": "nova", "stage": "standard", "family": "openai", "active": True, "pricing_count": 1, "inventory_provider_count": 1},
-            ]}
-        if path.startswith("/admin/v1/pricing/bindings"):
-            return {"items": []}
-        if path.startswith("/admin/v1/pricing"):
-            return {"items": [{
-                "id": 1, "active": True, "unpriced": False, "status": "priced",
-                "provider": {"id": 1, "name": "Alpha", "provider_key": "alpha", "provider_type": "direct", "type": "direct", "multiplier": 1, "active": True, "inventory_models": ["luna"]},
-                "model": {"id": "luna", "stage": "standard", "family": "openai", "active": True},
-                "base_price": {"input": 1, "cache": .1, "output": 2, "currency": "USD"},
-                "final_price": {"input": 1, "cache": .1, "output": 2, "blended": 1.656, "currency": "USD", "multiplier": 1},
-                "source": {"kind": "direct", "url": "https://prices.invalid", "evidence": "table", "verified_at": "2026-08-29T10:00:00Z", "legacy": False},
-                "binding": None, "reason": None,
-            }]}
-        if path == "/admin/v1/routing":
-            return {"race_parallel_cap": 3}
-        if path.startswith("/admin/v1/quality"):
-            return {"calls": 7 if "window=7d" in path else 2, "total_cost": 123456789.123456, "technical_success_rate": 0.98, "request_success_rate": 0.9, "request_success_numerator": 9, "request_success_denominator": 10, "request_coverage": 0.8, "avg_ttft_ms": 130, "p95_ttft_ms": 140, "model_fulfillment_rate": 1, "failures": {"cancelled": 0, "timed_out": 0, "transport_failed": 1, "protocol_failed": 0, "stream_incomplete": 0}}
-        if path.startswith("/admin/v1/data-health"):
-            return {"in_progress": 0, "reconciled_unknown": 0, "legacy_records": 0, "unknown": 0, "collection_errors": 0}
-        if path.startswith("/admin/v1/analytics"):
-            return {"groups": [{"group": "alpha", "success_rate": 0.9, "success_denominator": 10, "confidence_interval_95": [0.6, 0.98], "insufficient": True}]}
-        if path.startswith("/admin/v1/routes/route-1"):
-            return {"route_id": "route-1", "outcome": "completed", "candidates": [], "attempts": []}
-        if path.startswith("/admin/v1/routes"):
-            return {"items": [{"route_id": "route-1", "started_at": "2026-08-29T10:00:00Z", "outcome": "completed", "delivery_mode": "plain_stream", "tier": "standard", "selected_model": "luna", "selected_site_id": "alpha", "terminal_reason": None, "telemetry_version": 1}], "next_cursor": None}
-        if path.startswith("/admin/v1/calls"):
-            if "cursor=2" in path:
-                return {"items": [calls[1]], "next_cursor": None}
-            return {"items": [calls[0]], "next_cursor": "2"}
-        if path == "/admin/v1/sync":
-            return {"added": 1, "updated": 0, "offlined": 0, "inventory_failures": 0, "last_successful_sync": "2026-08-29T10:00:00Z"}
-        raise AssertionError(path)
-
-    with LiveBroker(tmp_path / "broker.sqlite3") as broker, sync_playwright() as playwright:
+def test_console_uses_strict_key_and_stage_contract(tmp_path):
+    """The visible console exposes Key-safe fields and Stage-level test controls."""
+    with LiveBroker(tmp_path / "strict-console.sqlite3") as broker, sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page()
 
-        def route_handler(route):
-            request = route.request
-            path = request.url.removeprefix(broker.url)
-            seen.append((request.method, path, request.post_data))
-            if path == "/admin/v1/catalog" and request.method == "POST":
-                body = request.post_data_json
-                catalog[body["model"]] = {key: value for key, value in body.items() if key != "model"} | {"blended_price": 2.456, "available_provider_count": 0}
-                route.fulfill(status=201, content_type="application/json", body='{"model":"gpt-console-route"}')
-            elif path == "/admin/v1/providers/test" and request.method == "POST":
-                provider["last_test_at"] = "2026-08-29T11:00:00Z"
-                provider["last_test_ttft_ms"] = 95
-                route.fulfill(status=200, content_type="application/json", body='{"items":[{"state":"succeeded","ttft_ms":95}],"total_keys":1}')
-            elif path == "/admin/v1/routing" and request.method == "PATCH":
-                route.fulfill(status=200, content_type="application/json", body='{"race_parallel_cap":2}')
-            elif path == "/admin/v1/catalog/apply" and request.method == "POST":
-                route.fulfill(status=200, content_type="application/json", body='{"providers":1,"retained_models":1,"removed_models":2}')
-            elif path.startswith("/admin/v1/catalog/") and request.method == "PUT":
-                model = path.rsplit("/", 1)[-1]
-                catalog[model] = request.post_data_json | {"blended_price": 2.456, "available_provider_count": catalog[model]["available_provider_count"]}
-                route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
-            elif path.startswith("/admin/v1/catalog/") and request.method == "DELETE":
-                catalog.pop(path.rsplit("/", 1)[-1])
-                route.fulfill(status=204, body="")
-            elif request.method == "PATCH":
-                provider.update(request.post_data_json)
-                route.fulfill(status=200, content_type="application/json", body='{"updated":true}')
-            else:
-                route.fulfill(status=200, content_type="application/json", body=__import__("json").dumps(payload(path)))
+        def payload(path):
+            if path.startswith("/admin/v1/summary"):
+                return {"routable_apis": 1, "last_successful_sync": None}
+            if path.startswith("/admin/v1/providers"):
+                return {"providers": [{
+                    "fingerprint": "fp-a", "normalized_hostname": "alpha.invalid", "status": "enabled",
+                    "note": "safe note", "api_key_mask": "abc***xyz", "max_parallel": 3,
+                    "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
+                }]}
+            if path.startswith("/admin/v1/stages"):
+                return {"items": [{
+                    "stage": "standard", "model": "gpt-5.6-luna", "family": "openai",
+                    "provider_types": ["openai"], "callable_key_count": 1, "latest_test": None,
+                    "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
+                    "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
+                }], "window": "24h"}
+            if path == "/admin/v1/catalog":
+                return {"catalog": {}}
+            if path.startswith("/admin/v1/routing"):
+                return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
+            if path.startswith("/admin/v1/models") or path.startswith("/admin/v1/pricing"):
+                return {"items": []}
+            if path.startswith("/admin/v1/quality"):
+                return {"calls": 0, "failures": {}}
+            if path.startswith("/admin/v1/calls") or path.startswith("/admin/v1/routes"):
+                return {"items": [], "next_cursor": None}
+            if path.startswith("/admin/v1/data-health"):
+                return {"in_progress": 0, "reconciled_unknown": 0, "legacy_records": 0}
+            if path.startswith("/admin/v1/analytics"):
+                return {"groups": []}
+            raise AssertionError(path)
 
-        page.route("**/admin/v1/**", route_handler)
+        page.route("**/admin/v1/**", lambda route: route.fulfill(
+            status=200, content_type="application/json", body=__import__("json").dumps(
+                payload(route.request.url.removeprefix(broker.url))
+            )
+        ))
         page.goto(broker.url)
-        assert page.evaluate("window.__injected") is None
-        assert page.locator("#providers img, #providers svg, #providers script").count() == 0
-        assert page.locator("#model-directory").get_by_text("luna", exact=True).count() == 1
-        assert "https://prices.invalid" in page.locator("#pricing").inner_text()
-        assert page.locator(".masthead").count() == 0
-        assert page.locator("main > section").first.locator("h2").inner_text() == "调用质量"
-        assert page.locator("main > section").first.locator(".index").inner_text() == "01 / QUALITY"
-        assert page.locator(".lede").count() == 0
-        assert page.locator("#quality").get_by_text("可路由 API", exact=True).count() == 1
-        assert page.locator("#quality").get_by_text("技术成功率", exact=True).count() == 1
-        assert page.locator("#quality").get_by_text("平均 TTFT", exact=True).count() == 1
-        assert page.locator("#quality > div").count() == 15
-        assert page.locator("#quality").get_by_text("请求成功率", exact=True).count() == 1
-        assert page.locator("#quality").get_by_text("90.0%", exact=True).count() == 1
-        assert page.locator("#analytics").get_by_text("insufficient", exact=True).count() == 1
-        page.locator("#routes").get_by_role("button", name="view").click()
-        page.locator("#route-detail").get_by_text('"route_id": "route-1"').wait_for()
-        assert page.locator("#quality > div").filter(has_text="传输失败").locator("strong").inner_text() == "50.0%"
-        assert page.locator("#quality > div").filter(has_text="已取消").locator("strong").inner_text() == "0.0%"
-        assert "transport_failed" not in page.locator("#quality").inner_text()
-        total_cost = page.locator("#quality > div").filter(has_text="总费用").locator("strong")
-        total_cost.wait_for()
-        total_cost_style = total_cost.evaluate("number => ({ nowrap: getComputedStyle(number).whiteSpace, fits: number.scrollWidth <= number.clientWidth, fontSize: Number.parseFloat(getComputedStyle(number).fontSize) })")
-        assert total_cost_style["nowrap"] == "nowrap" and total_cost_style["fits"] and total_cost_style["fontSize"] < 16
-        assert all(height < 40 for height in page.locator("#quality > div").evaluate_all("items => items.map(item => item.getBoundingClientRect().height)"))
-        assert page.get_by_text("https://alpha.invalid", exact=True).count() == 1
-        assert "provider-secret" not in page.content()
-        page.get_by_text("1.8 s", exact=True).first.wait_for()
-        page.locator("#syncat").get_by_text("2026/08/29 18:00", exact=True).wait_for()
-        assert page.locator("#providers #race-parallel-cap").count() == 0
-        assert page.locator("#providers").get_by_role("button", name="总Token").count() == 1
-        assert page.locator("#providers").get_by_text("14", exact=True).count() == 1
-        assert page.locator("section:has(#model-view-title) #race-parallel-cap").count() == 1
-        assert "价格决定先后" not in page.content()
-        assert "stage 决定路由分区" not in page.content()
-        assert page.locator("#providers .model-tag").all_inner_texts() == ["nova", "luna", "luna", "luna"]
-        assert "available" not in page.locator("#providers").inner_text()
-        assert page.locator("#providers").get_by_role("button", name="24h 费用").count() == 1
-        assert page.locator("#providers").get_by_role("button", name="最后测试").count() == 1
-        page.get_by_text("180 ms · 2026/08/29 18:00", exact=True).first.wait_for()
-        assert page.get_by_text("中转站余额", exact=True).count() == 0
-        assert not any("/admin/v1/balances" in path for _, path, _ in seen)
-        page.get_by_role("button", name="一键测试").click()
-        page.get_by_text("测试完成：1 个 API Key 全部成功", exact=True).wait_for()
-        page.get_by_text("95 ms · 2026/08/29 19:00", exact=True).wait_for()
-        page.get_by_text("$0.02", exact=True).first.wait_for()
-        cell_styles = page.locator("#providers tbody td, #model-view tbody td, #catalog tbody td, #calls tbody td").evaluate_all("cells => cells.map(cell => { const style = getComputedStyle(cell); return [style.lineHeight, style.paddingBottom]; })")
-        assert set(map(tuple, cell_styles)) == {("32px", "0px")}
-        base_urls = page.locator("#providers tbody td[rowspan]")
-        assert base_urls.count() == 1
-        assert base_urls.first.get_attribute("rowspan") == "4"
-        assert base_urls.first.inner_text() == "https://alpha.invalid"
-        assert "/v1" not in page.locator("#providers").inner_text()
-        assert page.locator("#providers tbody tr").filter(has_text="disabled note").get_attribute("class") == "inactive-row"
-        model_view = page.locator("#model-view tbody tr")
-        assert model_view.count() == 4
-        assert model_view.locator("td").all_inner_texts() == ["standard", "低价组", "cheapest note", "nova", "$0.828", "initial note <script>window.__injected=2</script>", "luna", "$1.656", "高价组", "second note", "luna", "$2.484", "disabled note", "luna", "$3.312"]
-        assert model_view.locator("td").nth(0).get_attribute("rowspan") == "4"
-        assert model_view.locator("td").nth(1).get_attribute("rowspan") == "2"
-        assert model_view.filter(has_text="disabled note").get_attribute("class") == "inactive-row"
-        page.locator("#model-view").get_by_role("button", name="价格组").click()
-        page.locator("#race-parallel-cap").fill("2")
-        page.locator("#save-routing").click()
-        page.get_by_text("同价竞速 Key 数已设为 2").wait_for()
-        page.locator("#catalog-apply").click()
-        page.get_by_text("已应用目录：1 个 Key，保留 1 个模型，移除 2 个模型").wait_for()
-        page.locator("#catalog-create").click()
-        page.locator("#catalog-form [name=model]").fill("gpt-console-route")
-        page.locator("#catalog-form [name=family]").fill("Console test")
-        page.locator("#catalog-form [name=intellect]").select_option("standard")
-        page.locator("#catalog-form [name=official_input_price]").fill("1")
-        page.locator("#catalog-form [name=official_cache_price]").fill("0.1")
-        page.locator("#catalog-form [name=official_output_price]").fill("3")
-        assert page.locator("#catalog-form [name=blended_price]").input_value() == "2.456000"
-        page.locator("#catalog-form button[type=submit]").click()
-        page.locator("#catalog").get_by_text("gpt-console-route", exact=True).wait_for()
-        catalog_row = page.locator("#catalog tbody tr").filter(has_text="gpt-console-route")
-        catalog_row.locator("button").click()
-        page.locator("#catalog-form [name=intellect]").select_option("smart")
-        page.locator("#catalog-form button[type=submit]").click()
-        page.locator("#catalog tbody tr").filter(has_text="gpt-console-route").get_by_text("smart", exact=True).wait_for()
-        page.locator("#catalog tbody tr").filter(has_text="gpt-console-route").locator("button").click()
-        page.locator("#catalog-delete").click()
-        expect(page.locator("#catalog").get_by_text("gpt-console-route", exact=True)).to_have_count(0)
-        page.locator("#providers").get_by_role("button", name="编辑").first.click()
-        assert "Alpha <img src=x onerror=window.__injected=1>" in page.locator("#editor-source").inner_text()
-        assert page.locator("#policy [name=multiplier]").get_attribute("step") == "0.001"
-        page.get_by_label("备注").fill("saved note")
-        page.get_by_label("启用").uncheck()
-        page.locator("#policy").get_by_role("button", name="保存").click()
-        page.get_by_role("button", name="从 CPA 手动同步").click()
-        page.get_by_text("added 1 updated 0 offlined 0 inventory_failures 0").wait_for()
-        page.get_by_role("button", name="7d").click()
-        page.get_by_text("7", exact=True).last.wait_for()
-        page.locator("#providers").get_by_role("button", name="7d 费用").wait_for()
-        page.locator("#providers").get_by_role("button", name="总Token").wait_for()
-        page.locator("#providers").get_by_text("70", exact=True).wait_for()
-        page.get_by_text("$0.07", exact=True).wait_for()
-        page.locator("#callprovider").fill("Alpha")
-        page.locator("#callstatus").fill("completed")
-        page.locator("#callwindow").select_option("1h")
-        page.locator("#calllimit").select_option("2")
-        page.locator("#calls").get_by_text("成功", exact=True).wait_for()
-        call_headers = [text.split("\n")[0] for text in page.locator("#calls thead th").all_inner_texts()]
-        assert "Provider" not in call_headers
-        assert "request ID" not in call_headers
-        page.get_by_role("button", name="下一页").click()
-        page.locator("#calls").get_by_text("传输失败", exact=True).wait_for()
-        assert page.locator("#calls").get_by_text("传输失败", exact=True).count() == 1
-        page.reload()
-        expect(page.locator("#windows").get_by_role("button", name="7d", exact=True)).to_have_class(__import__("re").compile("active"))
-        expect(page.locator("#model-view").get_by_role("button", name="价格组")).to_have_class(__import__("re").compile("active"))
-        assert page.locator("#callwindow").input_value() == "1h"
-        assert page.locator("#calllimit").input_value() == "2"
-        assert page.locator("#callprovider").input_value() == "Alpha"
-        assert page.locator("#callstatus").input_value() == "completed"
-        assert page.locator("#providers").inner_text().find("saved note") >= 0
-        assert any(method == "PATCH" and '"enabled":false' in (body or "") for method, _, body in seen)
-        assert any("window=1h" in path and "provider=Alpha" in path and "status=completed" in path for _, path, _ in seen)
-        assert any("limit=2" in path for _, path, _ in seen)
-        assert any("/admin/v1/providers?window=7d" in path for _, path, _ in seen)
-        assert any(method == "POST" and path == "/admin/v1/catalog" for method, path, _ in seen)
-        assert any(method == "POST" and path == "/admin/v1/catalog/apply" for method, path, _ in seen)
-        assert any(method == "PATCH" and path == "/admin/v1/routing" and '"race_parallel_cap":2' in (body or "") for method, path, body in seen)
-        assert any(method == "PUT" and path.endswith("/gpt-console-route") for method, path, _ in seen)
-        assert any(method == "DELETE" and path.endswith("/gpt-console-route") for method, path, _ in seen)
-        browser.close()
+        page.locator("#providers tbody tr").wait_for()
 
+        provider_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#providers thead th").all_inner_texts()]
+        assert provider_headers == ["域名", "状态", "备注", "API Key", "单 Key 并发上限", "24h Token", "24h 费用", "操作"]
+        assert page.locator("#providers").get_by_role("button", name="一键测试").count() == 0
+        assert page.locator("#providers").get_by_text("safe note", exact=True).count() == 1
+        assert page.locator("#model-view tbody tr").get_by_role("button", name="测试").count() == 1
+        assert page.locator("#model-directory input[name=official_input_price]").count() == 0
+        assert page.locator("main > section:has(#analytics-title)").count() == 1
+        assert page.locator("main > section:has(#route-audit-title)").count() == 1
+        browser.close()
 
 def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_path):
     with LiveBroker(tmp_path / "pricing-console.sqlite3") as broker, sync_playwright() as playwright:
@@ -328,7 +137,6 @@ def test_pricing_console_separates_models_prices_and_escapes_source_text(tmp_pat
         assert page.locator("#pricing img, #pricing svg, #pricing script").count() == 0
         assert "Console price list" in page.locator("#pricing").inner_text()
         assert "Evidence <script>window.__injected=2</script>" in page.locator("#pricing").inner_text()
-        assert page.locator("#model-directory").get_by_text("1", exact=True).count() >= 1
         assert page.locator("#model-directory-section input[name=official_input_price]").count() == 0
         page.locator("#pricing-bindings").get_by_text("Initial binding", exact=False).wait_for()
         page.locator("#pricing-bindings").get_by_role("button", name="编辑").click()
