@@ -1965,11 +1965,18 @@ class Store:
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
             pricing_type = canonical_provider_type(
-                entry.get("pricing_provider_type") or entry.get("provider_type") or "openai",
+                entry.get("canonical_provider_type")
+                or entry.get("pricing_provider_type")
+                or entry.get("provider_type")
+                or "openai",
                 base_url=base_url, models=entry.get("models") or (),
             )
             if pricing_type is None:
-                raise ValueError("unsupported provider type")
+                # CPA synchronization filters these entries before storage;
+                # direct Store callers receive the same six-provider boundary
+                # by ignoring unsupported inventory instead of aborting the
+                # whole snapshot.
+                continue
             from .catalog import canonicalize
             source_models = list(dict.fromkeys(canonicalize(model) for model in (entry.get("models") or [entry.get("model", "unavailable")])))
             # Inventory keeps the complete CPA model evidence. Routing still
@@ -2011,6 +2018,9 @@ class Store:
                 for key in ("section", "site_name", "provider_type")
                 if isinstance(entry.get("source"), dict) and isinstance(entry["source"].get(key), (str, int, float, bool))
             } | {"inventory_status": entry.get("inventory_status", "unavailable")}
+            transport_provider_type = entry.get("provider_type")
+            if isinstance(transport_provider_type, str) and transport_provider_type.strip():
+                source["transport_provider_type"] = transport_provider_type.strip()[:160]
             model_aliases = entry.get("model_aliases")
             if isinstance(model_aliases, dict):
                 source["model_aliases"] = {
@@ -2022,7 +2032,11 @@ class Store:
             name = str(entry.get("name") or (models[0] if models else "unavailable"))[:160]
             if api_key in name:
                 name = entry.get("provider_type", "openai")
-            rows.append((fp, name, base_url, self._encrypt(api_key), entry.get("provider_type", "openai"), pricing_type, self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
+            # Keep the inventory row keyed by the canonical pricing provider.
+            # The transport adapter remains available in source_json, while
+            # Provider + Model pricing must always use the six-provider
+            # identity that CPA supplied as canonical_provider_type.
+            rows.append((fp, name, base_url, self._encrypt(api_key), pricing_type, pricing_type, self._encrypt(request_headers), self.api_key_mask(api_key), json.dumps(models), json.dumps(source), synced_at, site_id))
         canonical_model_metadata = self.canonical_models()
         current_models = {row[0]: set(json.loads(row[8])) for row in rows}
         preserved_mappings = [
@@ -2387,12 +2401,17 @@ class Store:
                 ) ORDER BY julianday(evidence_at) DESC,source_priority DESC LIMIT 1""",
                 (row['fingerprint'], row['fingerprint']),
             ).fetchone()
+            try:
+                source_metadata = json.loads(row['source_json'] or "{}")
+            except (TypeError, ValueError):
+                source_metadata = {}
             inventory.append({
                 'fingerprint': row['fingerprint'], 'name': row['name'], 'base_url': row['base_url'],
-                'site_id': row['site_id'], 'normalized_hostname': row['site_id'], 'family': row['provider_type'],
+                'site_id': row['site_id'], 'normalized_hostname': row['site_id'],
+                'family': source_metadata.get('transport_provider_type') or row['provider_type'],
                 'api_key_mask': row['api_key_mask'] or '***', 'models': models,
                 'model_pricing': model_pricing,
-                'inventory_status': json.loads(row['source_json']).get('inventory_status'), 'enabled': bool(row['enabled']),
+                'inventory_status': source_metadata.get('inventory_status'), 'enabled': bool(row['enabled']),
                 'calibrated': bool(row['calibrated']), 'note': row['note'], 'max_parallel': row['max_parallel'],
                 'technical_success_rate': stats['rate'], 'avg_ttft_ms': stats['ttft'],
                 'cost_24h': single_fee, 'total_tokens': accounting['total_tokens'], 'fee_buckets': fees,
