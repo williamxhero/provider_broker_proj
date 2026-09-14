@@ -244,19 +244,30 @@ function renderProviders(payload) {
   const columns = [{ key: "normalized_hostname", label: "域名" }, { key: "status", label: "状态" }, { key: "note", label: "备注" }, { key: "api_key_mask", label: "API Key" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "total_tokens", label: `${state.qualityWindow} Token` }, { key: "fee_buckets", label: `${state.qualityWindow} 费用` }];
   columns.push({ label: "操作" });
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
+  const groups = new Map();
   sortItems(payload.providers, "providers", (provider, key) => provider[key]).forEach((provider) => {
+    const hostname = provider.normalized_hostname || "UNKNOWN";
+    if (!groups.has(hostname)) groups.set(hostname, []);
+    groups.get(hostname).push(provider);
+  });
+  groups.forEach((providers) => providers.forEach((provider, index) => {
     const row = document.createElement("tr");
     if (provider.status !== "enabled") row.className = "inactive-row";
+    if (index === 0) {
+      const domain = cell(provider.normalized_hostname);
+      domain.rowSpan = providers.length;
+      row.append(domain);
+    }
     const status = document.createElement("span");
     status.className = `status ${provider.status === "enabled" ? "on" : "off"}`;
     status.textContent = provider.status === "enabled" ? "启用" : provider.status === "disabled" ? "停用" : "不可用";
     const statusCell = document.createElement("td"); statusCell.append(status);
-    row.append(cell(provider.normalized_hostname), statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.max_parallel), cell(formatTokens(provider.total_tokens)), cell(formatFeeBuckets(provider.fee_buckets)));
+    row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.max_parallel), cell(formatTokens(provider.total_tokens)), cell(formatFeeBuckets(provider.fee_buckets)));
     const action = document.createElement("td");
     const edit = document.createElement("button"); edit.type = "button"; edit.className = "text-button"; edit.textContent = "编辑";
     edit.addEventListener("click", () => openEditor(provider));
     action.append(edit); row.append(action); body.append(row);
-  });
+  }));
 }
 
 function providerDomain(baseUrl) {

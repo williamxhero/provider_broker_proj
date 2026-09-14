@@ -50,11 +50,18 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
             if path.startswith("/admin/v1/summary"):
                 return {"routable_apis": 1, "last_successful_sync": None}
             if path.startswith("/admin/v1/providers"):
-                return {"providers": [{
-                    "fingerprint": "fp-a", "normalized_hostname": "alpha.invalid", "status": "enabled",
-                    "note": "safe note", "api_key_mask": "abc***xyz", "max_parallel": 3,
-                    "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
-                }]}
+                return {"providers": [
+                    {
+                        "fingerprint": "fp-a", "normalized_hostname": "alpha.invalid", "status": "enabled",
+                        "note": "safe note", "api_key_mask": "abc***xyz", "max_parallel": 3,
+                        "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
+                    },
+                    {
+                        "fingerprint": "fp-b", "normalized_hostname": "alpha.invalid", "status": "disabled",
+                        "note": "backup key", "api_key_mask": "def***uvw", "max_parallel": 2,
+                        "total_tokens": 8, "fee_buckets": {"UNKNOWN": {"total_fee": 0.01}},
+                    },
+                ]}
             if path.startswith("/admin/v1/stages"):
                 return {"items": [{
                     "stage": "standard", "model": "gpt-5.6-luna", "family": "openai",
@@ -83,12 +90,16 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
             )
         ))
         page.goto(broker.url)
-        page.locator("#providers tbody tr").wait_for()
+        page.locator("#providers tbody tr").first.wait_for()
 
         provider_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#providers thead th").all_inner_texts()]
         assert provider_headers == ["域名", "状态", "备注", "API Key", "单 Key 并发上限", "24h Token", "24h 费用", "操作"]
         assert page.locator("#providers").get_by_role("button", name="一键测试").count() == 0
         assert page.locator("#providers").get_by_text("safe note", exact=True).count() == 1
+        assert page.locator("#providers tbody tr").count() == 2
+        assert page.locator("#providers tbody td[rowspan='2']").count() == 1
+        assert page.locator("#providers").get_by_text("abc***xyz", exact=True).count() == 1
+        assert page.locator("#providers").get_by_text("def***uvw", exact=True).count() == 1
         model_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#model-view thead th").all_inner_texts()]
         assert model_headers == ["Stage", "低价输出 / 1M CNY", "高价输出 / 1M CNY", "Provider types", "可调用 Key", "最近测试", "技术成功率", "平均首字延迟", "24h Token", "24h 费用", "操作"]
         assert page.locator("#model-view tbody tr").get_by_role("button", name="测试").count() == 1

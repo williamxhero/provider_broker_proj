@@ -50,9 +50,10 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
     assert keys_response.status == 200
     keys = (await keys_response.json())["providers"]
     assert all(set(item) == API_KEY_RESOURCE_FIELDS for item in keys)
-    assert len(keys) == 1
-    assert keys[0]["normalized_hostname"] == "api.example.com"
-    assert keys[0]["status"] == "mixed"
+    assert len(keys) == 2
+    assert {item["normalized_hostname"] for item in keys} == {"api.example.com"}
+    assert {item["api_key_mask"] for item in keys} == {"sec***pha", "sec***eta"}
+    assert {item["status"] for item in keys} == {"enabled", "disabled"}
     assert all("secret-" not in str(item) and "base_url" not in item and "models" not in item for item in keys)
     assert all(item["window"] == "1h" for item in keys)
 

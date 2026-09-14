@@ -68,15 +68,17 @@ def test_key_resources_merge_by_last_three_hostname_labels_and_keep_windowed_tot
 
     resources = store.api_key_resources("24h")
 
-    assert len(resources) == 1
-    resource = resources[0]
-    assert resource["fingerprint"] == resource["normalized_hostname"] == "vendor.example.com"
-    assert resource["status"] == "mixed"
-    assert resource["max_parallel"] == 5
-    assert resource["total_tokens"] == 40
-    assert resource["fee_buckets"]["CNY"]["total_fee"] == 1.25
-    assert "secret-one" not in json.dumps(resource)
-    assert store.api_key_resource(first, "24h")["fingerprint"] == "vendor.example.com"
+    assert len(resources) == 2
+    assert {item["normalized_hostname"] for item in resources} == {"vendor.example.com"}
+    by_key = {item["api_key_mask"]: item for item in resources}
+    assert {item["status"] for item in resources} == {"enabled", "disabled"}
+    assert {item["max_parallel"] for item in resources} == {2, 3}
+    assert by_key["sec***one"]["total_tokens"] == 15
+    assert by_key["sec***two"]["total_tokens"] == 25
+    assert by_key["sec***one"]["fee_buckets"]["CNY"]["total_fee"] == 0.5
+    assert by_key["sec***two"]["fee_buckets"]["CNY"]["total_fee"] == 0.75
+    assert "secret-one" not in json.dumps(resources)
+    assert store.api_key_resource(first, "24h")["fingerprint"] == first
 
 
 def test_stage_resources_are_one_row_per_stage_with_stable_output_price_bands(tmp_path):

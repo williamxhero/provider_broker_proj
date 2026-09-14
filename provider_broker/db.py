@@ -2428,8 +2428,9 @@ class Store:
         The routing inventory above intentionally remains rich because it is
         consumed by internal routing and migration code.  This projection is
         the only shape used by the Key console: it never includes endpoint
-        paths, provider/model inventory, pricing, or health statistics.  The
-        public row is one normalized hostname, not one credential.
+        paths, provider/model inventory, pricing, or health statistics.  Each
+        credential is one row; the console merges only the repeated hostname
+        cell visually.
         """
         if window not in ACCOUNTING_WINDOWS:
             raise ValueError("invalid window")
@@ -2439,51 +2440,31 @@ class Store:
                  FROM source_provider s JOIN policy p USING(fingerprint)
                  ORDER BY s.id"""
         ).fetchall()
-        groups: dict[str, list[sqlite3.Row]] = {}
-        for row in rows:
-            groups.setdefault(normalize_hostname(row["base_url"]) or "UNKNOWN", []).append(row)
-
         resources = []
-        for hostname, members in sorted(groups.items(), key=lambda item: (item[0], item[1][0]["id"])):
-            member_fingerprints = [row["fingerprint"] for row in members]
-            public_identifier = member_fingerprints[0] if len(members) == 1 else hostname
-            accounting = self._merge_accounting(
-                [self.accounting(window=window, fingerprint=fingerprint) for fingerprint in member_fingerprints],
-                window=window,
+        for row in rows:
+            hostname = normalize_hostname(row["base_url"]) or "UNKNOWN"
+            try:
+                source = json.loads(row["source_json"] or "{}")
+            except (TypeError, ValueError):
+                source = {}
+            inventory_status = source.get("inventory_status")
+            status = "disabled" if not row["enabled"] else (
+                "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
             )
-            statuses = []
-            for row in members:
-                try:
-                    source = json.loads(row["source_json"] or "{}")
-                except (TypeError, ValueError):
-                    source = {}
-                inventory_status = source.get("inventory_status")
-                statuses.append("disabled" if not row["enabled"] else (
-                    "unavailable" if inventory_status not in (None, "available", "stale") else "enabled"
-                ))
-            distinct_statuses = set(statuses)
-            status = statuses[0] if len(distinct_statuses) == 1 else "mixed"
-            masks = list(dict.fromkeys((row["api_key_mask"] or "***") for row in members))
-            notes = list(dict.fromkeys(row["note"] for row in members if row["note"]))
+            accounting = self.accounting(window=window, fingerprint=row["fingerprint"])
             resources.append({
-                # The normalized hostname is the stable group identifier. A
-                # caller may still address an individual legacy fingerprint;
-                # api_key_resource() resolves both forms during the cutover.
-                "fingerprint": public_identifier,
+                "fingerprint": row["fingerprint"],
                 "normalized_hostname": hostname,
                 "status": status,
-                "note": " · ".join(notes),
-                "api_key_mask": " · ".join(masks),
-                # The domain row represents the total available capacity of
-                # its credentials; individual policy limits remain editable
-                # through the group detail endpoint.
-                "max_parallel": sum(int(row["max_parallel"]) for row in members),
+                "note": row["note"],
+                "api_key_mask": row["api_key_mask"] or "***",
+                "max_parallel": row["max_parallel"],
                 "window": window,
                 "total_tokens": accounting["total_tokens"],
                 "fee_buckets": accounting["fee_buckets"],
                 "edit": {
-                    "fingerprint": public_identifier,
-                    "href": f"/admin/v1/keys/{public_identifier}",
+                    "fingerprint": row["fingerprint"],
+                    "href": f"/admin/v1/keys/{row['fingerprint']}",
                 },
             })
         return resources
@@ -2556,9 +2537,8 @@ class Store:
         members = self._api_key_group_members(fingerprint)
         if not members:
             return None
-        hostname = normalize_hostname(members[0]["base_url"]) or "UNKNOWN"
         resource = next((item for item in self.api_key_resources(window)
-                         if item["normalized_hostname"] == hostname), None)
+                         if item["fingerprint"] == members[0]["fingerprint"]), None)
         if resource is None:
             return None
         if include_mappings:
