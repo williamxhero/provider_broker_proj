@@ -617,7 +617,10 @@ def validate_structured_output(text: str, schema: dict, finish_reason: str | Non
 
 async def invoke_stream(provider, body: dict) -> dict:
     requested_model = canonicalize(provider.models[0])
-    model = canonicalize(getattr(provider, "wire_model", None) or requested_model)
+    # Canonicalization is for Broker identities only.  Preserve the configured
+    # wire ID exactly: vendor IDs such as `deepseek-flash` and case-sensitive
+    # namespaced IDs must reach the upstream unchanged.
+    model = str(getattr(provider, "wire_model", None) or requested_model)
     schema = structured_schema(body)
     outbound_schema = provider_native_schema(schema, provider.provider_type, provider.base_url)
     effort = body.get("effort")

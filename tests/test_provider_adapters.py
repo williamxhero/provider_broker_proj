@@ -138,6 +138,7 @@ async def test_deepseek_chat_adapter_does_not_send_unsupported_thinking_option()
 
     assert output["text"] == "ok"
     assert "thinking" not in captured
+    assert captured["model"] == "deepseek-flash"
 
 
 async def test_openai_chat_adapter_sends_structured_contract_and_validates_sse():
