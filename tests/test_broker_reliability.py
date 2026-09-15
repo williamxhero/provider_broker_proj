@@ -4,13 +4,30 @@ from unittest.mock import patch
 
 import pytest
 from provider_broker.db import Store
-from provider_broker.health import run_probe
+from provider_broker.health import invoke_stream as invoke_probe_stream, run_probe
 from provider_broker.source import expand_config
 from provider_broker.upstream import AttemptFailure, classify_failure
 
 
 def store(tmp_path: Path) -> Store:
     return Store(tmp_path / "broker.sqlite3", b"0123456789abcdef")
+
+
+@pytest.mark.asyncio
+async def test_structured_probe_reserves_budget_for_reasoning_models():
+    captured = {}
+
+    async def fake_invoke(_provider, body):
+        captured.update(body)
+        return {"actual_model": "glm-5.3", "latency_ms": 1}
+
+    with patch("provider_broker.health._invoke_stream", fake_invoke):
+        await invoke_probe_stream(object(), {
+            "prompt": "ignored", "output_token_limit": 1,
+            "probe_contract": "structured",
+        })
+
+    assert captured["output_token_limit"] >= 256
 
 
 def test_route_metrics_measure_request_outcome_separately_from_attempts(tmp_path):

@@ -1,6 +1,6 @@
 [project]
 name = "provider-broker"
-version = "0.2.33"
+version = "0.2.34"
 description = "Private provider routing broker"
 requires-python = ">=3.12"
 dependencies = ["aiohttp>=3.10", "cryptography>=43", "jsonschema>=4.23"]
@@ -22,3 +22,4 @@ provider_broker = ["web/*.html", "web/*.js", "web/*.css"]
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"
 testpaths = ["tests"]
+pythonpath = ["."]

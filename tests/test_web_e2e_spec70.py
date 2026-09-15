@@ -7,6 +7,7 @@ from playwright.sync_api import sync_playwright
 
 from provider_broker.app import create_app
 from provider_broker.settings import Settings
+from web_test_support import safe_loopback_socket
 
 
 class LiveBroker:
@@ -26,7 +27,8 @@ class LiveBroker:
         app = create_app(Settings(self.database_path, "admin-secret", "session-secret", base64.b64encode(b"x" * 32).decode()))
         self.runner = web.AppRunner(app)
         self.loop.run_until_complete(self.runner.setup())
-        self.site = web.TCPSite(self.runner, "127.0.0.1", 0)
+        self.socket = safe_loopback_socket()
+        self.site = web.SockSite(self.runner, self.socket)
         self.loop.run_until_complete(self.site.start())
         self.url = f"http://127.0.0.1:{self.site._server.sockets[0].getsockname()[1]}"
         self.ready.set()

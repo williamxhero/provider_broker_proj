@@ -30,7 +30,9 @@ def structured_probe_prompt() -> str:
 async def invoke_stream(provider, body: dict) -> dict:
     """Make every health probe prove the structured-output contract."""
     if body.get("probe_contract") == "structured":
-        body = {**body, "prompt": structured_probe_prompt(), "output_token_limit": 32, "_preserve_prompt_envelope": True}
+        # Reasoning models can spend dozens of tokens before emitting the tiny
+        # JSON body. A 32-token cap makes a healthy model look incomplete.
+        body = {**body, "prompt": structured_probe_prompt(), "output_token_limit": 256, "_preserve_prompt_envelope": True}
     return await _invoke_stream(provider, body)
 
 
