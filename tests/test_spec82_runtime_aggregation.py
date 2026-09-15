@@ -139,5 +139,6 @@ def test_stage_resources_use_the_complete_approved_stage_model_mapping(tmp_path)
         (stage, model)
         for stage, models in APPROVED_STAGE_MODELS.items()
         for model in models
+        if model.startswith("gpt-")
     ]
     assert "unknown-provider-model" not in {item["model"] for item in stages}

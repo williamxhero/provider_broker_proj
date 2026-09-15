@@ -43,9 +43,9 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
         "inventory_status": "available",
     }], "2026-09-12T00:00:00+00:00")
 
-    assert {provider.models[0] for provider in store.providers("standard")} == {"deepseek-v4-flash-0731"}
-    assert {provider.models[0] for provider in store.providers("smart")} == set()
-    assert {provider.models[0] for provider in store.providers("expert")} == {"glm-5.3"}
+    assert {provider.models[0] for provider in store.providers("standard")} == {"gpt-5.6-luna"}
+    assert {provider.models[0] for provider in store.providers("smart")} == {"gpt-5.6-terra"}
+    assert {provider.models[0] for provider in store.providers("expert")} == {"gpt-5.6-sol", "gpt-5.5"}
     assert "unknown-provider-model" in store.inventory()[0]["models"]
     assert all("unknown-provider-model" not in provider.models for provider in store.providers("smart"))
 
@@ -63,6 +63,23 @@ def test_routing_recovers_the_saved_wire_adapter_and_model_alias(tmp_path):
     provider = store.providers("standard")[0]
     assert provider.provider_type == "openai_chat"
     assert provider.wire_model == "deepseek-ai/DeepSeek-V4-Flash-0731"
+
+
+def test_broker_mapping_routes_when_cpa_inventory_is_empty(tmp_path):
+    store = Store(tmp_path / "broker.sqlite3", b"0123456789abcdef")
+    store.replace_source_snapshot([{
+        "name": "Qwen", "base_url": "https://qwen.test/v1", "api_key": "secret",
+        "provider_type": "qwen", "models": [], "inventory_status": "unavailable",
+    }], "2026-09-15T00:00:00+00:00")
+    fingerprint = store.conn.execute("SELECT fingerprint FROM source_provider").fetchone()[0]
+    store.update_policy(fingerprint, {"calibrated": True})
+    row = store.conn.execute("SELECT * FROM source_provider").fetchone()
+    assert store._broker_models_for_row(row) == ["qwen3.8-flash-next", "glm-5.3-flash", "glm-5.3"]
+
+    assert {provider.models[0] for provider in store.providers("smart")} == {"qwen3.8-flash-next", "glm-5.3-flash"}
+    assert store.probe_provider(
+        store.providers("smart")[0].fingerprint, "qwen3.8-flash-next"
+    ).wire_model == "qwen3.8-flash"
 
 
 def test_legacy_catalog_writes_are_removed_and_fixed_directory_is_stable(tmp_path):

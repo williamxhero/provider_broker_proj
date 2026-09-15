@@ -15,6 +15,7 @@ from cryptography.hazmat.primitives.ciphers.aead import AESGCM
 from .catalog import (
     APPROVED_MODEL_IDS,
     APPROVED_STAGE_MODELS,
+    BROKER_PROVIDER_MODELS,
     OFFICIAL_PRICE_SNAPSHOT,
     OFFICIAL_PROVIDER_SNAPSHOTS,
     canonicalize,
@@ -1274,11 +1275,11 @@ class Store:
         """Create health rows for newly discovered usable Provider/model pairs."""
         stamp = self._timestamp(now)
         canonical_models = set(self.canonical_models())
-        rows = self.conn.execute("SELECT fingerprint,models_json FROM source_provider").fetchall()
+        rows = self.conn.execute("SELECT fingerprint,provider_type,source_json FROM source_provider").fetchall()
         created = []
         with self.conn:
             for row in rows:
-                for model in json.loads(row["models_json"]):
+                for model in self._broker_models_for_row(row):
                     if model not in canonical_models:
                         continue
                     inserted = self.conn.execute(
@@ -1972,11 +1973,16 @@ class Store:
         existing_policies = {row[0] for row in self.conn.execute("SELECT fingerprint FROM policy")}
         for entry in entries:
             base_url, api_key = entry["base_url"].rstrip("/"), entry["api_key"]
+            transport_provider_type = entry.get("provider_type")
+            explicit_provider_type = entry.get("canonical_provider_type") or entry.get("pricing_provider_type")
+            inferred_provider_type = explicit_provider_type or (
+                {"openai_chat": "openai", "anthropic_messages": "anthropic"}.get(
+                    str(transport_provider_type).strip().lower()
+                    if isinstance(transport_provider_type, str) else ""
+                )
+            ) or transport_provider_type or "openai"
             pricing_type = canonical_provider_type(
-                entry.get("canonical_provider_type")
-                or entry.get("pricing_provider_type")
-                or entry.get("provider_type")
-                or "openai",
+                inferred_provider_type,
                 base_url=base_url, models=entry.get("models") or (),
             )
             if pricing_type is None:
@@ -2026,9 +2032,9 @@ class Store:
                 for key in ("section", "site_name", "provider_type")
                 if isinstance(entry.get("source"), dict) and isinstance(entry["source"].get(key), (str, int, float, bool))
             } | {"inventory_status": entry.get("inventory_status", "unavailable")}
-            transport_provider_type = entry.get("provider_type")
             if isinstance(transport_provider_type, str) and transport_provider_type.strip():
                 source["transport_provider_type"] = transport_provider_type.strip()[:160]
+            source["broker_provider_type"] = pricing_type
             model_aliases = entry.get("model_aliases")
             if isinstance(model_aliases, dict):
                 source["model_aliases"] = {
@@ -2206,10 +2212,15 @@ class Store:
     def _provider_from_row(self, row, model: str, canonical_model_metadata: dict) -> Provider:
         headers = json.loads(self._decrypt(row['request_headers'])) if row['request_headers'] else {}
         source = json.loads(row['source_json']) if row['source_json'] else {}
+        broker_provider_type = self._broker_provider_type_for_row(row)
+        # Broker's fixed mapping is authoritative. CPA /models aliases are
+        # discovery evidence only and may be absent when inventory failed.
+        wire_model = BROKER_PROVIDER_MODELS.get(broker_provider_type, {}).get(model)
         model_aliases = source.get('model_aliases') or {}
-        wire_model = model_aliases.get(model)
+        if wire_model is None:
+            wire_model = model_aliases.get(model)
         reverse_aliases = {str(wire).casefold(): str(alias) for alias, wire in model_aliases.items()}
-        source_models = [canonicalize(item) for item in json.loads(row['models_json'])]
+        source_models = self._broker_models_for_row(row)
         pricing_by_model = {
             candidate: self.effective_key_pricing(row['fingerprint'], candidate)
             for candidate in source_models
@@ -2228,6 +2239,26 @@ class Store:
             price_reason=pricing['reason'],
         )
 
+    @staticmethod
+    def _broker_provider_type_for_row(row) -> str:
+        try:
+            source = json.loads(row['source_json'] or '{}')
+        except (TypeError, ValueError):
+            source = {}
+        provider_type = str(
+            source.get('broker_provider_type') or row['provider_type'] or ''
+        ).strip().lower()
+        return {
+            'openai_chat': 'openai',
+            'anthropic_messages': 'anthropic',
+        }.get(provider_type, provider_type)
+
+    @classmethod
+    def _broker_models_for_row(cls, row) -> list[str]:
+        """Return Broker-owned models for one key, independent of CPA inventory."""
+        provider_type = cls._broker_provider_type_for_row(row)
+        return list(BROKER_PROVIDER_MODELS.get(provider_type, {}))
+
     def providers(self, tier: str, *, contract: str | None = None) -> list[Provider]:
         rows = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel FROM source_provider s JOIN policy p USING(fingerprint)
         WHERE p.enabled=1 AND p.calibrated=1 ORDER BY s.id""").fetchall()
@@ -2235,7 +2266,7 @@ class Store:
         result=[]
         for r in rows:
             blocked={row[0] for row in self.conn.execute('SELECT model FROM route_block WHERE fingerprint=?',(r['fingerprint'],))}
-            models=[m for m in json.loads(r['models_json']) if m in canonical_model_metadata and canonical_model_metadata[m]['stage'] == tier and m not in blocked]
+            models=[m for m in self._broker_models_for_row(r) if m in canonical_model_metadata and canonical_model_metadata[m]['stage'] == tier and m not in blocked]
             if models and tier in json.loads(r['tiers_json']):
                 # A key can expose several catalog models in the same stage.  Health is
                 # per model, so make each routing candidate explicit rather than letting
@@ -2293,7 +2324,7 @@ class Store:
         row = self.conn.execute("""SELECT s.*,p.enabled,p.calibrated,p.tiers_json,p.max_parallel
             FROM source_provider s JOIN policy p USING(fingerprint) WHERE s.fingerprint=?""", (fingerprint,)).fetchone()
         catalog = self.canonical_models()
-        if row is None or not row['enabled'] or not row['calibrated'] or model not in json.loads(row['models_json']) or model not in catalog:
+        if row is None or not row['enabled'] or not row['calibrated'] or model not in self._broker_models_for_row(row) or model not in catalog:
             return None
         tier = catalog[model]['stage']
         if tier not in json.loads(row['tiers_json']):
@@ -2580,7 +2611,7 @@ class Store:
         result = []
         for row in rows:
             try:
-                models = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
+                models = set(self._broker_models_for_row(row))
                 tiers = set(json.loads(row["tiers_json"] or "[]"))
                 source = json.loads(row["source_json"] or "{}")
             except (TypeError, ValueError):
@@ -2590,7 +2621,9 @@ class Store:
             if not callable_only:
                 result.append(row)
                 continue
-            if not row["enabled"] or not row["calibrated"] or source.get("inventory_status") not in (None, "available", "stale"):
+            # CPA inventory is advisory. An unavailable /models response must
+            # not remove a Broker-owned model from the callable key set.
+            if not row["enabled"] or not row["calibrated"]:
                 continue
             site = self.conn.execute(
                 "SELECT enabled FROM site_policy WHERE site_id=?", (row["site_id"],)
@@ -2686,7 +2719,7 @@ class Store:
                     continue
                 for row in rows:
                     try:
-                        declared = {canonicalize(item) for item in json.loads(row["models_json"] or "[]")}
+                        declared = set(self._broker_models_for_row(row))
                         tiers = set(json.loads(row["tiers_json"] or "[]"))
                         source = json.loads(row["source_json"] or "{}")
                     except (TypeError, ValueError):

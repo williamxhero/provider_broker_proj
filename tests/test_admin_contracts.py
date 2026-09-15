@@ -29,7 +29,7 @@ def seed_inventory(store: Store) -> list[str]:
         {"name": "Alpha", "base_url": "https://api.example.com/v1", "api_key": "secret-alpha",
          "provider_type": "openai", "models": ["gpt-5.6-luna"], "inventory_status": "available"},
         {"name": "Beta", "base_url": "https://api.example.com:443/alt", "api_key": "secret-beta",
-         "provider_type": "anthropic", "models": ["gpt-5.6-luna"], "inventory_status": "available"},
+         "provider_type": "openai", "models": ["gpt-5.6-luna"], "inventory_status": "available"},
     ], "2026-09-14T00:00:00Z")
     rows = store.conn.execute("SELECT fingerprint FROM source_provider ORDER BY id").fetchall()
     return [row["fingerprint"] for row in rows]
@@ -45,6 +45,8 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
                   tier="standard", success=0, latency_ms=300, input_tokens=20,
                   output_tokens=5, cost=2, currency="CNY")
     assert store.update_policy(second, {"enabled": False})
+    assert store.update_policy(first, {"tiers": ["standard"]})
+    assert store.update_policy(second, {"tiers": ["standard"]})
 
     keys_response = await admin_client.get("/admin/v1/providers?window=1h")
     assert keys_response.status == 200
@@ -64,11 +66,12 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
     assert all(set(item) == STAGE_RESOURCE_FIELDS for item in stages)
     assert {item["model"] for item in stages} == {"gpt-5.6-luna"}
     assert {item["fingerprint"] for item in stages} == {first, second}
-    assert {item["provider_type"] for item in stages} == {"anthropic", "openai"}
+    assert {item["provider_type"] for item in stages} == {"openai"}
     assert {item["status"] for item in stages} == {"enabled", "disabled"}
     assert sum(item["total_tokens"] for item in stages) == 40
-    assert stages[0]["fee_buckets"]["USD"]["total_fee"] == .25
-    assert stages[1]["fee_buckets"]["CNY"]["total_fee"] == 2
+    standard = [item for item in stages if item["model"] == "gpt-5.6-luna"]
+    assert standard[0]["fee_buckets"]["USD"]["total_fee"] == .25
+    assert standard[1]["fee_buckets"]["CNY"]["total_fee"] == 2
 
     assert (await admin_client.get("/admin/v1/models?include_inactive=true")).status == 404
 
