@@ -170,8 +170,6 @@ BROKER_PROVIDER_MODELS = {
     },
     "qwen": {
         "qwen3.8-flash-next": "qwen3.8-flash",
-        "glm-5.3-flash": "ZHIPU/GLM-5.3-Flash",
-        "glm-5.3": "ZHIPU/GLM-5.3",
     },
     "doubao": {
         "doubao-seed-2.1-turbo": "doubao-seed-2-1-turbo-260628",

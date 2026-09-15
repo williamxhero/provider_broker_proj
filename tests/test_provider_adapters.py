@@ -238,8 +238,6 @@ def test_broker_owned_provider_model_mapping_is_independent_of_cpa_configuration
     }
     assert _broker_model_aliases("qwen") == {
         "qwen3.8-flash-next": "qwen3.8-flash",
-        "glm-5.3-flash": "ZHIPU/GLM-5.3-Flash",
-        "glm-5.3": "ZHIPU/GLM-5.3",
     }
     assert _broker_model_aliases("doubao") == {
         "doubao-seed-2.1-turbo": "doubao-seed-2-1-turbo-260628",
@@ -276,7 +274,7 @@ async def test_failed_model_discovery_keeps_broker_owned_mapping(tmp_path):
     assert result["inventory_failures"] == 1
     row = store.inventory()[0]
     assert row["inventory_status"] == "stale"
-    assert row["models"] == ["qwen3.8-flash-next", "glm-5.3-flash", "glm-5.3"]
+    assert row["models"] == ["qwen3.8-flash-next"]
 
 
 def test_deepseek_falls_back_to_prompt_validation_for_native_schema():

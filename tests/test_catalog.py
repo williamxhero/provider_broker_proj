@@ -74,9 +74,9 @@ def test_broker_mapping_routes_when_cpa_inventory_is_empty(tmp_path):
     fingerprint = store.conn.execute("SELECT fingerprint FROM source_provider").fetchone()[0]
     store.update_policy(fingerprint, {"calibrated": True})
     row = store.conn.execute("SELECT * FROM source_provider").fetchone()
-    assert store._broker_models_for_row(row) == ["qwen3.8-flash-next", "glm-5.3-flash", "glm-5.3"]
+    assert store._broker_models_for_row(row) == ["qwen3.8-flash-next"]
 
-    assert {provider.models[0] for provider in store.providers("smart")} == {"qwen3.8-flash-next", "glm-5.3-flash"}
+    assert {provider.models[0] for provider in store.providers("smart")} == {"qwen3.8-flash-next"}
     assert store.probe_provider(
         store.providers("smart")[0].fingerprint, "qwen3.8-flash-next"
     ).wire_model == "qwen3.8-flash"
