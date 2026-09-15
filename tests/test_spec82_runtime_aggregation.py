@@ -142,3 +142,28 @@ def test_stage_resources_use_the_complete_approved_stage_model_mapping(tmp_path)
         if model.startswith("gpt-")
     ]
     assert "unknown-provider-model" not in {item["model"] for item in stages}
+
+
+def test_key_test_provider_prefers_effective_cny_price_then_model_list_fallback(tmp_path):
+    store = make_store(tmp_path)
+    first, second = add_inventory(store, [{
+        "name": "Priced key", "base_url": "https://priced.vendor.example.com/v1",
+        "api_key": "priced-secret", "provider_type": "openai",
+        "models": ["gpt-5.6-luna", "gpt-5.6-terra"], "inventory_status": "available",
+    }, {
+        "name": "Unpriced key", "base_url": "https://unpriced.vendor.example.com/v1",
+        "api_key": "unpriced-secret", "provider_type": "openai",
+        "models": ["gpt-5.6-luna", "gpt-5.6-terra"], "inventory_status": "available",
+    }])
+    price_provider = store.create_pricing_provider("selection-prices", provider_type="openai")
+    store.insert_provider_model_price(provider_id=price_provider, model_id="gpt-5.6-luna", output_price_cny=2)
+    store.insert_provider_model_price(provider_id=price_provider, model_id="gpt-5.6-terra", output_price_cny=4)
+    store.upsert_key_model_mapping(first, "gpt-5.6-luna", target_provider_id=price_provider, multiplier=3)
+    store.upsert_key_model_mapping(first, "gpt-5.6-terra", target_provider_id=price_provider, multiplier=1)
+    for mapping in store.key_model_mappings(fingerprint=second):
+        store.update_key_model_mapping(mapping["id"], enabled=False)
+
+    selected, stage = store.key_test_provider(first)
+    assert selected.models == ["gpt-5.6-terra"] and stage == "smart"
+    fallback, fallback_stage = store.key_test_provider(second)
+    assert fallback.models == ["gpt-5.6-luna"] and fallback_stage == "standard"

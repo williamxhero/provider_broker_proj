@@ -1,12 +1,11 @@
 const byId = (id) => document.getElementById(id);
 const sortDefaults = {
   providers: { key: "note", direction: "asc" },
-  modelView: { key: "stage", direction: "asc" },
   models: { key: "id", direction: "asc" },
   pricing: { key: "provider", direction: "asc" },
   calls: { key: "time", direction: "desc" },
 };
-const state = { cursor: "", provider: null, model: null, pricing: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], stages: [], summary: {}, sorts: {}, models: [], pricingItems: [] };
+const state = { cursor: "", provider: null, model: null, callsRequest: 0, filterTimer: null, pricingTimer: null, qualityWindow: "24h", providers: [], summary: {}, sorts: {}, models: [], pricingItems: [], expandedKeys: new Set(), knownKeys: new Set() };
 const preferencesKey = "provider-broker.console.preferences.v1";
 const preferences = (() => { try { return JSON.parse(window.localStorage.getItem(preferencesKey) || "{}"); } catch (_) { return {}; } })();
 const empty = (value) => value === null || value === undefined || value === "" || value === "UNKNOWN" ? "n/a" : String(value);
@@ -240,9 +239,22 @@ async function loadPricingViews() {
 
 function renderProviders(payload) {
   state.providers = payload.providers;
+  const currentKeys = new Set(state.providers.map((provider) => provider.fingerprint));
+  state.providers.forEach((provider) => {
+    if (!state.knownKeys.has(provider.fingerprint)) state.expandedKeys.add(provider.fingerprint);
+  });
+  state.expandedKeys.forEach((fingerprint) => { if (!currentKeys.has(fingerprint)) state.expandedKeys.delete(fingerprint); });
+  state.knownKeys = currentKeys;
   const table = byId("providers");
-  const columns = [{ key: "normalized_hostname", label: "域名" }, { key: "status", label: "状态" }, { key: "note", label: "备注" }, { key: "api_key_mask", label: "API Key" }, { key: "max_parallel", label: "单 Key 并发上限" }, { key: "total_tokens", label: `${state.qualityWindow} Token` }, { key: "fee_buckets", label: `${state.qualityWindow} 费用` }];
-  columns.push({ label: "操作" });
+  const columns = [
+    { key: "normalized_hostname", label: "域名" }, { key: "status", label: "状态" },
+    { key: "note", label: "备注" }, { key: "api_key_mask", label: "API Key" },
+    { key: "max_parallel", label: "单 Key 并发上限" }, { key: "total_tokens", label: `${state.qualityWindow} Token` },
+    { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "Model" },
+    { label: "Stage" }, { label: "可调用" }, { label: "最近测试" }, { label: "技术成功率" },
+    { label: "平均首字延迟" }, { label: `${state.qualityWindow} Model Token` },
+    { label: `${state.qualityWindow} Model 费用` }, { label: "操作" },
+  ];
   const body = tableHead(table, columns, "providers", () => renderProviders({ providers: state.providers }));
   const groups = new Map();
   sortItems(payload.providers, "providers", (provider, key) => provider[key]).forEach((provider) => {
@@ -250,24 +262,60 @@ function renderProviders(payload) {
     if (!groups.has(hostname)) groups.set(hostname, []);
     groups.get(hostname).push(provider);
   });
-  groups.forEach((providers) => providers.forEach((provider, index) => {
-    const row = document.createElement("tr");
-    if (provider.status !== "enabled") row.className = "inactive-row";
-    if (index === 0) {
-      const domain = cell(provider.normalized_hostname);
-      domain.rowSpan = providers.length;
-      row.append(domain);
-    }
+  const stageRank = (value) => ({ standard: 0, smart: 1, expert: 2 }[value] ?? 99);
+  const modelSortValue = (item, key) => key === "latest_test" ? item.latest_test?.at : item[key];
+  const renderStatus = (value) => {
     const status = document.createElement("span");
-    status.className = `status ${provider.status === "enabled" ? "on" : "off"}`;
-    status.textContent = provider.status === "enabled" ? "启用" : provider.status === "disabled" ? "停用" : "不可用";
-    const statusCell = document.createElement("td"); statusCell.append(status);
-    row.append(statusCell, cell(provider.note), cell(provider.api_key_mask), cell(provider.max_parallel), cell(formatTokens(provider.total_tokens)), cell(formatFeeBuckets(provider.fee_buckets)));
-    const action = document.createElement("td");
-    const edit = document.createElement("button"); edit.type = "button"; edit.className = "text-button"; edit.textContent = "编辑";
-    edit.addEventListener("click", () => openEditor(provider));
-    action.append(edit); row.append(action); body.append(row);
-  }));
+    status.className = `status ${value === "enabled" ? "on" : "off"}`;
+    status.textContent = value === "enabled" ? "启用" : value === "disabled" ? "停用" : "不可用";
+    const td = document.createElement("td"); td.append(status); return td;
+  };
+  const button = (label, className, listener, ariaLabel = label) => {
+    const item = document.createElement("button"); item.type = "button"; item.className = className; item.textContent = label;
+    item.setAttribute("aria-label", ariaLabel); item.addEventListener("click", listener); return item;
+  };
+  const modelCells = (model) => {
+    const latest = model.latest_test ? `${displayStatus(model.latest_test.status)} · ${formatShanghaiTime(model.latest_test.at)}` : "n/a";
+    return [cell(model.model), cell(model.stage), cell(model.callable ? "是" : "否"), cell(latest),
+      cell(formatPercent(model.technical_success_rate)), cell(formatMs(model.avg_first_token_latency_ms)),
+      cell(formatTokens(model.total_tokens)), cell(formatFeeBuckets(model.fee_buckets))];
+  };
+  groups.forEach((providers) => {
+    const domainRows = providers.reduce((total, provider) => total + 1 + (provider.models || []).length, 0);
+    let domainRendered = false;
+    providers.forEach((provider) => {
+      const models = [...(provider.models || [])].sort((left, right) =>
+        stageRank(left.stage) - stageRank(right.stage) || compareValues(left.model, right.model));
+      const rowCount = models.length + 1;
+      const parent = document.createElement("tr");
+      parent.className = `key-parent${provider.status !== "enabled" ? " inactive-row" : ""}`;
+      parent.dataset.key = provider.fingerprint;
+      if (!domainRendered) {
+        const domain = cell(provider.normalized_hostname); domain.rowSpan = domainRows; domain.className = "domain-cell";
+        parent.append(domain); domainRendered = true;
+      }
+      const parentCells = [renderStatus(provider.status), cell(provider.note), cell(provider.api_key_mask), cell(provider.max_parallel),
+        cell(formatTokens(provider.total_tokens)), cell(formatFeeBuckets(provider.fee_buckets))];
+      parentCells.forEach((item) => { item.rowSpan = rowCount; item.classList.add("key-parent-cell"); parent.append(item); });
+      const summary = cell(models.length ? `${models.length} 个 Model` : "无可路由 Model"); summary.colSpan = 8; summary.className = "model-summary"; parent.append(summary);
+      const action = document.createElement("td"); action.rowSpan = rowCount; action.className = "key-actions";
+      const expanded = state.expandedKeys.has(provider.fingerprint);
+      const toggle = button(expanded ? "⌃" : "⌄", "icon-button", () => toggleKey(provider.fingerprint), expanded ? "收起 Model" : "展开 Model");
+      toggle.setAttribute("aria-expanded", String(expanded)); toggle.title = expanded ? "收起 Model" : "展开 Model";
+      action.append(toggle, button("编辑", "text-button", () => openEditor(provider)), button("测试", "text-button", (event) => testKey(provider, event.currentTarget), "测试此 API Key"));
+      parent.append(action); body.append(parent);
+      models.forEach((model) => {
+        const child = document.createElement("tr"); child.className = `model-child${expanded ? "" : " collapsed"}`; child.dataset.parentKey = provider.fingerprint;
+        modelCells(model).forEach((item) => { item.classList.add("model-child-cell"); child.append(item); });
+        body.append(child);
+      });
+    });
+  });
+}
+
+function toggleKey(fingerprint) {
+  if (state.expandedKeys.has(fingerprint)) state.expandedKeys.delete(fingerprint); else state.expandedKeys.add(fingerprint);
+  renderProviders({ providers: state.providers });
 }
 
 function renderModels(payload = { items: state.models }) {
@@ -311,6 +359,8 @@ function closeModelEditor() { byId("model-editor").hidden = true; state.model = 
 
 async function loadModels() { renderModels(await requestJson("/admin/v1/models")); }
 
+async function loadProviders() { renderProviders(await requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`)); }
+
 function providerDomain(baseUrl) {
   try { return new URL(baseUrl).origin; } catch (_) { return baseUrl; }
 }
@@ -319,66 +369,20 @@ function stageOrder(value) {
   return ({ standard: 0, smart: 1, expert: 2 })[value] ?? 99;
 }
 
-function renderModelView(payload = { items: state.stages }) {
-  state.stages = payload.items || [];
-  const table = byId("model-view");
-  const columns = [
-    { key: "stage", label: "Stage" }, { key: "note", label: "备注" }, { key: "model", label: "模型" },
-    { key: "provider_type", label: "Provider" }, { key: "api_key_mask", label: "API Key" },
-    { key: "status", label: "状态" }, { key: "max_parallel", label: "单 Key 并发上限" },
-    { key: "callable", label: "可调用" }, { key: "latest_test", label: "最近测试" },
-    { key: "technical_success_rate", label: "技术成功率" },
-    { key: "avg_first_token_latency_ms", label: "平均首字延迟" },
-    { key: "total_tokens", label: `${state.qualityWindow} Token` },
-    { key: "fee_buckets", label: `${state.qualityWindow} 费用` }, { label: "操作" },
-  ];
-  const body = tableHead(table, columns, "modelView", () => renderModelView({ items: state.stages }));
-  const grouped = new Map();
-  state.stages.forEach((item) => {
-    if (!grouped.has(item.stage)) grouped.set(item.stage, []);
-    grouped.get(item.stage).push(item);
-  });
-  const valueFor = (item, key) => key === "latest_test" ? item.latest_test?.at : item[key];
-  [...grouped.keys()].sort((left, right) => stageOrder(left) - stageOrder(right)).forEach((stage) => {
-    const items = sortItems(grouped.get(stage), "modelView", valueFor);
-    items.forEach((item, index) => {
-    const row = document.createElement("tr");
-    if (index === 0) {
-      const stageCell = cell(item.stage);
-      stageCell.rowSpan = items.length;
-      row.append(stageCell);
-    }
-    const latest = item.latest_test ? `${displayStatus(item.latest_test.status)} · ${formatShanghaiTime(item.latest_test.at)}` : "n/a";
-    const status = document.createElement("span");
-    status.className = `status ${item.status === "enabled" ? "on" : "off"}`;
-    status.textContent = item.status === "enabled" ? "启用" : item.status === "disabled" ? "停用" : "不可用";
-    const callable = item.callable ? "是" : "否";
-    row.append(cell(item.note), cell(item.model), cell(item.provider_type), cell(item.api_key_mask), (() => { const td = document.createElement("td"); td.append(status); return td; })(), cell(item.max_parallel), cell(callable), cell(latest), cell(formatPercent(item.technical_success_rate)), cell(formatMs(item.avg_first_token_latency_ms)), cell(formatTokens(item.total_tokens)), cell(formatFeeBuckets(item.fee_buckets)));
-    const action = document.createElement("td");
-    if (index === 0) {
-      const test = document.createElement("button"); test.type = "button"; test.className = "text-button"; test.textContent = "测试 Stage";
-      test.addEventListener("click", () => testStage(item, test));
-      action.rowSpan = items.length;
-      action.append(test);
-    }
-    row.append(action); body.append(row);
-    });
-  });
-}
-
-async function testStage(item, button) {
-  const output = byId("stage-test-result");
+async function testKey(provider, button) {
+  const output = byId("provider-model-result");
   button.disabled = true;
-  output.textContent = `正在测试 ${item.stage} 的启用 Key/Model pairs…`;
+  output.textContent = `正在测试 ${provider.api_key_mask} 的最低价 Model…`;
   try {
-    const result = await requestJson("/admin/v1/stages/test", {
+    const result = await requestJson(`/admin/v1/keys/${encodeURIComponent(provider.fingerprint)}/test`, {
       method: "POST", headers: { "Content-Type": "application/json" },
-      body: JSON.stringify({ stage: item.stage }),
+      body: JSON.stringify({}),
     });
-    await loadStageView();
-    output.textContent = `测试完成：${result.succeeded_count || 0}/${result.tested_count || 0} 个 capability pair 成功`;
+    state.expandedKeys.add(provider.fingerprint);
+    await loadProviders();
+    output.textContent = `测试完成：${result.model} · ${result.state === "succeeded" ? "成功" : "失败"}`;
   } catch (error) {
-    output.textContent = `Stage 测试失败：${error.message}`;
+    output.textContent = `API Key 测试失败：${error.message}`;
   } finally {
     button.disabled = false;
   }
@@ -525,21 +529,15 @@ async function loadAnalytics() {
   renderAnalytics(await requestJson(`/admin/v1/analytics?window=${encodeURIComponent(state.qualityWindow)}&group_by=site`));
 }
 
-async function loadStageView() {
-  renderModelView(await requestJson(`/admin/v1/stages?window=${encodeURIComponent(state.qualityWindow)}`));
-}
-
 async function load() {
-  const [summary, providers, routing, stages, models] = await Promise.all([
+  const [summary, providers, routing, models] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
-    requestJson(`/admin/v1/stages?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/models"),
   ]);
   renderSummary(summary);
   renderProviders(providers);
-  renderModelView(stages);
   renderModels(models);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
@@ -630,14 +628,12 @@ byId("windows").addEventListener("click", async (event) => {
   const button = event.target.closest("button[data-window]");
   if (!button) return;
   setQualityWindow(button.dataset.window);
-  const [quality, providers, stages] = await Promise.all([
+  const [quality, providers] = await Promise.all([
     requestJson(`/admin/v1/quality?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
-    requestJson(`/admin/v1/stages?window=${encodeURIComponent(state.qualityWindow)}`),
   ]);
   renderQuality(quality);
   renderProviders(providers);
-  renderModelView(stages);
 });
 
 function setQualityWindow(windowName) {

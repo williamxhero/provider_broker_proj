@@ -21,38 +21,35 @@
       <div id="quality" class="quality-grid"></div>
     </section>
 
-    <section aria-labelledby="providers-title">
-      <div class="section-heading">
-        <div><p class="index">02 / CREDENTIALS</p><h2 id="providers-title">API Key</h2></div>
-        <div class="section-actions"><div class="sync-control"><button id="sync" class="secondary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div></div>
-      </div>
-      <output id="syncresult" class="notice" aria-live="polite"></output>
-      <div class="table-wrap"><table id="providers"></table></div>
-    </section>
-
     <section aria-labelledby="models-title" id="models-section">
       <div class="section-heading">
-        <div><p class="index">03 / BROKER MODELS</p><h2 id="models-title">Model List</h2></div>
+        <div><p class="index">02 / BROKER MODELS</p><h2 id="models-title">Model List</h2></div>
         <div class="section-actions"><button id="add-model" class="primary" type="button">添加 Model</button></div>
       </div>
-      <p class="field-help">Broker 只使用这里启用的模型。每个标签属于一个 Stage；CPA 的 /models 结果不会写入或覆盖此列表。</p>
+      <p class="field-help">Broker 只使用这里启用的模型。每个模型属于一个 Stage；CPA 的 /models 结果不会写入或覆盖此列表。</p>
       <div id="model-list" class="stage-model-list"></div>
       <output id="model-result" class="notice" aria-live="polite"></output>
     </section>
 
-    <section aria-labelledby="model-view-title">
+    <section aria-labelledby="providers-title">
       <div class="section-heading">
-        <div><p class="index">04 / STAGE</p><h2 id="model-view-title">Stage</h2></div>
-        <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
+        <div><p class="index">03 / PROVIDER + MODEL</p><h2 id="providers-title">Provider + Model</h2></div>
+        <div class="section-actions">
+          <label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label>
+          <label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label>
+          <button id="save-routing" class="secondary" type="button">保存路由</button>
+          <div class="sync-control"><button id="sync" class="secondary" type="button">从 CPA 手动同步</button><small>最近同步：<time id="syncat">n/a</time></small></div>
+        </div>
       </div>
-      <p class="field-help">每个 Stage 只展示已批准的模型；每条备注对应一个 Provider + API Key。测试只触达启用且当前可调用的模型 Key，并在完成后刷新对应行指标。</p>
-      <div class="table-wrap"><table id="model-view"></table></div>
-      <output id="stage-test-result" class="notice" aria-live="polite"></output>
+      <output id="syncresult" class="notice" aria-live="polite"></output>
+      <p class="field-help">域名合并为分组；每个 API Key 是父级，下面展开该 Key 当前可路由的 Model、Stage、质量、用量和最近测试。</p>
+      <div class="table-wrap"><table id="providers"></table></div>
+      <output id="provider-model-result" class="notice" aria-live="polite"></output>
     </section>
 
     <section aria-labelledby="pricing-title" id="pricing-section">
       <div class="section-heading">
-        <div><p class="index">06 / PROVIDER + MODEL PRICING</p><h2 id="pricing-title">Provider + Model 定价</h2></div>
+        <div><p class="index">04 / PROVIDER + MODEL PRICING</p><h2 id="pricing-title">Provider + Model 定价</h2></div>
         <div class="section-actions"></div>
       </div>
       <div class="filters pricing-filters">
@@ -64,7 +61,7 @@
 
     <section aria-labelledby="calls-title">
       <div class="section-heading">
-        <div><p class="index">07 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
+        <div><p class="index">05 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
         <div class="filters">
           <label>时间窗<select id="callwindow"><option>1h</option><option selected>24h</option><option>7d</option><option>30d</option></select></label>
           <label>每页<select id="calllimit"><option>2</option><option>10</option><option selected>25</option></select></label>
@@ -76,12 +73,12 @@
       <button id="next" class="secondary" type="button">下一页</button>
     </section>
     <section aria-labelledby="analytics-title">
-      <div class="section-heading"><div><p class="index">08 / ANALYTICS</p><h2 id="analytics-title">Cohort analytics</h2></div></div>
+      <div class="section-heading"><div><p class="index">06 / ANALYTICS</p><h2 id="analytics-title">Cohort analytics</h2></div></div>
       <div class="table-wrap"><table id="analytics"></table></div>
     </section>
 
     <section aria-labelledby="route-audit-title">
-      <div class="section-heading"><div><p class="index">09 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
+      <div class="section-heading"><div><p class="index">07 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
       <output id="telemetry-health" class="notice" aria-live="polite"></output>
       <div class="table-wrap"><table id="routes"></table></div>
       <pre id="route-detail" class="notice"></pre>

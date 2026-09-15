@@ -31,7 +31,7 @@ PRICING_MIGRATION_VERSION = 4
 ACCOUNTING_WINDOWS = {"1h": "-1 hour", "24h": "-24 hours", "7d": "-7 days", "30d": "-30 days"}
 API_KEY_RESOURCE_FIELDS = frozenset({
     "fingerprint", "normalized_hostname", "status", "note", "api_key_mask",
-    "max_parallel", "window", "total_tokens", "fee_buckets", "edit",
+    "max_parallel", "window", "total_tokens", "fee_buckets", "edit", "models",
 })
 STAGE_RESOURCE_FIELDS = frozenset({
     "stage", "fingerprint", "note", "model", "family", "provider_type",
@@ -2502,6 +2502,15 @@ class Store:
                  FROM source_provider s JOIN policy p USING(fingerprint)
                  ORDER BY s.id"""
         ).fetchall()
+        model_resources = {}
+        for item in self.stage_resources(window):
+            model_resources.setdefault(item["fingerprint"], []).append({
+                "model": item["model"], "stage": item["stage"], "family": item["family"],
+                "callable": item["callable"], "latest_test": item["latest_test"],
+                "technical_success_rate": item["technical_success_rate"],
+                "avg_first_token_latency_ms": item["avg_first_token_latency_ms"],
+                "total_tokens": item["total_tokens"], "fee_buckets": item["fee_buckets"],
+            })
         resources = []
         for row in rows:
             hostname = normalize_hostname(row["base_url"]) or "UNKNOWN"
@@ -2524,12 +2533,40 @@ class Store:
                 "window": window,
                 "total_tokens": accounting["total_tokens"],
                 "fee_buckets": accounting["fee_buckets"],
+                "models": model_resources.get(row["fingerprint"], []),
                 "edit": {
                     "fingerprint": row["fingerprint"],
                     "href": f"/admin/v1/keys/{row['fingerprint']}",
                 },
             })
         return resources
+
+    def key_test_provider(self, fingerprint: str) -> tuple[Provider | None, str | None]:
+        """Choose the cheapest callable active model for one API Key."""
+        catalog = self.canonical_models()
+        candidates = []
+        for stage in ("standard", "smart", "expert"):
+            for model in self.stage_models(stage):
+                rows = [row for row in self._stage_key_rows(stage, model, callable_only=True)
+                        if row["fingerprint"] == fingerprint]
+                if not rows or model not in catalog:
+                    continue
+                candidates.append((stage, model, rows[0]))
+        if not candidates:
+            return None, "API Key is disabled, unavailable, or has no callable model"
+        priced = []
+        for stage, model, row in candidates:
+            pricing = self.effective_key_pricing(fingerprint, model)
+            if pricing.get("priced") and pricing.get("currency") == "CNY":
+                priced.append((float(pricing["output_price_cny"]), stage, model, row))
+        if priced:
+            _, stage, model, row = min(
+                priced,
+                key=lambda item: (item[0], ("standard", "smart", "expert").index(item[1]), item[2]),
+            )
+        else:
+            stage, model, row = candidates[0]
+        return self._provider_from_row(row, model, catalog), stage
 
     @staticmethod
     def _merge_accounting(reports: list[dict], *, window: str) -> dict:

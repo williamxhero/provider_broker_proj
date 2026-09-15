@@ -295,10 +295,9 @@ async def test_cost_rollups_are_exposed_for_keys_and_quality_window(client, cpa)
     assert inventory[0]['total_tokens'] == 150
     assert seven_day_inventory[0]['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert seven_day_inventory[0]['total_tokens'] == 300
-    stages = [item for item in (await (await client.get('/admin/v1/stages?window=7d')).json())['items'] if item['model'] == 'gpt-5.6-luna']
-    assert len(stages) == 1
-    assert stages[0]['technical_success_rate'] == .5 and stages[0]['avg_first_token_latency_ms'] == 200
-    assert stages[0]['fee_buckets']['UNKNOWN']['total_fee'] == .625
+    model = next(item for item in seven_day_inventory[0]['models'] if item['model'] == 'gpt-5.6-luna')
+    assert model['technical_success_rate'] == .5 and model['avg_first_token_latency_ms'] == 200
+    assert model['fee_buckets']['UNKNOWN']['total_fee'] == .625
     assert quality['total_cost'] == .125
     assert (await client.get('/admin/v1/calls?sort=cost:asc')).status == 200
     assert (await client.get('/admin/v1/calls?sort=unknown:asc')).status == 400
@@ -555,11 +554,13 @@ async def test_web_console_is_direct_and_management_api_needs_no_session(client)
     assert js.status == 200 and js.content_type in ('application/javascript','text/javascript')
     script=await js.text()
     assert '最近测试' in script
-    for token in ('renderQuality','renderCalls','renderModelView','sortItems','/admin/v1/sync','/admin/v1/routing','callsUrl','formatShanghaiTime','可路由 API','技术成功率','平均 TTFT','n/a'):
+    for token in ('renderQuality','renderCalls','renderProviders','sortItems','/admin/v1/sync','/admin/v1/routing','/admin/v1/keys/','callsUrl','formatShanghaiTime','可路由 API','技术成功率','平均 TTFT','n/a'):
         assert token in script
     assert (await client.get('/admin/v1/summary')).status == 200
     assert (await client.get('/admin/v1/providers')).status == 200
     assert (await client.get('/admin/v1/routing')).status == 200
+    assert (await client.get('/admin/v1/stages')).status == 404
+    assert (await client.post('/admin/v1/stages/test', json={'stage': 'standard'})).status == 404
     assert (await client.get('/login')).status == 404
 
 
@@ -761,8 +762,9 @@ async def test_summary_and_provider_stats_use_mixed_observations(client, cpa):
             db.execute("INSERT INTO observation(fingerprint,requested_model,actual_model,tier,effort,success,latency_ms,error,status) VALUES(?,?,?,?,?,?,?,?,?)",(provider['fingerprint'],'gpt-5.6-luna','gpt-5.6-luna','standard','low',success,ttft,status,status))
     summary=await client.get('/admin/v1/summary?window=24h',headers=headers); data=await summary.json()
     assert data['routable_apis']==1 and data['technical_success_rate']==.5 and data['avg_ttft_ms']==200
-    rows=[item for item in (await (await client.get('/admin/v1/stages?window=24h',headers=headers)).json())['items'] if item['model']=='gpt-5.6-luna']
-    assert len(rows)==1 and rows[0]['technical_success_rate']==.5 and rows[0]['avg_first_token_latency_ms']==200
+    rows=(await (await client.get('/admin/v1/providers?window=24h',headers=headers)).json())['providers'][0]['models']
+    row=next(item for item in rows if item['model']=='gpt-5.6-luna')
+    assert row['technical_success_rate']==.5 and row['avg_first_token_latency_ms']==200
 
 
 async def test_summary_counts_only_actual_routable_provider_keys(client, cpa):

@@ -264,6 +264,25 @@ async def keys(request):
     return web.json_response({"items": request.app["store"].api_key_resources(window), "window": window})
 
 
+async def key_test(request):
+    fingerprint = request.match_info["fingerprint"]
+    store = request.app["store"]
+    provider, stage = store.key_test_provider(fingerprint)
+    if provider is None:
+        return web.json_response({"error": stage}, status=409)
+    results = await run_probe(
+        store, tier=stage, mode="all", targets=[provider],
+        timeout_ms=request.app["settings"].probe_timeout_ms,
+        concurrency=1, clock=request.app["clock"],
+    )
+    result = results[0] if results else {"state": "failed"}
+    return web.json_response({
+        "fingerprint": fingerprint, "model": provider.models[0], "stage": stage,
+        "state": result.get("state"), "status": result.get("state"), "tested_count": len(results),
+        "succeeded_count": sum(item.get("state") == "succeeded" for item in results),
+    })
+
+
 async def stages(request):
     window = request.query.get("window", "24h")
     if window not in ("1h", "24h", "7d", "30d"):
@@ -1026,7 +1045,7 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/admin/v1/inventory", inventory), web.get("/admin/v1/providers", providers),
         web.get("/admin/v1/keys", keys), web.get("/admin/v1/keys/{fingerprint}", key_resource), web.patch("/admin/v1/keys/{fingerprint}", key_resource),
         web.put("/admin/v1/policy/{fingerprint}", update_policy), web.patch("/admin/v1/policy/{fingerprint}", update_policy),
-        web.get("/admin/v1/stages", stages), web.post("/admin/v1/stages/test", stage_test), web.get("/admin/v1/summary", summary),
+        web.post("/admin/v1/keys/{fingerprint}/test", key_test), web.get("/admin/v1/summary", summary),
         web.get("/admin/v1/models", models_api), web.post("/admin/v1/models", models_api),
         web.put("/admin/v1/models/{model_id}", models_api), web.patch("/admin/v1/models/{model_id}", models_api),
         web.delete("/admin/v1/models/{model_id}", models_api),

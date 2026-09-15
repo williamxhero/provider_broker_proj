@@ -82,22 +82,19 @@ def cpa_cell(cpa_url: str, cpa_key: str, model: str, contract: str) -> dict:
 
 
 def broker_cell(broker_url: str, model: str, contract: str, *, runs: int = 1) -> dict:
-    # Key resources deliberately omit model inventory and fingerprints.  The
-    # Stage resource is the release-facing capability summary, and its test
-    # endpoint performs the enabled Key/Model selection server-side.
-    stage = TIERS.get(model, "smart")
-    status, stage_inventory = request(broker_url.rstrip("/") + "/admin/v1/stages?window=24h")
-    stages = (stage_inventory or {}).get("items") if status == 200 else None
-    target = next((item for item in stages or []
-                   if isinstance(item, dict) and item.get("stage") == stage and item.get("model") == model
-                   and item.get("callable") is True), None)
+    # The Provider + Model contract keeps Model capabilities under each Key;
+    # the Key test endpoint chooses the cheapest callable model for that Key.
+    status, key_inventory = request(broker_url.rstrip("/") + "/admin/v1/providers?window=24h")
+    providers = (key_inventory or {}).get("providers") if status == 200 else None
+    target = next((item for item in providers or []
+                   if isinstance(item, dict) and any(model_item.get("model") == model and model_item.get("callable") is True
+                                                     for model_item in item.get("models", []))), None)
     if not target:
         return {"path": "broker_direct", "contract": contract, "model": model, "state": "failed", "reason": "no_enabled_target", "runs": 0, "passed_runs": 0}
-    payload = {"stage": stage}
     started = time.monotonic()
     items = []
     for _ in range(runs):
-        status, data = request(broker_url.rstrip("/") + "/admin/v1/stages/test", payload=payload)
+        status, data = request(broker_url.rstrip("/") + f"/admin/v1/keys/{target['fingerprint']}/test", payload={})
         tested = (data or {}).get("tested_count", 0) if status == 200 else 0
         succeeded = (data or {}).get("succeeded_count", 0) if status == 200 else 0
         items.append((status, tested, succeeded))

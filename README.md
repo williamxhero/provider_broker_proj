@@ -67,23 +67,14 @@ curl -N -X POST http://yosef-server:8817/v1/generate/stream \
 
 ### 管理接口
 
-管理台 Stage 视图使用 Broker 自有的固定 `Stage ↔ Model` 映射：`standard → gpt-5.6-luna、deepseek-v4-flash-0731`；`smart → gpt-5.6-terra、claude-sonnet-5、glm-5.3-flash、deepseek-v4.1-flash、qwen3.8-flash-next、doubao-seed-2.1-turbo、doubao-seed-2.1-pro`；`expert → gpt-5.6-sol、gpt-5.5、claude-opus-5、claude-opus-4-8、glm-5.3`。CPA 只提供 endpoint、API key 和传输信息；CPA 的 `models` 及 `/models` 返回值不决定 Broker 路由。每个 Stage 下按备注对应的 Provider + API Key 展开独立行，域名只在 API Key 视图合并展示；未被 Broker 映射的模型不进入 Stage 或 Provider + Model 定价列表。
-
-查看某个 Stage 的最新健康证据：
+管理台按 `Quality → Model List → Provider + Model → Pricing → Audit` 展示 Broker 运行面。`Provider + Model` 接口 `/admin/v1/providers?window=24h` 返回按域名组织的 API Key 父级及其 Model 子级；Stage 仍是 Model 的路由属性，但不再提供独立 Stage 管理接口。可对单个 Key 执行一次测试：
 
 ```bash
-curl 'http://yosef-server:8817/admin/v1/health?stage=standard'
+curl -X POST http://yosef-server:8817/admin/v1/keys/{fingerprint}/test \
+  -H 'Content-Type: application/json' -d '{}'
 ```
 
-手动进行一次与生产价格组选择相同的竞速探针：
-
-```bash
-curl -X POST http://yosef-server:8817/admin/v1/probes \
-  -H 'Content-Type: application/json' \
-  -d '{"stage":"standard","mode":"race"}'
-```
-
-`mode: "all"` 会逐个检查指定 Stage 的所有可探测 Provider/model；两个模式都可附加 `fingerprint`、`model`、`timeout_ms` 和 `concurrency` 以缩小范围或控制执行上限。管理台的 Stage 视角提供相同的竞速探针、全量探针和最新结果表，并保存选定 Stage 与表格排序。
+该测试只执行一个 Key/Model pair，并按有效 CNY 价格选择模型；未定价时按 Model List 顺序回退。`mode: "all"` 等内部探针参数仅供健康调度使用，不作为管理台 HTTP 契约暴露。
 
 可用环境变量：`BROKER_HEALTH_STALE_SECONDS`（默认 1800）、`BROKER_PROBE_TIMEOUT_MS`（默认 15000）、`BROKER_PROBE_CONCURRENCY`（默认 2）、`BROKER_HEALTH_SCHEDULER_SECONDS`（默认 60）、`BROKER_FIRST_EVENT_TIMEOUT_MS`（默认 30000）、`BROKER_STREAM_IDLE_TIMEOUT_MS`（默认 90000）、`BROKER_ATTEMPT_TIMEOUT_MS`（默认 180000）、`BROKER_RESPONSE_RESERVE_MS`（默认 5000）和 `BROKER_ROUTE_ATTEMPT_BUDGET`（默认 32）。首事件窗口按 effort 调整：low 或未指定为 1 倍、medium 为 2 倍、high 为 3 倍；reasoning 事件只表示活性，不会拼入输出。路由预算会同时扣除响应预留和有界取消窗口，二者不会叠加到客户端 deadline 之后；journal 会记录不含 prompt 或密钥的 route start、complete、timeout/cancel 事件。deadline 已耗尽时，超时 attempts 随 504 响应并写入 journal，但不会再同步等待 SQLite 审计，以免数据库争用突破客户端时限。
 

@@ -50,8 +50,6 @@ def test_analytics_and_routes_share_the_main_container_at_desktop_and_narrow_wid
                 return {"routable_apis": 0, "last_successful_sync": None}
             if path.startswith("/admin/v1/providers"):
                 return {"providers": []}
-            if path.startswith("/admin/v1/stages"):
-                return {"items": [], "window": "24h"}
             if path.startswith("/admin/v1/models"):
                 return {"items": []}
             if path.startswith("/admin/v1/routing"):

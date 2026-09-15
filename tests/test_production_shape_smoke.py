@@ -10,15 +10,15 @@ def test_sized_prompt_matches_real_character_and_utf8_shape_without_original_tex
     assert "Return exactly one JSON object" in prompt
 
 
-def test_structured_canary_uses_stage_contract_for_three_successful_runs(monkeypatch):
+def test_structured_canary_uses_key_contract_for_three_successful_runs(monkeypatch):
     calls = []
 
     def fake_request(url, *, payload=None, headers=None, timeout=70):
-        if url.endswith("/stages?window=24h"):
-            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable": True}]}
-        assert url.endswith("/stages/test")
+        if url.endswith("/providers?window=24h"):
+            return 200, {"providers": [{"fingerprint": "fp-a", "models": [{"model": "gpt-5.6-luna", "callable": True}]}]}
+        assert url.endswith("/keys/fp-a/test")
         calls.append(payload)
-        return 200, {"stage": "standard", "tested_count": 1, "succeeded_count": 1}
+        return 200, {"model": "gpt-5.6-luna", "state": "succeeded", "tested_count": 1, "succeeded_count": 1}
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)
     result = broker_cell("http://broker", "gpt-5.6-luna", "structured", runs=3)
@@ -26,13 +26,13 @@ def test_structured_canary_uses_stage_contract_for_three_successful_runs(monkeyp
     assert result["state"] == "succeeded"
     assert result["runs"] == result["passed_runs"] == 3
     assert len(calls) == 3
-    assert calls == [{"stage": "standard"}] * 3
+    assert calls == [{}] * 3
 
 
 def test_structured_canary_fails_when_no_enabled_target_exists(monkeypatch):
     def fake_request(url, *, payload=None, headers=None, timeout=70):
-        if url.endswith("/stages?window=24h"):
-            return 200, {"items": [{"stage": "standard", "model": "gpt-5.6-luna", "callable": False}]}
+        if url.endswith("/providers?window=24h"):
+            return 200, {"providers": [{"fingerprint": "fp-a", "models": [{"model": "gpt-5.6-luna", "callable": False}]}]}
         raise AssertionError("probe must not run without a target")
 
     monkeypatch.setattr("scripts.transport_matrix.request", fake_request)

@@ -5,7 +5,7 @@ import pytest
 from aiohttp.test_utils import TestClient, TestServer
 
 from provider_broker.app import create_app
-from provider_broker.db import API_KEY_RESOURCE_FIELDS, STAGE_RESOURCE_FIELDS, Store
+from provider_broker.db import API_KEY_RESOURCE_FIELDS, Store
 from provider_broker.settings import Settings
 
 
@@ -35,7 +35,7 @@ def seed_inventory(store: Store) -> list[str]:
     return [row["fingerprint"] for row in rows]
 
 
-async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client):
+async def test_provider_model_contract_is_allowlisted_and_windowed(admin_client):
     store = admin_client.app["store"]
     first, second = seed_inventory(store)
     store.observe(fingerprint=first, requested_model="gpt-5.6-luna", actual_model="gpt-5.6-luna",
@@ -56,70 +56,66 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
     assert {item["normalized_hostname"] for item in keys} == {"api.example.com"}
     assert {item["api_key_mask"] for item in keys} == {"sec***pha", "sec***eta"}
     assert {item["status"] for item in keys} == {"enabled", "disabled"}
-    assert all("secret-" not in str(item) and "base_url" not in item and "models" not in item for item in keys)
+    assert all("secret-" not in str(item) and "base_url" not in item for item in keys)
     assert all(item["window"] == "1h" for item in keys)
-
-    stages_response = await admin_client.get("/admin/v1/stages?window=24h")
-    assert stages_response.status == 200
-    stages = (await stages_response.json())["items"]
-    assert len(stages) == 2
-    assert all(set(item) == STAGE_RESOURCE_FIELDS for item in stages)
-    assert {item["model"] for item in stages} == {"gpt-5.6-luna"}
-    assert {item["fingerprint"] for item in stages} == {first, second}
-    assert {item["provider_type"] for item in stages} == {"openai"}
-    assert {item["status"] for item in stages} == {"enabled", "disabled"}
-    assert sum(item["total_tokens"] for item in stages) == 40
-    standard = [item for item in stages if item["model"] == "gpt-5.6-luna"]
-    assert standard[0]["fee_buckets"]["USD"]["total_fee"] == .25
-    assert standard[1]["fee_buckets"]["CNY"]["total_fee"] == 2
+    assert all(set(model) == {
+        "model", "stage", "family", "callable", "latest_test",
+        "technical_success_rate", "avg_first_token_latency_ms", "total_tokens", "fee_buckets",
+    } for item in keys for model in item["models"])
+    by_key = {item["fingerprint"]: item for item in keys}
+    assert by_key[first]["models"][0]["model"] == "gpt-5.6-luna"
+    assert by_key[first]["models"][0]["total_tokens"] == 15
+    assert by_key[second]["models"][0]["total_tokens"] == 25
+    assert by_key[first]["models"][0]["technical_success_rate"] == 1
+    assert by_key[second]["models"][0]["technical_success_rate"] == 0
+    assert by_key[first]["models"][0]["fee_buckets"]["USD"]["total_fee"] == .25
+    assert by_key[second]["models"][0]["fee_buckets"]["CNY"]["total_fee"] == 2
 
     models_response = await admin_client.get("/admin/v1/models")
     assert models_response.status == 200
     assert {item["id"] for item in (await models_response.json())["items"]}
 
-    assert (await admin_client.get("/admin/v1/stages?window=2h")).status == 400
+    assert (await admin_client.get("/admin/v1/stages?window=24h")).status == 404
     assert (await admin_client.patch(f"/admin/v1/keys/{first}", json={"multiplier": 2})).status == 400
     updated = await admin_client.patch(f"/admin/v1/keys/{first}", json={"note": "safe note", "max_parallel": 4})
     assert updated.status == 200
     assert (await updated.json())["note"] == "safe note"
 
 
-async def test_stage_test_targets_enabled_pairs_and_returns_refresh_evidence(admin_client):
+async def test_key_test_targets_one_enabled_pair_and_returns_refresh_evidence(admin_client):
     store = admin_client.app["store"]
     first, second = seed_inventory(store)
     assert store.update_policy(second, {"enabled": False})
     with patch("provider_broker.app.run_probe", new=AsyncMock(return_value=[
         {"fingerprint": first, "model": "gpt-5.6-luna", "state": "succeeded"},
     ])) as run_probe:
-        response = await admin_client.post("/admin/v1/stages/test", json={"stage": "standard"})
+        response = await admin_client.post(f"/admin/v1/keys/{first}/test", json={})
     assert response.status == 200
     assert await response.json() == {
-        "stage": "standard", "tested_count": 1, "succeeded_count": 1,
+        "fingerprint": first, "model": "gpt-5.6-luna", "stage": "standard",
+        "state": "succeeded", "status": "succeeded", "tested_count": 1, "succeeded_count": 1,
     }
     targets = run_probe.await_args.kwargs["targets"]
     assert [target.fingerprint for target in targets] == [first]
 
 
-async def test_stage_test_without_model_covers_the_whole_stage(admin_client):
+async def test_key_test_rejects_disabled_or_modelless_key(admin_client):
     store = admin_client.app["store"]
     first, second = seed_inventory(store)
-    with patch("provider_broker.app.run_probe", new=AsyncMock(return_value=[])) as run_probe:
-        response = await admin_client.post("/admin/v1/stages/test", json={"stage": "standard"})
-    assert response.status == 200
-    assert (await response.json()) == {
-        "stage": "standard", "tested_count": 0, "succeeded_count": 0,
-    }
-    targets = run_probe.await_args.kwargs["targets"]
-    assert {(target.fingerprint, target.models[0]) for target in targets} == {
-        (first, "gpt-5.6-luna"), (second, "gpt-5.6-luna"),
-    }
+    assert store.update_policy(first, {"enabled": False})
+    response = await admin_client.post(f"/admin/v1/keys/{first}/test", json={})
+    assert response.status == 409
+    assert "disabled" in (await response.json())["error"]
+    assert store.update_policy(first, {"enabled": True, "tiers": []})
+    response = await admin_client.post(f"/admin/v1/keys/{first}/test", json={})
+    assert response.status == 409
+    assert "no callable model" in (await response.json())["error"]
+    assert (await admin_client.post(f"/admin/v1/keys/{second}/test", json={})).status == 200
 
 
-async def test_stage_test_rejects_the_removed_model_selector(admin_client):
-    response = await admin_client.post("/admin/v1/stages/test", json={
-        "stage": "standard", "model": "gpt-5.6-luna",
-    })
-    assert response.status == 400
+async def test_stage_management_routes_are_removed(admin_client):
+    assert (await admin_client.get("/admin/v1/stages")).status == 404
+    assert (await admin_client.post("/admin/v1/stages/test", json={"stage": "standard"})).status == 404
 
 
 async def test_model_list_replaces_removed_model_directory_and_legacy_probe_routes_are_not_management_contracts(admin_client):

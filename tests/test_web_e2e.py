@@ -42,8 +42,8 @@ class LiveBroker:
         self.thread.join(10)
 
 
-def test_console_uses_strict_key_and_stage_contract(tmp_path):
-    """The visible console exposes Key-safe fields and Stage-level test controls."""
+def test_console_uses_provider_model_parent_child_contract(tmp_path):
+    """The visible console exposes nested Key and Model rows."""
     with LiveBroker(tmp_path / "strict-console.sqlite3") as broker, sync_playwright() as playwright:
         browser = playwright.chromium.launch()
         page = browser.new_page()
@@ -57,22 +57,21 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
                         "fingerprint": "fp-a", "normalized_hostname": "alpha.invalid", "status": "enabled",
                         "note": "safe note", "api_key_mask": "abc***xyz", "max_parallel": 3,
                         "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
+                        "models": [{"model": "gpt-5.6-luna", "stage": "standard", "family": "OpenAI GPT-5.6",
+                                    "callable": True, "latest_test": None, "technical_success_rate": 1,
+                                    "avg_first_token_latency_ms": 120, "total_tokens": 12,
+                                    "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}}}],
                     },
                     {
                         "fingerprint": "fp-b", "normalized_hostname": "alpha.invalid", "status": "disabled",
                         "note": "backup key", "api_key_mask": "def***uvw", "max_parallel": 2,
                         "total_tokens": 8, "fee_buckets": {"UNKNOWN": {"total_fee": 0.01}},
+                        "models": [{"model": "gpt-5.6-terra", "stage": "smart", "family": "OpenAI GPT-5.6",
+                                    "callable": False, "latest_test": None, "technical_success_rate": None,
+                                    "avg_first_token_latency_ms": None, "total_tokens": 8,
+                                    "fee_buckets": {"UNKNOWN": {"total_fee": 0.01}}}],
                     },
                 ]}
-            if path.startswith("/admin/v1/stages"):
-                return {"items": [{
-                    "stage": "standard", "fingerprint": "fp-a", "note": "safe note",
-                    "model": "gpt-5.6-luna", "family": "OpenAI GPT-5.6", "provider_type": "openai",
-                    "normalized_hostname": "alpha.invalid", "api_key_mask": "abc***xyz",
-                    "status": "enabled", "max_parallel": 3, "callable": True, "latest_test": None,
-                    "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
-                    "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
-                    }], "window": "24h"}
             if path.startswith("/admin/v1/models"):
                 return {"items": [{"id": "gpt-5.6-luna", "stage": "standard", "family": "OpenAI GPT-5.6", "active": True}]}
             if path.startswith("/admin/v1/routing"):
@@ -98,18 +97,24 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
         page.locator("#providers tbody tr").first.wait_for()
 
         provider_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#providers thead th").all_inner_texts()]
-        assert provider_headers == ["域名", "状态", "备注", "API Key", "单 Key 并发上限", "24h Token", "24h 费用", "操作"]
+        assert provider_headers == ["域名", "状态", "备注", "API Key", "单 Key 并发上限", "24h Token", "24h 费用", "Model", "Stage", "可调用", "最近测试", "技术成功率", "平均首字延迟", "24h Model Token", "24h Model 费用", "操作"]
         assert page.locator("#providers").get_by_role("button", name="一键测试").count() == 0
         assert page.locator("#providers").get_by_text("safe note", exact=True).count() == 1
-        assert page.locator("#providers tbody tr").count() == 2
-        assert page.locator("#providers tbody td[rowspan='2']").count() == 1
+        assert page.locator("#providers tbody tr").count() == 4
+        assert page.locator("#providers tbody td[rowspan='4']").count() == 1
         assert page.locator("#providers").get_by_text("abc***xyz", exact=True).count() == 1
         assert page.locator("#providers").get_by_text("def***uvw", exact=True).count() == 1
-        model_headers = [text.replace("↑", "").replace("↓", "").strip() for text in page.locator("#model-view thead th").all_inner_texts()]
-        assert model_headers == ["Stage", "备注", "模型", "Provider", "API Key", "状态", "单 Key 并发上限", "可调用", "最近测试", "技术成功率", "平均首字延迟", "24h Token", "24h 费用", "操作"]
-        assert page.locator("#model-view tbody tr").get_by_role("button", name="测试 Stage").count() == 1
-        assert page.locator("#model-view").get_by_text("gpt-5.6-luna", exact=True).count() == 1
-        assert page.locator("#model-view").get_by_text("safe note", exact=True).count() == 1
+        assert page.locator("#model-view").count() == 0
+        assert page.locator("#providers").get_by_role("button", name="测试此 API Key").count() == 2
+        assert page.locator("#providers").get_by_text("gpt-5.6-luna", exact=True).count() == 1
+        assert page.locator("#providers").get_by_text("safe note", exact=True).count() == 1
+        assert page.locator("#providers tr[data-key='fp-a']").get_attribute("class") == "key-parent"
+        assert page.locator("#providers tr[data-parent-key='fp-a']").is_visible()
+        assert page.locator("#providers tr[data-key='fp-a'] button[aria-expanded='true']").count() == 1
+        page.locator("#providers tr[data-key='fp-a'] button[aria-expanded='true']").click()
+        assert page.locator("#providers tr[data-parent-key='fp-a']").is_hidden()
+        assert page.locator("#providers tr[data-key='fp-a'] button[aria-expanded='false']").count() == 1
+        assert page.locator("#models-section").evaluate("node => node.compareDocumentPosition(document.querySelector('[aria-labelledby=providers-title]')) & Node.DOCUMENT_POSITION_FOLLOWING")
         assert page.locator("#probe-stage, #probe-race, #probe-all, #probe-results").count() == 0
         assert page.locator("#model-directory").count() == 0
         assert page.locator("#models-section").count() == 1
