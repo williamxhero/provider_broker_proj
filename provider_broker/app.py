@@ -271,6 +271,62 @@ async def stages(request):
     return web.json_response({"items": request.app["store"].stage_resources(window), "window": window})
 
 
+def _model_payload(item):
+    return {
+        "id": item["id"], "stage": item["stage"], "family": item["family"],
+        "active": bool(item["active"]),
+    }
+
+
+async def models_api(request):
+    store = request.app["store"]
+    if request.method == "GET":
+        active = None if request.query.get("include_inactive") == "true" else True
+        items = [item for item in store.canonical_models(active=active).values()]
+        return web.json_response({"items": [_model_payload(item) for item in items]})
+
+    if request.method == "POST":
+        body = await request.json()
+        if (not isinstance(body, dict) or set(body) != {"id", "stage", "family"}
+                or not isinstance(body["id"], str) or not re.fullmatch(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}", body["id"])
+                or not isinstance(body["family"], str) or not body["family"].strip()
+                or body["stage"] not in ("standard", "smart", "expert")):
+            return web.json_response({"error": "invalid model"}, status=400)
+        try:
+            created = store.create_canonical_model(canonicalize(body["id"]), stage=body["stage"], family=body["family"].strip())
+        except ValueError as exc:
+            return web.json_response({"error": str(exc)}, status=400)
+        if not created:
+            return web.json_response({"error": "model already exists"}, status=409)
+        return web.json_response(_model_payload(store.canonical_models()[canonicalize(body["id"])]), status=201)
+
+    model_id = canonicalize(request.match_info["model_id"])
+    current = store.canonical_models(active=None).get(model_id)
+    if current is None:
+        return web.json_response({"error": "model not found"}, status=404)
+    if request.method == "DELETE":
+        if not store.deactivate_canonical_model(model_id):
+            return web.json_response({"error": "model not found"}, status=404)
+        return web.Response(status=204)
+    body = await request.json()
+    if (not isinstance(body, dict) or not body or not set(body) <= {"stage", "family", "active"}
+            or body.get("stage", current["stage"]) not in ("standard", "smart", "expert")
+            or not isinstance(body.get("family", current["family"]), str)
+            or not body.get("family", current["family"]).strip()
+            or ("active" in body and type(body["active"]) is not bool)):
+        return web.json_response({"error": "invalid model"}, status=400)
+    try:
+        updated = store.update_canonical_model(
+            model_id, stage=body.get("stage", current["stage"]),
+            family=body.get("family", current["family"]).strip(), active=body.get("active"),
+        )
+    except ValueError as exc:
+        return web.json_response({"error": str(exc)}, status=400)
+    if not updated:
+        return web.json_response({"error": "model not found"}, status=404)
+    return web.json_response(_model_payload(store.canonical_models(active=None)[model_id]))
+
+
 async def stage_test(request):
     body = await request.json()
     if (not isinstance(body, dict) or set(body) != {"stage"} or
@@ -971,6 +1027,9 @@ def create_app(settings: Settings, *, clock=None):
         web.get("/admin/v1/keys", keys), web.get("/admin/v1/keys/{fingerprint}", key_resource), web.patch("/admin/v1/keys/{fingerprint}", key_resource),
         web.put("/admin/v1/policy/{fingerprint}", update_policy), web.patch("/admin/v1/policy/{fingerprint}", update_policy),
         web.get("/admin/v1/stages", stages), web.post("/admin/v1/stages/test", stage_test), web.get("/admin/v1/summary", summary),
+        web.get("/admin/v1/models", models_api), web.post("/admin/v1/models", models_api),
+        web.put("/admin/v1/models/{model_id}", models_api), web.patch("/admin/v1/models/{model_id}", models_api),
+        web.delete("/admin/v1/models/{model_id}", models_api),
         web.get("/admin/v1/quality", quality), web.get("/admin/v1/accounting", accounting), web.get("/admin/v1/analytics", analytics), web.get("/admin/v1/analytics/export", analytics_export), web.get("/admin/v1/configuration-events", configuration_events), web.post("/admin/v1/client-telemetry", client_telemetry), web.get("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.post("/admin/v1/telemetry-maintenance", telemetry_maintenance), web.get("/admin/v1/alerts", alerts), web.post("/admin/v1/alerts/evaluate", alerts), web.get("/admin/v1/data-health", data_health), web.get("/admin/v1/routes", routes), web.get("/admin/v1/routes/{route_id}", route_detail), web.get("/admin/v1/routes/{route_id}/{resource:candidates|attempts}", route_audit_resource), web.get("/admin/v1/calls", calls), web.get("/admin/v1/routing", routing), web.patch("/admin/v1/routing", routing),
         web.get("/admin/v1/pricing/providers", pricing_provider_api), web.post("/admin/v1/pricing/providers", pricing_provider_api),
         web.put("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.patch("/admin/v1/pricing/providers/{provider_id}", update_pricing_provider_api), web.delete("/admin/v1/pricing/providers/{provider_id}", deactivate_pricing_provider_api),

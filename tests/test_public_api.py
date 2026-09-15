@@ -626,7 +626,9 @@ async def test_catalog_rejects_incomplete_and_unknown_updates(client):
 
 async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(client):
     headers = {'Authorization': 'Bearer admin-secret'}
-    assert (await client.get('/admin/v1/models?stage=smart', headers=headers)).status == 404
+    models = await client.get('/admin/v1/models?stage=smart', headers=headers)
+    assert models.status == 200
+    assert all(set(item) == {'id', 'stage', 'family', 'active'} for item in (await models.json())['items'])
     client.app['store'].create_canonical_model('api-model', stage='smart', family='API Family')
 
     assert (await client.post('/admin/v1/pricing/providers', headers=headers, json={
@@ -652,7 +654,8 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     assert duplicate.status == 409
 
     listed = await client.get('/admin/v1/pricing?provider=api-openai&model=api-model&currency=CNY', headers=headers)
-    assert (await listed.json())['items'] == []
+    assert (await listed.json())['items'][0]['model'] == {'id': 'api-model'}
+    assert (await listed.json())['items'][0]['output_price_cny'] == 4.0
     approved_price = await client.post('/admin/v1/pricing', headers=headers, json={
         'provider_id': provider['id'], 'model_id': 'gpt-5.6-luna', 'output_price_cny': 4,
     })
@@ -684,8 +687,8 @@ async def test_pricing_api_exposes_only_provider_model_and_cny_output_price(clie
     assert (await client.delete(f"/admin/v1/pricing/{provider['id']}/gpt-5.6-luna", headers=headers)).status == 204
     inactive = await client.get('/admin/v1/pricing?provider=api-openai&include_inactive=true', headers=headers)
     inactive_items = (await inactive.json())['items']
-    assert {item['model']['id'] for item in inactive_items} == {'gpt-5.6-luna'}
-    assert inactive_items[0]['active'] is False
+    assert {item['model']['id'] for item in inactive_items} == {'api-model', 'gpt-5.6-luna'}
+    assert next(item for item in inactive_items if item['model']['id'] == 'gpt-5.6-luna')['active'] is False
 
 
 async def test_pricing_api_validates_removed_binding_api_and_exposes_inventory_without_legacy_writes(client, cpa):

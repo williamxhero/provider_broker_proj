@@ -30,9 +30,19 @@
       <div class="table-wrap"><table id="providers"></table></div>
     </section>
 
+    <section aria-labelledby="models-title" id="models-section">
+      <div class="section-heading">
+        <div><p class="index">03 / BROKER MODELS</p><h2 id="models-title">Model List</h2></div>
+        <div class="section-actions"><button id="add-model" class="primary" type="button">添加 Model</button></div>
+      </div>
+      <p class="field-help">Broker 只使用这里启用的模型。每个标签属于一个 Stage；CPA 的 /models 结果不会写入或覆盖此列表。</p>
+      <div id="model-list" class="stage-model-list"></div>
+      <output id="model-result" class="notice" aria-live="polite"></output>
+    </section>
+
     <section aria-labelledby="model-view-title">
       <div class="section-heading">
-        <div><p class="index">03 / STAGE</p><h2 id="model-view-title">Stage</h2></div>
+        <div><p class="index">04 / STAGE</p><h2 id="model-view-title">Stage</h2></div>
         <div class="section-actions"><label>同价竞速 Key 数<input id="race-parallel-cap" type="number" min="1" max="32" step="1" required></label><label>对冲延迟 (ms)<input id="hedge-delay-ms" type="number" min="0" max="10000" step="1" required></label><button id="save-routing" class="secondary" type="button">保存</button></div>
       </div>
       <p class="field-help">每个 Stage 只展示已批准的模型；每条备注对应一个 Provider + API Key。测试只触达启用且当前可调用的模型 Key，并在完成后刷新对应行指标。</p>
@@ -42,7 +52,7 @@
 
     <section aria-labelledby="pricing-title" id="pricing-section">
       <div class="section-heading">
-        <div><p class="index">05 / PROVIDER + MODEL PRICING</p><h2 id="pricing-title">Provider + Model 定价</h2></div>
+        <div><p class="index">06 / PROVIDER + MODEL PRICING</p><h2 id="pricing-title">Provider + Model 定价</h2></div>
         <div class="section-actions"></div>
       </div>
       <div class="filters pricing-filters">
@@ -54,7 +64,7 @@
 
     <section aria-labelledby="calls-title">
       <div class="section-heading">
-        <div><p class="index">06 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
+        <div><p class="index">07 / AUDIT</p><h2 id="calls-title">调用记录</h2></div>
         <div class="filters">
           <label>时间窗<select id="callwindow"><option>1h</option><option selected>24h</option><option>7d</option><option>30d</option></select></label>
           <label>每页<select id="calllimit"><option>2</option><option>10</option><option selected>25</option></select></label>
@@ -66,12 +76,12 @@
       <button id="next" class="secondary" type="button">下一页</button>
     </section>
     <section aria-labelledby="analytics-title">
-      <div class="section-heading"><div><p class="index">07 / ANALYTICS</p><h2 id="analytics-title">Cohort analytics</h2></div></div>
+      <div class="section-heading"><div><p class="index">08 / ANALYTICS</p><h2 id="analytics-title">Cohort analytics</h2></div></div>
       <div class="table-wrap"><table id="analytics"></table></div>
     </section>
 
     <section aria-labelledby="route-audit-title">
-      <div class="section-heading"><div><p class="index">08 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
+      <div class="section-heading"><div><p class="index">09 / ROUTES</p><h2 id="route-audit-title">Route audit</h2></div></div>
       <output id="telemetry-health" class="notice" aria-live="polite"></output>
       <div class="table-wrap"><table id="routes"></table></div>
       <pre id="route-detail" class="notice"></pre>
@@ -102,6 +112,16 @@
       <label>Model ID<input name="model_id" required></label>
       <label>输出价格 / 1M CNY<input name="output_price_cny" type="number" min="0" step="0.0001" required></label>
       <div class="editor-actions"><button id="cancel-pricing-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
+    </form>
+  </aside>
+
+  <aside id="model-editor" class="editor" aria-labelledby="model-editor-title" hidden>
+    <form id="model-form">
+      <div class="editor-heading"><div><p class="index">BROKER MODEL</p><h2 id="model-editor-title">编辑 Model</h2></div><button id="close-model-editor" type="button" aria-label="关闭">×</button></div>
+      <label>Model ID<input name="id" maxlength="128" pattern="[A-Za-z0-9][A-Za-z0-9._-]{0,127}" required></label>
+      <label>Stage<select name="stage"><option value="standard">Standard</option><option value="smart">Smart</option><option value="expert">Expert</option></select></label>
+      <label>Family<input name="family" maxlength="256" required></label>
+      <div class="editor-actions"><button id="cancel-model-editor" type="button" class="secondary">取消</button><button type="submit" class="primary">保存</button></div>
     </form>
   </aside>
 

@@ -46,6 +46,14 @@ tbody tr { transition: background .18s ease; } tbody tr:hover { background: #0f1
 .status.on::before { background: var(--accent); box-shadow: 0 0 0 .25rem #75e0bf19; }
 .model-tags { display: flex; flex-wrap: nowrap; align-items: center; gap: .25rem; height: 32px; min-width: 12rem; white-space: nowrap; }
 .model-tag { display: inline-flex; height: 20px; max-width: 14rem; overflow: hidden; text-overflow: ellipsis; padding: 1px .35rem; border: 1px solid var(--line); border-radius: 999px; color: var(--text); background: #141d20; font: .68rem/16px ui-monospace, SFMono-Regular, Consolas, monospace; }
+.stage-model-list { display: grid; gap: .2rem; padding: .2rem 0 .9rem; }
+.stage-model-row { display: grid; grid-template-columns: 7rem minmax(0, 1fr) auto; align-items: center; gap: 1rem; min-height: 3.2rem; border-bottom: 1px solid #182125; }
+.stage-model-row h3 { margin: 0; color: var(--muted); font-size: .78rem; font-weight: 600; text-transform: uppercase; letter-spacing: .08em; }
+.model-list-tags { min-width: 0; height: auto; min-height: 2rem; flex-wrap: wrap; white-space: normal; }
+.model-list-tag { max-width: 24rem; padding-right: .15rem; }
+.tag-action { border: 0; border-left: 1px solid var(--line); margin-left: .35rem; padding: 0 .3rem; color: var(--accent); background: transparent; font: .64rem/16px inherit; }
+.tag-action.remove { color: var(--critical); }
+.stage-add { white-space: nowrap; }
 .segmented { display: flex; border-bottom: 1px solid var(--line); }
 .segmented button { border: 0; background: transparent; color: var(--muted); padding: .65rem .85rem; }
 .text-button { border: 0; background: transparent; color: var(--accent); padding: 0; line-height: 32px; }
@@ -85,4 +93,5 @@ button:disabled { opacity: .38; cursor: not-allowed; transform: none; }
   .section-heading > p { text-align: left; }
   .filters { width: 100%; flex-wrap: wrap; }
 }
+@media (max-width: 620px) { .stage-model-row { grid-template-columns: 1fr; gap: .3rem; padding: .7rem 0; } .stage-add { justify-self: start; } }
 @media (prefers-reduced-motion: reduce) { *, *::before, *::after { animation: none !important; transition: none !important; } }

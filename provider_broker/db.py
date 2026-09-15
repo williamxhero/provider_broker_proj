@@ -431,6 +431,18 @@ class Store:
             "INSERT OR IGNORE INTO canonical_model(id,stage,family,active) VALUES(?,?,?,1)",
             [(model, item['intellect'], item['family']) for model, item in CATALOG.items()],
         )
+        # The bundled catalog is only a migration seed.  Broker-owned active
+        # models are the approved Stage list; later operator-created models
+        # are left untouched by this cleanup.
+        catalog_ids = tuple(CATALOG)
+        approved_ids = tuple(APPROVED_MODEL_IDS)
+        if catalog_ids:
+            placeholders = ",".join("?" for _ in catalog_ids)
+            approved_placeholders = ",".join("?" for _ in approved_ids)
+            self.conn.execute(
+                f"UPDATE canonical_model SET active=0 WHERE id IN ({placeholders}) AND id NOT IN ({approved_placeholders})",
+                [*catalog_ids, *approved_ids],
+            )
         self.conn.execute(
             "INSERT OR IGNORE INTO pricing_provider(provider_key,name,provider_type,multiplier,active) VALUES('official-seed','Fixed official seed','official',1.0,1)"
         )
@@ -527,6 +539,16 @@ class Store:
             }
             for row in rows
         }
+
+    def stage_models(self, stage: str) -> tuple[str, ...]:
+        """Return the active Broker-owned models currently assigned to a Stage."""
+        rows = self.conn.execute(
+            "SELECT id FROM canonical_model WHERE stage=? AND active=1", (stage,)
+        ).fetchall()
+        available = {row["id"] for row in rows}
+        approved = tuple(model for model in APPROVED_STAGE_MODELS.get(stage, ()) if model in available)
+        custom = tuple(sorted(available - set(approved)))
+        return approved + custom
 
     def create_canonical_model(self, model_id: str, *, stage: str, family: str) -> bool:
         if not model_id or stage not in {'standard', 'smart', 'expert'} or not family:
@@ -967,7 +989,7 @@ class Store:
         model_map = {
             row['id']: {'id': row['id'], 'stage': row['stage'], 'family': row['family'], 'active': bool(row['active'])}
             for row in model_rows
-            if row['id'] in APPROVED_MODEL_IDS
+            if include_inactive or bool(row['active'])
         }
         if model:
             model_id = canonicalize(model)
@@ -2647,7 +2669,7 @@ class Store:
         routing may still enumerate the wider canonical catalog separately.
         """
         catalog = self.canonical_models()
-        candidates = STAGE_MODELS.get(stage)
+        candidates = self.stage_models(stage)
         if not candidates:
             return []
         pairs = []
@@ -2713,7 +2735,7 @@ class Store:
         resources = []
         stage_order = ("standard", "smart", "expert")
         for stage in stage_order:
-            for model in STAGE_MODELS[stage]:
+            for model in self.stage_models(stage):
                 metadata = canonical_model_metadata.get(model)
                 if metadata is None:
                     continue

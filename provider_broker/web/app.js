@@ -270,6 +270,47 @@ function renderProviders(payload) {
   }));
 }
 
+function renderModels(payload = { items: state.models }) {
+  state.models = payload.items || [];
+  const container = byId("model-list");
+  container.replaceChildren();
+  ["standard", "smart", "expert"].forEach((stage) => {
+    const row = document.createElement("div");
+    row.className = "stage-model-row";
+    const heading = document.createElement("h3"); heading.textContent = stage[0].toUpperCase() + stage.slice(1);
+    const tags = document.createElement("div"); tags.className = "model-tags model-list-tags";
+    state.models.filter((item) => item.active && item.stage === stage).forEach((item) => {
+      const tag = document.createElement("span"); tag.className = "model-tag model-list-tag"; tag.title = item.family;
+      tag.append(document.createTextNode(item.id));
+      const edit = document.createElement("button"); edit.type = "button"; edit.className = "tag-action"; edit.textContent = "编辑";
+      edit.addEventListener("click", () => openModelEditor(item)); tag.append(edit); tags.append(tag);
+      const remove = document.createElement("button"); remove.type = "button"; remove.className = "tag-action remove"; remove.textContent = "删除";
+      remove.addEventListener("click", () => deactivateModel(item)); tag.append(remove);
+    });
+    const add = document.createElement("button"); add.type = "button"; add.className = "text-button stage-add"; add.textContent = "+ 添加";
+    add.addEventListener("click", () => openModelEditor({ stage, family: "Custom model" }));
+    row.append(heading, tags, add); container.append(row);
+  });
+}
+
+async function deactivateModel(item) {
+  if (!window.confirm(`停用 ${item.id}？`)) return;
+  try { await requestJson(`/admin/v1/models/${encodeURIComponent(item.id)}`, { method: "DELETE" }); await loadModels(); byId("model-result").textContent = `${item.id} 已停用`; }
+  catch (error) { byId("model-result").textContent = `Model 删除失败：${error.message}`; }
+}
+
+function openModelEditor(item = null) {
+  state.model = item && item.id ? item : null;
+  const form = byId("model-form"); form.reset();
+  form.elements.id.value = item?.id || ""; form.elements.id.readOnly = Boolean(state.model);
+  form.elements.stage.value = item?.stage || "standard"; form.elements.family.value = item?.family || "Custom model";
+  byId("model-editor").hidden = false; (state.model ? form.elements.family : form.elements.id).focus();
+}
+
+function closeModelEditor() { byId("model-editor").hidden = true; state.model = null; }
+
+async function loadModels() { renderModels(await requestJson("/admin/v1/models")); }
+
 function providerDomain(baseUrl) {
   try { return new URL(baseUrl).origin; } catch (_) { return baseUrl; }
 }
@@ -489,15 +530,17 @@ async function loadStageView() {
 }
 
 async function load() {
-  const [summary, providers, routing, stages] = await Promise.all([
+  const [summary, providers, routing, stages, models] = await Promise.all([
     requestJson("/admin/v1/summary?window=24h"),
     requestJson(`/admin/v1/providers?window=${encodeURIComponent(state.qualityWindow)}`),
     requestJson("/admin/v1/routing"),
     requestJson(`/admin/v1/stages?window=${encodeURIComponent(state.qualityWindow)}`),
+    requestJson("/admin/v1/models"),
   ]);
   renderSummary(summary);
   renderProviders(providers);
   renderModelView(stages);
+  renderModels(models);
   byId("race-parallel-cap").value = routing.race_parallel_cap;
   byId("hedge-delay-ms").value = routing.hedge_delay_ms;
   // Secondary panels must not delay the primary dashboard. Fetch them in
@@ -511,6 +554,18 @@ async function load() {
     loadAnalytics(),
   ]);
 }
+
+byId("model-form").addEventListener("submit", async (event) => {
+  event.preventDefault();
+  const form = event.currentTarget;
+  const body = { stage: form.elements.stage.value, family: form.elements.family.value.trim() };
+  const endpoint = state.model ? `/admin/v1/models/${encodeURIComponent(state.model.id)}` : "/admin/v1/models";
+  try {
+    await requestJson(endpoint, { method: state.model ? "PATCH" : "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(state.model ? body : { ...body, id: form.elements.id.value.trim() }) });
+    closeModelEditor(); await loadModels(); byId("model-result").textContent = "Model List 已更新";
+  } catch (error) { byId("model-result").textContent = `Model 保存失败：${error.message}`; }
+});
+["close-model-editor", "cancel-model-editor"].forEach((id) => byId(id).addEventListener("click", closeModelEditor));
 
 byId("policy").addEventListener("submit", async (event) => {
   event.preventDefault();

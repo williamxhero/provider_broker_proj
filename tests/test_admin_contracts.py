@@ -73,7 +73,9 @@ async def test_key_and_stage_contracts_are_allowlisted_and_windowed(admin_client
     assert standard[0]["fee_buckets"]["USD"]["total_fee"] == .25
     assert standard[1]["fee_buckets"]["CNY"]["total_fee"] == 2
 
-    assert (await admin_client.get("/admin/v1/models?include_inactive=true")).status == 404
+    models_response = await admin_client.get("/admin/v1/models")
+    assert models_response.status == 200
+    assert {item["id"] for item in (await models_response.json())["items"]}
 
     assert (await admin_client.get("/admin/v1/stages?window=2h")).status == 400
     assert (await admin_client.patch(f"/admin/v1/keys/{first}", json={"multiplier": 2})).status == 400
@@ -120,12 +122,30 @@ async def test_stage_test_rejects_the_removed_model_selector(admin_client):
     assert response.status == 400
 
 
-async def test_removed_model_health_and_legacy_probe_routes_are_not_management_contracts(admin_client):
+async def test_model_list_replaces_removed_model_directory_and_legacy_probe_routes_are_not_management_contracts(admin_client):
     for method, path in (
-        ("get", "/admin/v1/models"),
         ("get", "/admin/v1/health?stage=standard"),
         ("post", "/admin/v1/probes"),
         ("post", "/admin/v1/providers/test"),
     ):
         response = await getattr(admin_client, method)(path)
         assert response.status == 404
+
+
+async def test_broker_model_list_supports_create_update_and_deactivate(admin_client):
+    created = await admin_client.post("/admin/v1/models", json={
+        "id": "operator-model", "stage": "standard", "family": "Operator",
+    })
+    assert created.status == 201
+    assert (await created.json()) == {
+        "id": "operator-model", "stage": "standard", "family": "Operator", "active": True,
+    }
+    updated = await admin_client.patch("/admin/v1/models/operator-model", json={
+        "stage": "expert", "family": "Operator v2",
+    })
+    assert updated.status == 200
+    assert (await updated.json())["stage"] == "expert"
+    assert (await admin_client.delete("/admin/v1/models/operator-model")).status == 204
+    inactive = await admin_client.get("/admin/v1/models?include_inactive=true")
+    item = next(item for item in (await inactive.json())["items"] if item["id"] == "operator-model")
+    assert item["active"] is False

@@ -72,7 +72,9 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
                     "status": "enabled", "max_parallel": 3, "callable": True, "latest_test": None,
                     "technical_success_rate": 1, "avg_first_token_latency_ms": 120,
                     "total_tokens": 12, "fee_buckets": {"UNKNOWN": {"total_fee": 0.02}},
-                }], "window": "24h"}
+                    }], "window": "24h"}
+            if path.startswith("/admin/v1/models"):
+                return {"items": [{"id": "gpt-5.6-luna", "stage": "standard", "family": "OpenAI GPT-5.6", "active": True}]}
             if path.startswith("/admin/v1/routing"):
                 return {"race_parallel_cap": 3, "hedge_delay_ms": 0}
             if path.startswith("/admin/v1/pricing"):
@@ -110,6 +112,8 @@ def test_console_uses_strict_key_and_stage_contract(tmp_path):
         assert page.locator("#model-view").get_by_text("safe note", exact=True).count() == 1
         assert page.locator("#probe-stage, #probe-race, #probe-all, #probe-results").count() == 0
         assert page.locator("#model-directory").count() == 0
+        assert page.locator("#models-section").count() == 1
+        assert page.locator("#model-list .model-list-tag").filter(has_text="gpt-5.6-luna").count() == 1
         assert page.locator("main > section:has(#analytics-title)").count() == 1
         assert page.locator("main > section:has(#route-audit-title)").count() == 1
         browser.close()
