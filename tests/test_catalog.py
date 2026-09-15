@@ -21,9 +21,9 @@ def test_approved_catalog_entries_have_explicit_stage_and_output_price():
 def test_approved_aliases_canonicalize_deterministically():
     aliases = {
         "DeepSeek_V4_Flash": "deepseek-v4-flash-0731",
+        "deepseek-flash": "deepseek-v4-flash-0731",
         "deepseek-v4-1-flash": "deepseek-v4.1-flash",
         "deepseek-reasoner": "deepseek-v4.1-flash",
-        "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
         "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
         "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
         "glm-5-3-flash": "glm-5.3-flash",
@@ -39,7 +39,7 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
     store.replace_source_snapshot([{
         "name": "approved-provider", "base_url": "https://provider.test",
         "api_key": "secret", "provider_type": "openai_chat",
-        "models": ["deepseek-v4-flash", "glm-5.3", "unknown-provider-model"],
+        "models": ["deepseek-v4-flash-0731", "glm-5.3", "unknown-provider-model"],
         "inventory_status": "available",
     }], "2026-09-12T00:00:00+00:00")
 
@@ -48,6 +48,21 @@ def test_discovery_intersects_with_catalog_and_stage_routing(tmp_path):
     assert {provider.models[0] for provider in store.providers("expert")} == {"glm-5.3"}
     assert "unknown-provider-model" in store.inventory()[0]["models"]
     assert all("unknown-provider-model" not in provider.models for provider in store.providers("smart"))
+
+
+def test_routing_recovers_the_saved_wire_adapter_and_model_alias(tmp_path):
+    store = Store(tmp_path / "broker.sqlite3", b"0123456789abcdef")
+    store.replace_source_snapshot([{
+        "name": "DeepInfra", "base_url": "https://api.deepinfra.com/v1/openai",
+        "api_key": "secret", "provider_type": "openai_chat", "pricing_provider_type": "deepinfra",
+        "models": ["deepseek-v4-flash-0731"],
+        "model_aliases": {"deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731"},
+        "source": {"transport_provider_type": "openai_chat"}, "inventory_status": "available",
+    }], "2026-09-15T00:00:00+00:00")
+
+    provider = store.providers("standard")[0]
+    assert provider.provider_type == "openai_chat"
+    assert provider.wire_model == "deepseek-ai/DeepSeek-V4-Flash-0731"
 
 
 def test_legacy_catalog_writes_are_removed_and_fixed_directory_is_stable(tmp_path):

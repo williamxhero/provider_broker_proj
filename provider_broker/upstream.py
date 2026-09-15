@@ -11,9 +11,11 @@ import uuid
 from urllib.parse import parse_qsl, urlencode, urlsplit, urlunsplit
 
 from aiohttp import ClientConnectionError, ClientError, ClientSession, ClientTimeout
+from aiohttp import TCPConnector
 from jsonschema import Draft202012Validator, SchemaError, ValidationError
 
 from .catalog import CATALOG, canonicalize
+from .network import direct_local_addr
 
 
 _CHAT_API_ROOTS = (
@@ -350,7 +352,7 @@ def replace_one_of_with_any_of(value):
     return value
 
 
-def provider_native_schema(schema: dict | None, provider_type: str) -> dict | None:
+def provider_native_schema(schema: dict | None, provider_type: str, base_url: str | None = None) -> dict | None:
     """Return a provider-safe native schema, or fall back to prompt enforcement.
 
     OpenAI-compatible strict schema implementations reject object nodes without
@@ -359,6 +361,12 @@ def provider_native_schema(schema: dict | None, provider_type: str) -> dict | No
     The Broker still embeds the authoritative schema in the prompt and validates
     the returned JSON against it locally.
     """
+    host = (urlsplit(str(base_url or '')).hostname or '').lower()
+    if host == 'api.deepseek.com' or host.endswith('.deepseek.com'):
+        # DeepSeek's OpenAI-compatible endpoint rejects response_format even
+        # when the schema is valid. The prompt remains authoritative and the
+        # Broker validates the completed output locally.
+        return None
     if schema is None or _contains_open_object(schema):
         return None
     if provider_type not in ("anthropic", "claude") and _contains_optional_object_property(schema):
@@ -611,15 +619,12 @@ async def invoke_stream(provider, body: dict) -> dict:
     requested_model = canonicalize(provider.models[0])
     model = canonicalize(getattr(provider, "wire_model", None) or requested_model)
     schema = structured_schema(body)
-    outbound_schema = provider_native_schema(schema, provider.provider_type)
+    outbound_schema = provider_native_schema(schema, provider.provider_type, provider.base_url)
     effort = body.get("effort")
     repair_note = body.get("_structured_repair_note") if isinstance(body.get("_structured_repair_note"), str) else None
     provider_prompt = body["prompt"] if body.get("_preserve_prompt_envelope") else strict_schema_prompt(body["prompt"], schema, repair_note)
     if provider.provider_type in ("anthropic", "claude", "openai_chat"):
         payload = {"model": model, "max_tokens": body.get("output_token_limit", 1024), "messages": [{"role": "user", "content": provider_prompt}], "stream": True}
-        host = (urlsplit(provider.base_url).hostname or "").lower()
-        if host == "api.deepseek.com" or host.endswith(".deepseek.com"):
-            payload["thinking"] = {"type": "enabled"}
         if outbound_schema is not None:
             payload["response_format"] = {"type": "json_schema", "json_schema": {"name": "broker_output", "strict": True, "schema": outbound_schema}}
         endpoint = "/chat/completions"
@@ -758,6 +763,10 @@ async def invoke_stream(provider, body: dict) -> dict:
         session_options = {"timeout": timeout}
         if connector is not None:
             session_options |= {"connector": connector, "connector_owner": False}
+        else:
+            local_addr = direct_local_addr(provider.base_url)
+            if local_addr is not None:
+                session_options["connector"] = TCPConnector(local_addr=local_addr)
         async with ClientSession(**session_options) as session:
             try:
                 response = await asyncio.wait_for(session.post(api_url(provider.base_url, endpoint), json=payload, headers=provider_headers(provider)), max(.001, first_event_deadline - time.monotonic()))

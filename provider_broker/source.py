@@ -4,7 +4,7 @@ import json
 from urllib.parse import urlsplit
 from aiohttp import ClientSession
 
-from .catalog import canonicalize
+from .catalog import BROKER_PROVIDER_MODELS, CATALOG, canonicalize
 from .pricing import canonical_provider_type
 
 
@@ -28,28 +28,12 @@ _CPA_CONFIG_SECTIONS = {
     "claude": "claude-api-key",
 }
 
-# Public model IDs do not require a user-created Ark Endpoint. The catalog
-# name remains stable for routing while this table supplies the vendor wire
-# name when Ark does not expose a useful /models inventory.
-_PUBLIC_MODEL_IDS = {
-    "deepseek.com": {
-        "deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
-        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
-    },
-    "volces.com": {
-        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
-        "doubao-seed-2.1-turbo": "doubao-seed-2.1-turbo",
-        "doubao-seed-2.1-pro": "doubao-seed-2.1-pro",
-    },
-}
-
-
-def _public_model_ids(base_url: str, models: list[str] | None = None) -> dict[str, str]:
-    host = (_url_parts(base_url).hostname or "").lower()
-    for domain, mapping in _PUBLIC_MODEL_IDS.items():
-        if host == domain or host.endswith("." + domain):
-            return {model: wire for model, wire in mapping.items() if models is None or model in models}
-    return {}
+def _broker_model_aliases(provider_type: str, base_url: str | None = None) -> dict[str, str]:
+    """Return the Broker-owned Stage-to-wire mapping for one provider family."""
+    # The CPA model inventory is discovery evidence only.  A relay or custom
+    # endpoint must receive the same Broker-owned mapping as its Provider
+    # family; endpoint ownership does not change the Stage contract.
+    return dict(BROKER_PROVIDER_MODELS.get(provider_type, {}))
 
 
 def _management_headers(token: str) -> dict[str, str]:
@@ -401,7 +385,7 @@ def expand_config(payload: object) -> list[dict]:
                 models = []
             names = [model.get("id") if isinstance(model,dict) else model for model in models]
             names = [str(name) for name in names if name]
-            if normalized_base and secret and names:
+            if normalized_base and secret:
                 site_name = _site_name(key, provider)
                 if site_name and secret in site_name:
                     site_name = None
@@ -410,8 +394,14 @@ def expand_config(payload: object) -> list[dict]:
                 transport_type = _provider_type(normalized_base, kind, provider.get("protocol") or key.get("protocol"))
                 pricing_type = canonical_provider_type(kind, base_url=normalized_base, models=names)
                 if pricing_type is None:
-                    raise ValueError("unsupported provider type")
-                result.append({"name":site_name or names[0],"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names,"provider_type":transport_type,"pricing_provider_type":pricing_type,"request_headers":request_headers,"source":{"site_name":site_name,"provider_type":pricing_type}})
+                    # A key without a declared model is usable only when its
+                    # endpoint identifies one of Broker's supported families.
+                    # Ignore malformed, unclassifiable input instead of
+                    # allowing it to become a routable provider.
+                    if names:
+                        raise ValueError("unsupported provider type")
+                    continue
+                result.append({"name":site_name or (names[0] if names else kind),"site_name":site_name,"base_url":normalized_base,"api_key":secret,"models":names or ['unavailable'],"provider_type":transport_type,"pricing_provider_type":pricing_type,"request_headers":request_headers,"source":{"site_name":site_name,"provider_type":pricing_type}})
     return result
 
 
@@ -433,24 +423,42 @@ async def sync_cpa(store, url: str, token: str) -> dict:
             try:
                 async with session.get(_api_url(entry['base_url'], '/models'),headers=headers,timeout=10) as response:
                     raw=await response.json(content_type=None)
-                    discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if response.status == 200 and isinstance(raw,dict) else []
-                    aliases=entry.get('aliases',{})
-                    models=list(dict.fromkeys(canonicalize(aliases.get(model.casefold(), model)) for model in discovered))
-                    configured_models = list(aliases.values()) or models
-                    public_catalog = _public_model_ids(entry['base_url'])
-                    public_ids = public_catalog or _public_model_ids(entry['base_url'], [canonicalize(model) for model in configured_models])
-                    if public_ids and (not models or entry.get('provider_type') == 'openai_chat'):
-                        models = list(public_ids)
-                        entry['model_aliases'] = public_ids
-                    entry['models']=models or ['unavailable']; entry['inventory_status']='available' if models else 'unavailable'
-                    if aliases and entry.get('provider_type') == 'openai_chat':
-                        entry['model_aliases'] = {
-                            canonicalize(alias): actual
-                            for actual, alias in aliases.items()
-                            if canonicalize(alias) in models
+                    discovery_ok = response.status == 200 and isinstance(raw, dict)
+                    discovered=[str(x.get('id')) for x in raw.get('data',[]) if isinstance(x,dict) and x.get('id')] if discovery_ok else []
+                    provider_models = _broker_model_aliases(entry['pricing_provider_type'], entry['base_url'])
+                    if not provider_models:
+                        # Compatibility fallback for provider families that do
+                        # not yet have a Broker-owned mapping.
+                        aliases = entry.get('aliases', {})
+                        provider_models = {
+                            canonicalize(aliases.get(model.casefold(), model)): model
+                            for model in discovered
+                            if canonicalize(aliases.get(model.casefold(), model)) in CATALOG
                         }
+                    discovered_by_casefold = {model.casefold(): model for model in discovered}
+                    model_aliases = {
+                        canonical: discovered_by_casefold.get(wire.casefold(), wire)
+                        for canonical, wire in provider_models.items()
+                    }
+                    models = list(model_aliases)
+                    inventory_status = 'available' if discovery_ok else 'stale'
+                    entry['models']=models or ['unavailable']; entry['inventory_status']=inventory_status
+                    # The Store records pricing identity separately from the
+                    # wire adapter. Preserve aliases for every mapped provider
+                    # so OpenAI-compatible vendor IDs survive that projection.
+                    entry['model_aliases'] = model_aliases
             except Exception:
-                entry['models']=['unavailable']; entry['inventory_status']='unavailable'
+                # Discovery is auxiliary evidence. A target Provider's
+                # endpoint/key must retain Broker's own Stage mapping during a
+                # transient /models failure; direct calls and probes decide
+                # whether the mapping is actually usable.
+                provider_models = _broker_model_aliases(entry['pricing_provider_type'], entry['base_url'])
+                if provider_models:
+                    entry['models'] = list(provider_models)
+                    entry['model_aliases'] = provider_models
+                    entry['inventory_status'] = 'stale'
+                else:
+                    entry['models']=['unavailable']; entry['inventory_status']='unavailable'
                 inventory_failures+=1
     store.replace_source_snapshot(entries, datetime.datetime.now(datetime.UTC).isoformat())
     return {'count':len(entries),'inventory_failures':inventory_failures}

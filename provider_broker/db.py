@@ -2218,9 +2218,10 @@ class Store:
         pricing = pricing_by_model.get(model) or self.effective_key_pricing(row['fingerprint'], model)
         pricing_by_model = pricing_by_model | {model: pricing}
         price_group = int(pricing['blended_price'] * 100000) if pricing['priced'] else None
+        transport_provider_type = source.get("transport_provider_type") or row['provider_type']
         return Provider(
             row['id'], row['fingerprint'], row['name'], row['base_url'], self._decrypt(row['api_key']),
-            row['provider_type'], headers, [model], pricing, price_group, int(row['max_parallel']),
+            transport_provider_type, headers, [model], pricing, price_group, int(row['max_parallel']),
             bool(row['enabled']), row['site_id'], wire_model, reverse_aliases,
             pricing_by_model=pricing_by_model, price_currency=pricing['currency'],
             price_comparable=bool(pricing['priced']), price_source=pricing['source'],

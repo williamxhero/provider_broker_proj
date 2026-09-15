@@ -26,7 +26,6 @@ SCHEMA = {
 TIERS = {
     "gpt-5.6-luna": "standard",
     "deepseek-v4-flash-0731": "standard",
-    "doubao-seed-2.0-lite": "standard",
     "gpt-5.6-terra": "smart",
     "claude-sonnet-5": "smart",
     "glm-5.3-flash": "smart",

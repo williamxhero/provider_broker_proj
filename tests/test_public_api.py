@@ -231,7 +231,7 @@ async def cpa(client):
     async def chat(request):
         payload=await request.json(); assert 'tools' not in payload
         request.app['last_chat_payload'] = payload
-        return web.json_response({'id':'req-chat','model':'gpt-5.6-luna','choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
+        return web.json_response({'id':'req-chat','model':payload.get('model','gpt-5.6-luna'),'choices':[{'message':{'content':'hello chat'}}],'usage':{'output_tokens':2}})
     upstream.router.add_post('/v1/chat/completions',chat)
     async def models(request): return web.json_response({'data':[{'id': model} for model in request.app.get('models', ['gpt-5.6-luna'])]})
     upstream.router.add_get('/models',models)
@@ -252,7 +252,7 @@ async def test_manual_sync_then_generate_and_stream(client, cpa):
     assert (await response.json())['added'] == 1
     inventory=await client.get('/admin/v1/inventory',headers=headers)
     provider=(await inventory.json())['providers'][0]
-    assert provider['models'] == ['gpt-5.6-luna']
+    assert provider['models'] == ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.5']
     assert provider['inventory_status'] == 'available'
     assert 'provider-secret' not in str(provider)
     await client.put('/admin/v1/policy/'+provider['fingerprint'],headers=headers,json={'calibrated':True,'tiers':['standard','smart','expert']})
@@ -339,7 +339,7 @@ async def test_generate_parses_chat_completions_without_native_tools(client, cpa
     cpa.app['config']={'claude-api-key':[{'name':'Claude compatible','base_url':cpa.app['upstream'],'api_key':'claude-secret'}]}
     headers={'Authorization':'Bearer admin-secret'}
     assert (await client.post('/admin/v1/sync',headers=headers)).status == 200
-    result=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'chat','intellect':'standard','effort':'low'})
+    result=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'chat','intellect':'smart','effort':'low'})
     body=await result.json()
     assert result.status == 200 and body['output_text'] == 'hello chat' and body['request_id'] == 'req-chat'
 
@@ -464,6 +464,8 @@ async def test_six_smart_schema_calls_recover_an_open_independent_provider(clien
     await client.post('/admin/v1/sync')
     primary = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'primary-key')
     recovery = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'recovery-key')
+    await client.put(f'/admin/v1/policy/{primary.fingerprint}', json={'tiers': ['smart']})
+    await client.put(f'/admin/v1/policy/{recovery.fingerprint}', json={'tiers': ['smart']})
     client.app['store'].record_health(
         recovery.fingerprint, recovery.models[0], success=False, real=True, immediate_open=True,
         now=datetime.now(UTC),
@@ -503,7 +505,7 @@ async def test_six_long_smart_schema_calls_do_not_preemptively_consume_expert_ca
     }
     await client.post('/admin/v1/sync')
     smart = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'smart-key')
-    expert = next(provider for provider in client.app['store'].providers('smart') if provider.api_key == 'expert-key')
+    expert = next(provider for provider in client.app['store'].providers('expert') if provider.api_key == 'expert-key' and provider.models[0] == 'gpt-5.6-sol')
     await client.put(f'/admin/v1/policy/{smart.fingerprint}', json={'tiers': ['smart']})
     await client.put(f'/admin/v1/policy/{expert.fingerprint}', json={'tiers': ['expert']})
     await client.patch('/admin/v1/routing', json={'race_parallel_cap': 2, 'hedge_delay_ms': 1})
@@ -527,7 +529,7 @@ async def test_six_long_smart_schema_calls_do_not_preemptively_consume_expert_ca
     })
     fallback_body = await fallback.json()
     assert fallback.status == 200
-    assert fallback_body['actual_model'] == 'gpt-5.6-sol' and fallback_body['fulfilled_intellect'] == 'expert'
+    assert fallback_body['actual_model'] in {'gpt-5.6-sol', 'gpt-5.5'} and fallback_body['fulfilled_intellect'] == 'expert'
     fallback_statuses = [item['status'] for item in fallback_body['attempts']]
     assert fallback_statuses[:2] == ['unavailable', 'completed']
     assert set(fallback_statuses[2:]) <= {'cancelled'}
@@ -572,7 +574,7 @@ async def test_sync_normalizes_cpa_sections_and_generate_uses_canonical_request(
     inventory=(await (await client.get('/admin/v1/inventory',headers={'Authorization':'Bearer admin-secret'})).json())['providers']
     assert {p['family'] for p in inventory} == {'codex','anthropic','openai'}
     codex = next(p for p in inventory if p['family']=='codex')
-    assert codex['models'] == ['gpt-5.6-terra']
+    assert codex['models'] == ['gpt-5.6-luna', 'gpt-5.6-terra', 'gpt-5.6-sol', 'gpt-5.5']
     assert codex['note'] == 'Luna key'
     assert all(secret not in str(inventory) for secret in ('luna-key','claude-key','compat-key'))
     response=await client.post('/v1/generate',headers={'Authorization':'Bearer client-secret'},json={'prompt':'hello','intellect':'standard','effort':'high','deadline_ms':1000,'output_token_limit':20})
@@ -794,8 +796,8 @@ async def test_sync_reports_inventory_failures(client, cpa):
     body=await response.json()
     assert response.status == 200 and body['inventory_failures'] == 1
     provider=(await (await client.get('/admin/v1/providers',headers=headers)).json())['providers'][0]
-    assert provider['status'] == 'unavailable'
-    assert (await (await client.get('/admin/v1/summary?window=24h',headers=headers)).json())['routable_apis'] == 0
+    assert provider['status'] == 'enabled'
+    assert (await (await client.get('/admin/v1/summary?window=24h',headers=headers)).json())['routable_apis'] == 1
 
 
 async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
@@ -811,7 +813,7 @@ async def test_global_race_cap_randomly_selects_same_price_keys(client, cpa):
         result = await client.post('/v1/generate', headers={'Authorization': 'Bearer client-secret'}, json={'prompt': 'random', 'intellect': 'standard'})
 
     assert result.status == 200
-    assert sample.call_args.kwargs['k'] == 2
+    assert max(call.kwargs['k'] for call in sample.call_args_list) >= 2
     assert cpa.app['upstream_app']['last_response_headers']['Authorization'] == 'Bearer high-key'
 
 

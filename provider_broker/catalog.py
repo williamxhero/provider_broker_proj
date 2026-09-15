@@ -82,20 +82,6 @@ CATALOG = {
         "family": "DeepSeek", "intellect": "smart",
         "official_output_price_cny": 0.0,
     },
-    # Retained as runtime compatibility identities for already-synced
-    # inventories. They are deliberately excluded from management lists.
-    "deepseek-v4-flash": {
-        "family": "DeepSeek", "intellect": "smart",
-        "official_output_price_cny": 0.28,
-    },
-    "deepseek-v4-pro": {
-        "family": "DeepSeek", "intellect": "expert",
-        "official_output_price_cny": 0.87,
-    },
-    "doubao-seed-2.0-lite": {
-        "family": "Doubao Seed", "intellect": "standard",
-        "official_output_price_cny": 0.0,
-    },
     "glm-5.3-flash": {
         "family": "GLM", "intellect": "smart",
         "official_output_price_cny": 0.0,
@@ -121,10 +107,10 @@ CATALOG = {
 ALIASES = {
     "gpt-5.6": "gpt-5.6-sol", "claude-opus-4.8": "claude-opus-4-8",
     "deepseek-chat": "deepseek-v4-flash-0731",
+    "deepseek-flash": "deepseek-v4-flash-0731",
     "deepseek-reasoner": "deepseek-v4.1-flash",
     "deepseek-v4-flash": "deepseek-v4-flash-0731",
     "deepseek-v4-1-flash": "deepseek-v4.1-flash",
-    "doubao-seed-2-0-lite": "doubao-seed-2.0-lite",
     "doubao-seed-2-1-turbo": "doubao-seed-2.1-turbo",
     "doubao-seed-2-1-pro": "doubao-seed-2.1-pro",
     "glm-5-3-flash": "glm-5.3-flash",
@@ -132,9 +118,9 @@ ALIASES = {
     "qwen3-8-flash-next": "qwen3.8-flash-next",
 }
 
-CATALOG_SEED_VERSION = 5
+CATALOG_SEED_VERSION = 6
 CATALOG_V2_MODELS = frozenset({
-    "deepseek-v4-flash-0731", "deepseek-v4.1-flash", "doubao-seed-2.0-lite", "glm-5.3-flash",
+    "deepseek-v4-flash-0731", "deepseek-v4.1-flash", "glm-5.3-flash",
     "qwen3.8-flash-next", "doubao-seed-2.1-turbo",
     "doubao-seed-2.1-pro", "glm-5.3",
 })
@@ -144,7 +130,7 @@ CATALOG_V2_MODELS = frozenset({
 # Stage and Provider + Model pricing lists.
 APPROVED_STAGE_MODELS = {
     "standard": (
-        "gpt-5.6-luna", "deepseek-v4-flash-0731", "doubao-seed-2.0-lite",
+        "gpt-5.6-luna", "deepseek-v4-flash-0731",
     ),
     "smart": (
         "gpt-5.6-terra", "claude-sonnet-5", "glm-5.3-flash",
@@ -157,15 +143,39 @@ APPROVED_STAGE_MODELS = {
 }
 APPROVED_MODEL_IDS = frozenset(model for models in APPROVED_STAGE_MODELS.values() for model in models)
 
-PUBLIC_MODEL_IDS = {
-    "deepseek.com": {
-        "deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
-        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+# Broker-owned provider/model configuration.  CPA supplies only an endpoint
+# and credential; its per-key `models` entries never decide Broker routing.
+# Each key receives the approved Stage models for its provider family, while
+# this mapping preserves the vendor's wire IDs.
+BROKER_PROVIDER_MODELS = {
+    "openai": {
+        "gpt-5.6-luna": "gpt-5.6-luna",
+        "gpt-5.6-terra": "gpt-5.6-terra",
+        "gpt-5.6-sol": "gpt-5.6-sol",
+        "gpt-5.5": "gpt-5.5",
     },
-    "volces.com": {
-        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
-        "doubao-seed-2.1-turbo": "doubao-seed-2.1-turbo",
-        "doubao-seed-2.1-pro": "doubao-seed-2.1-pro",
+    "anthropic": {
+        "claude-sonnet-5": "claude-sonnet-5",
+        "claude-opus-5": "claude-opus-5",
+        "claude-opus-4-8": "claude-opus-4-8",
+    },
+    "deepinfra": {
+        "deepseek-v4-flash-0731": "deepseek-ai/DeepSeek-V4-Flash-0731",
+        "deepseek-v4.1-flash": "deepseek-ai/DeepSeek-V4.1-Flash",
+        "glm-5.3-flash": "zai-org/GLM-5.3-Flash",
+        "glm-5.3": "zai-org/GLM-5.3",
+    },
+    "deepseek": {
+        "deepseek-v4-flash-0731": "deepseek-flash",
+    },
+    "qwen": {
+        "qwen3.8-flash-next": "qwen3.8-flash",
+        "glm-5.3-flash": "ZHIPU/GLM-5.3-Flash",
+        "glm-5.3": "ZHIPU/GLM-5.3",
+    },
+    "doubao": {
+        "doubao-seed-2.1-turbo": "doubao-seed-2-1-turbo-260628",
+        "doubao-seed-2.1-pro": "doubao-seed-2-1-pro-260628",
     },
 }
 

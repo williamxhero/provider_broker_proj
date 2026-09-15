@@ -4,8 +4,8 @@ from types import SimpleNamespace
 from aiohttp import web
 from aiohttp.test_utils import TestServer
 
-from provider_broker.source import _api_url, _public_model_ids, expand_config
-from provider_broker.upstream import api_url, invoke_stream, provider_headers
+from provider_broker.source import _api_url, _broker_model_aliases, expand_config, sync_cpa
+from provider_broker.upstream import api_url, invoke_stream, provider_headers, provider_native_schema
 
 
 def test_vendor_roots_keep_their_path_and_use_chat_completions():
@@ -108,6 +108,38 @@ async def test_openai_chat_adapter_preserves_stream_contract_and_model_identity(
     assert "prompt-secret" not in json.dumps(output["diagnostic"])
 
 
+async def test_deepseek_chat_adapter_does_not_send_unsupported_thinking_option():
+    captured = {}
+
+    async def chat(request):
+        captured.update(await request.json())
+        response = web.StreamResponse(headers={"Content-Type": "text/event-stream"})
+        await response.prepare(request)
+        await response.write(b'data: {"model":"deepseek-flash"}\n\n')
+        await response.write(b'data: {"choices":[{"delta":{"content":"ok"},"finish_reason":"stop"}]}\n\n')
+        await response.write_eof()
+        return response
+
+    app = web.Application()
+    app.router.add_post("/v1/chat/completions", chat)
+    server = TestServer(app)
+    await server.start_server()
+    provider = SimpleNamespace(
+        base_url=str(server.make_url("")), api_key="provider-secret",
+        provider_type="openai_chat", models=["deepseek-v4-flash-0731"], request_headers={},
+        multiplier=1.0, pricing=None, wire_model="deepseek-flash",
+    )
+    try:
+        output = await invoke_stream(provider, {
+            "prompt": "prompt", "deadline_ms": 1000, "output_token_limit": 100,
+        })
+    finally:
+        await server.close()
+
+    assert output["text"] == "ok"
+    assert "thinking" not in captured
+
+
 async def test_openai_chat_adapter_sends_structured_contract_and_validates_sse():
     captured = {}
 
@@ -199,11 +231,54 @@ def test_cpa_openai_compatibility_key_entries_and_model_aliases_are_supported():
     assert entries[0]["provider_type"] == "openai_chat"
 
 
-def test_public_provider_inventory_uses_builtin_model_ids_without_endpoint_ids():
-    assert _public_model_ids("https://api.deepseek.com/v1", ["deepseek-v4-flash-0731", "deepseek-v4.1-flash"]) == {
-        "deepseek-v4-flash-0731": "deepseek-v4-flash-0731",
-        "deepseek-v4.1-flash": "deepseek-v4.1-flash",
+def test_broker_owned_provider_model_mapping_is_independent_of_cpa_configuration():
+    assert _broker_model_aliases("deepseek") == {
+        "deepseek-v4-flash-0731": "deepseek-flash",
     }
-    assert _public_model_ids("https://ark.cn-beijing.volces.com/api/v3", ["doubao-seed-2.0-lite"]) == {
-        "doubao-seed-2.0-lite": "doubao-seed-2-0-lite-260215",
+    assert _broker_model_aliases("qwen") == {
+        "qwen3.8-flash-next": "qwen3.8-flash",
+        "glm-5.3-flash": "ZHIPU/GLM-5.3-Flash",
+        "glm-5.3": "ZHIPU/GLM-5.3",
     }
+    assert _broker_model_aliases("doubao") == {
+        "doubao-seed-2.1-turbo": "doubao-seed-2-1-turbo-260628",
+        "doubao-seed-2.1-pro": "doubao-seed-2-1-pro-260628",
+    }
+    assert _broker_model_aliases("openai", "https://gateway.example/v1") == {
+        "gpt-5.6-luna": "gpt-5.6-luna",
+        "gpt-5.6-terra": "gpt-5.6-terra",
+        "gpt-5.6-sol": "gpt-5.6-sol",
+        "gpt-5.5": "gpt-5.5",
+    }
+
+
+async def test_failed_model_discovery_keeps_broker_owned_mapping(tmp_path):
+    from provider_broker.db import Store
+
+    store = Store(tmp_path / "broker.sqlite3", b"0123456789abcdef")
+    management = web.Application()
+
+    async def config(_request):
+        return web.json_response({"providers": [{
+            "name": "Qwen", "type": "qwen", "base_url": "http://127.0.0.1:1/compatible-mode/v1",
+            "keys": [{"key": "secret"}],
+        }]})
+
+    management.router.add_get("/v0/management/config", config)
+    server = TestServer(management)
+    await server.start_server()
+    try:
+        result = await sync_cpa(store, str(server.make_url("")).rstrip("/"), "management-secret")
+    finally:
+        await server.close()
+
+    assert result["inventory_failures"] == 1
+    row = store.inventory()[0]
+    assert row["inventory_status"] == "stale"
+    assert row["models"] == ["qwen3.8-flash-next", "glm-5.3-flash", "glm-5.3"]
+
+
+def test_deepseek_falls_back_to_prompt_validation_for_native_schema():
+    schema = {"type": "object", "properties": {"answer": {"type": "string"}}, "required": ["answer"]}
+    assert provider_native_schema(schema, "openai_chat", "https://api.deepseek.com/v1") is None
+    assert provider_native_schema(schema, "openai_chat", "https://gateway.example/v1") == schema

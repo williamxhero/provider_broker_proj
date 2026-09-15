@@ -56,6 +56,19 @@ fi
 chown yosef:yosef "$ENV_FILE"
 chmod 600 "$ENV_FILE"
 
+# The transparent TUN is useful for ordinary public traffic, but the current
+# DeepInfra route is sensitive to VPN egress resets.  Persist the physical
+# WLAN source address so Broker can bind only DeepInfra requests to it.
+deepinfra_source_ip=$(ip -4 -o addr show dev wlp3s0 scope global 2>/dev/null | awk 'NR==1 {split($4, a, "/"); print a[1]}')
+if [[ "$deepinfra_source_ip" =~ ^([0-9]{1,3}\.){3}[0-9]{1,3}$ ]]; then
+  tmp_env=$(mktemp "$APP_ROOT/secrets/.broker.env.XXXXXX")
+  grep -v '^BROKER_DEEPINFRA_SOURCE_IP=' "$ENV_FILE" > "$tmp_env" || true
+  printf 'BROKER_DEEPINFRA_SOURCE_IP=%s\n' "$deepinfra_source_ip" >> "$tmp_env"
+  chown yosef:yosef "$tmp_env"
+  chmod 600 "$tmp_env"
+  mv -f "$tmp_env" "$ENV_FILE"
+fi
+
 # CPA is the reference transport used by desktop clients.  Keep its local
 # inference credential in the already protected Broker environment so the
 # release-contained differential canary can compare both paths without printing
